@@ -1,0 +1,41 @@
+[package]
+name = "claude-launcher"
+version = "1.0.0"
+description = "ClaudeCode启动器 - Tauri Edition"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "claude_launcher_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+portable-pty = "0.8"
+toml_edit = "0.22"
+url = "2"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+which = "7"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+notify = "6"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_System_Environment",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Dwm",
+] }
