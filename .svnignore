@@ -1,8 +1,0 @@
-# 前端依赖（通过 npm install 还原）
-node_modules
-
-# 前端构建产物（通过 npm run build / npm run tauri build 生成）
-dist
-
-# Rust 构建产物（通过 cargo build 生成，需设置到 src-tauri 目录的 svn:ignore）
-target
