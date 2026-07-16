@@ -163,12 +163,34 @@
               <div class="model-columns" aria-hidden="true">
                 <span>模型 ID</span>
                 <span>显示名称</span>
+                <span>上下文长度</span>
+                <span>输出上限</span>
                 <span>输入能力</span>
                 <span></span>
               </div>
               <div v-for="model in provider.models" :key="model.originalId || model.id" class="model-row">
                 <input v-model="model.id" class="input" type="text" aria-label="模型 ID" />
                 <input v-model="model.name" class="input" type="text" aria-label="模型显示名称" />
+                <input
+                  :value="model.contextLimit ?? ''"
+                  class="input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  aria-label="上下文长度"
+                  placeholder="例如 200000"
+                  @input="updateModelLimit(model, 'contextLimit', $event)"
+                />
+                <input
+                  :value="model.outputLimit ?? ''"
+                  class="input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  aria-label="输出上限"
+                  placeholder="例如 65536"
+                  @input="updateModelLimit(model, 'outputLimit', $event)"
+                />
                 <div class="modality-options" aria-label="模型输入能力">
                   <label><input v-model="model.inputText" type="checkbox" /> Text</label>
                   <label><input v-model="model.inputImage" type="checkbox" /> Image</label>
@@ -211,7 +233,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import type { OpencodeGlobalProvider } from '@/types/config'
+import type { OpencodeGlobalModel, OpencodeGlobalProvider } from '@/types/config'
 import { useOpencodeConfigStore } from '@/stores/opencodeConfig'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
 import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
@@ -245,6 +267,20 @@ function connectionButtonLabel(provider: OpencodeGlobalProvider) {
 function addModel(provider: OpencodeGlobalProvider) {
   const key = store.providerKey(provider)
   if (store.addModel(provider, modelDrafts[key] || '')) modelDrafts[key] = ''
+}
+
+function updateModelLimit(
+  model: OpencodeGlobalModel,
+  field: 'contextLimit' | 'outputLimit',
+  event: Event,
+) {
+  const value = (event.target as HTMLInputElement).value.trim()
+  if (!value) {
+    model[field] = null
+    return
+  }
+  const parsed = Number(value)
+  model[field] = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
 }
 
 async function openConfigDirectory() {
@@ -300,7 +336,7 @@ onMounted(() => {
 .model-add-row { display: flex; gap: 6px; margin-top: 9px; }
 .model-add-row .input { min-width: 0; flex: 1; }
 .model-list { margin-top: 10px; }
-.model-columns, .model-row { display: grid; grid-template-columns: minmax(150px, 1.2fr) minmax(130px, 1fr) 170px 30px; gap: 7px; align-items: center; }
+.model-columns, .model-row { display: grid; grid-template-columns: minmax(150px, 1.2fr) minmax(130px, 1fr) minmax(120px, 0.8fr) minmax(110px, 0.8fr) 170px 30px; gap: 7px; align-items: center; }
 .model-columns { padding: 0 2px 4px; color: var(--text-secondary); font-size: var(--font-size-small); }
 .model-row { margin-top: 6px; }
 .model-row .input { min-width: 0; }
@@ -313,7 +349,9 @@ onMounted(() => {
 @media (max-width: 760px) {
   .model-columns { display: none; }
   .model-row { grid-template-columns: 1fr 1fr 30px; padding-top: 7px; border-top: 1px solid var(--separator); }
-  .modality-options { grid-column: 1 / 3; grid-row: 2; }
-  .model-row .icon-button { grid-column: 3; grid-row: 1 / 3; }
+  .model-row > :nth-child(3) { grid-column: 1 / 3; grid-row: 2; }
+  .model-row > :nth-child(4) { grid-column: 1 / 3; grid-row: 3; }
+  .modality-options { grid-column: 1 / 3; grid-row: 4; }
+  .model-row .icon-button { grid-column: 3; grid-row: 1 / 5; }
 }
 </style>

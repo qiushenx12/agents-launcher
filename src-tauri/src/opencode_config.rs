@@ -213,6 +213,10 @@ pub struct OpencodeGlobalModel {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub context_limit: Option<u64>,
+    #[serde(default)]
+    pub output_limit: Option<u64>,
     #[serde(default = "default_true")]
     pub input_text: bool,
     #[serde(default)]
@@ -735,6 +739,14 @@ fn global_model_from_value(id: &str, value: &Value) -> OpencodeGlobalModel {
         .get("modalities")
         .and_then(|modalities| modalities.get("input"))
         .and_then(Value::as_array);
+    let context_limit = value
+        .get("limit")
+        .and_then(|limit| limit.get("context"))
+        .and_then(Value::as_u64);
+    let output_limit = value
+        .get("limit")
+        .and_then(|limit| limit.get("output"))
+        .and_then(Value::as_u64);
     OpencodeGlobalModel {
         original_id: id.to_string(),
         id: id.to_string(),
@@ -743,6 +755,8 @@ fn global_model_from_value(id: &str, value: &Value) -> OpencodeGlobalModel {
             .and_then(Value::as_str)
             .unwrap_or(id)
             .to_string(),
+        context_limit,
+        output_limit,
         input_text: input
             .map(|items| items.iter().any(|item| item.as_str() == Some("text")))
             .unwrap_or(true),
@@ -1023,6 +1037,12 @@ fn normalize_global_config(
                     model.id
                 ));
             }
+            if model.context_limit.is_some() != model.output_limit.is_some() {
+                return Err(format!(
+                    "模型 '{}' 必须同时填写上下文长度与输出上限",
+                    model.id
+                ));
+            }
         }
     }
     Ok(config)
@@ -1031,6 +1051,34 @@ fn normalize_global_config(
 fn apply_global_model(model: &OpencodeGlobalModel, value: &mut Value) {
     let model_object = object_mut(value);
     set_optional_string(model_object, "name", &model.name);
+    if model.context_limit.is_some() || model.output_limit.is_some() {
+        let limit = model_object
+            .entry("limit".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let limit_object = object_mut(limit);
+        if let Some(context_limit) = model.context_limit {
+            limit_object.insert("context".to_string(), json!(context_limit));
+        } else {
+            limit_object.remove("context");
+        }
+        if let Some(output_limit) = model.output_limit {
+            limit_object.insert("output".to_string(), json!(output_limit));
+        } else {
+            limit_object.remove("output");
+        }
+    } else {
+        let remove_limit =
+            if let Some(limit) = model_object.get_mut("limit").and_then(Value::as_object_mut) {
+                limit.remove("context");
+                limit.remove("output");
+                limit.is_empty()
+            } else {
+                false
+            };
+        if remove_limit {
+            model_object.remove("limit");
+        }
+    }
     let modalities = model_object
         .entry("modalities".to_string())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -2440,9 +2488,13 @@ mod tests {
         assert_eq!(payload.providers[0].id, "custom");
         assert!(payload.providers[0].models[0].input_text);
         assert!(payload.providers[0].models[0].input_image);
+        assert_eq!(payload.providers[0].models[0].context_limit, Some(200000));
+        assert_eq!(payload.providers[0].models[0].output_limit, Some(65536));
 
         payload.providers[0].base_url = "https://new.example/v1".to_string();
         payload.providers[0].models[0].input_text = false;
+        payload.providers[0].models[0].context_limit = Some(262144);
+        payload.providers[0].models[0].output_limit = Some(32768);
         let rendered = build_global_config(existing, &payload).expect("build global config");
         let value: Value = serde_json::from_str(&rendered).expect("strict JSON output");
 
@@ -2456,7 +2508,11 @@ mod tests {
         assert_eq!(value["provider"]["custom"]["options"]["timeout"], 9000);
         assert_eq!(
             value["provider"]["custom"]["models"]["vision"]["limit"]["context"],
-            200000
+            262144
+        );
+        assert_eq!(
+            value["provider"]["custom"]["models"]["vision"]["limit"]["output"],
+            32768
         );
         assert_eq!(
             value["provider"]["custom"]["models"]["vision"]["modalities"]["input"],

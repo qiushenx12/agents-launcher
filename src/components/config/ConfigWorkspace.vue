@@ -12,11 +12,6 @@
           role="tab"
           @click="selectKind(kind)"
         >
-          <span
-            class="config-workspace__tab-dot"
-            :class="`config-workspace__tab-dot--${runtimeStore.statuses[kind]?.state ?? 'unknown'}`"
-            aria-hidden="true"
-          ></span>
           {{ CLI_DESCRIPTORS[kind].label }}
         </button>
       </nav>
@@ -294,19 +289,6 @@ onBeforeUnmount(() => {
   background: var(--tab-active);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
 }
-
-.config-workspace__tab-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--text-secondary);
-  opacity: 0.55;
-}
-
-.config-workspace__tab-dot--ready { background: var(--success); opacity: 1; }
-.config-workspace__tab-dot--checking { background: #ff9500; opacity: 1; }
-.config-workspace__tab-dot--degraded { background: #ff9500; opacity: 1; }
-.config-workspace__tab-dot--blocked { background: var(--danger); opacity: 1; }
 
 .config-workspace__dirty {
   color: #ff9500;

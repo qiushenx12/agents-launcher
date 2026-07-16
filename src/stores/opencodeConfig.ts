@@ -148,6 +148,8 @@ export const useOpencodeConfigStore = defineStore('opencodeConfig', () => {
       originalId: '',
       id,
       name: id,
+      contextLimit: null,
+      outputLimit: null,
       inputText: true,
       inputImage: false,
     })

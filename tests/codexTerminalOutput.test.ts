@@ -145,6 +145,21 @@ test('forced alternate screen is owned by the host for the full Codex session', 
   )
 })
 
+test('cursor gating keeps Codex in the normal buffer when alternate screen is not forced', async () => {
+  const output = collector()
+  const writer = createTerminalOutputWriter('codex', output.sink, {
+    gateCursorDuringOutput: true,
+    cursorIdleDelayMs: 5,
+  })
+
+  writer.write(encoder.encode('content'))
+  await new Promise(resolve => setTimeout(resolve, 20))
+
+  assert.equal(output.text(), HIDE_CURSOR + 'content' + SHOW_CURSOR)
+  assert.equal(output.text().includes(ENTER_ALT_SCREEN), false)
+  assert.equal(output.text().includes(LEAVE_ALT_SCREEN), false)
+})
+
 test('host-owned cursor stays hidden during output and returns at the final position', async () => {
   const output = collector()
   const writer = createTerminalOutputWriter('codex', output.sink, {

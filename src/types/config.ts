@@ -127,6 +127,8 @@ export interface OpencodeGlobalModel {
   originalId: string
   id: string
   name: string
+  contextLimit: number | null
+  outputLimit: number | null
   inputText: boolean
   inputImage: boolean
 }

@@ -1281,7 +1281,9 @@ export const useProjectStore = defineStore('project', () => {
       cmd = [runtimeStore.executable('claude'), ...args]
     } else if (session.cliKind === 'codex') {
       const codexStore = useCodexConfigStore()
-      const args: string[] = []
+      // Windows IME input can arrive as a fast burst of non-ASCII characters.
+      // Let Codex insert each character directly instead of applying its paste heuristic.
+      const args: string[] = ['--no-alt-screen', '-c', 'disable_paste_burst=true']
       try {
         await codexStore.ensureLoaded()
         if (codexStore.globalConfigError) {
@@ -1309,10 +1311,9 @@ export const useProjectStore = defineStore('project', () => {
       const args: string[] = []
       const opencodeStore = useOpencodeConfigStore()
       try {
-        const context = await opencodeStore.resolveLaunchContext(
+        await opencodeStore.resolveLaunchContext(
           session.cwd || project.path,
         )
-        statusMessage.value = `OpenCode 当前配置已获取：${context.providerIds.length} 个 provider，模型 ${context.model || '由 OpenCode 运行时决定'}`
       } catch (error) {
         statusMessage.value = `OpenCode 当前配置获取失败，已阻止启动：${error}`
         return null

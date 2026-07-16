@@ -10,6 +10,7 @@ import {
   createTerminalOutputWriter,
   type TerminalOutputWriter,
 } from '@/utils/codexTerminalOutput'
+import { encodeCodexConptyInput } from '@/utils/codexTerminalInput'
 
 const props = defineProps<{
   tabId: number
@@ -144,7 +145,8 @@ function initTerminal() {
 
   // Forward input to PTY
   term.onData((data) => {
-    invoke('pty_write', { tabId: props.tabId, data }).catch(() => {})
+    const ptyData = cliKind === 'codex' ? encodeCodexConptyInput(data) : data
+    invoke('pty_write', { tabId: props.tabId, data: ptyData }).catch(() => {})
   })
 
   // Forward resize to PTY
@@ -154,7 +156,6 @@ function initTerminal() {
 
   // Register writer in store — this also flushes any buffered output
   outputWriter = createTerminalOutputWriter(cliKind, bytes => t.write(bytes), {
-    forceAltScreen: cliKind === 'codex',
     gateCursorDuringOutput: cliKind === 'codex',
   })
   store.registerWriter(props.tabId, bytes => outputWriter?.write(bytes))
@@ -283,14 +284,11 @@ watch(() => store.refitSignal, () => {
   position: relative;
 }
 
-/* xterm's default left: -9999em pushes the hidden textarea off-screen.
-   On Windows, IME candidate windows follow that textarea's screen position,
-   causing the candidate window to jump to the screen edge and push the app.
-   Keep the textarea at left: 0 (still invisible via opacity/size). */
+/* Give the hidden textarea a safe initial position so Windows IME candidate
+   windows do not jump to the screen edge. Do not force its position or size:
+   xterm updates those inline while an IME composition is active. */
 .terminal-pane :deep(.xterm-helper-textarea) {
-  left: 0 !important;
-  width: 1px !important;
-  height: 1px !important;
+  left: 0;
   opacity: 0 !important;
   pointer-events: none !important;
   caret-color: transparent !important;
