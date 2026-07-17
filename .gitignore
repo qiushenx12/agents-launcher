@@ -37,3 +37,7 @@ Thumbs.db
 .svn/
 .git/
 
+
+# Local-only tools / assets
+claude-code-2-1-112/
+截图/

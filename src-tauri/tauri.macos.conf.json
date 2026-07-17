@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "icon": ["icons/app.icns"],
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    }
+  }
+}

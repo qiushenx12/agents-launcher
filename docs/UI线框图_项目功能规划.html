@@ -1,0 +1,2185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>项目模块 UI 线框图 · 功能规划工作台</title>
+  <style>
+    :root {
+      --bg: #f4f5f7;
+      --panel: #ffffff;
+      --ink: #1f2937;
+      --muted: #5f6b7a;
+      --faint: #8a94a3;
+      --line: #d8dee8;
+      --line-strong: #9aa4b2;
+      --top: #151922;
+      --top-2: #242a36;
+      --primary: #2563eb;
+      --primary-soft: #e8f0ff;
+      --accent: #0f766e;
+      --accent-soft: #dff6f2;
+      --warn: #d97706;
+      --warn-soft: #fff4df;
+      --danger: #dc2626;
+      --danger-soft: #ffe7e7;
+      --ok: #16a34a;
+      --idle: #22c55e;
+      --running: #f59e0b;
+      --off: #c6ccd6;
+      --terminal: #0f172a;
+      --terminal-text: #d8e1ee;
+      --shadow: 0 8px 24px rgba(23, 30, 43, 0.08);
+      --radius: 8px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 28px;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+      line-height: 1.55;
+    }
+
+    header,
+    .art-brief,
+    .gallery {
+      width: min(1480px, 100%);
+      margin: 0 auto;
+    }
+
+    header {
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 25px;
+      letter-spacing: 0;
+    }
+
+    header p,
+    .brief-text {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .art-brief {
+      display: grid;
+      grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr) minmax(280px, 1fr);
+      gap: 14px;
+      margin-bottom: 22px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .brief-block h2 {
+      margin: 0 0 8px;
+      font-size: 14px;
+    }
+
+    .brief-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      height: 24px;
+      padding: 0 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #f9fafb;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .gallery {
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+
+    .shot-card {
+      display: grid;
+      grid-template-columns: minmax(760px, 1fr) minmax(300px, 350px);
+      gap: 18px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .shot-head {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding-bottom: 4px;
+    }
+
+    .shot-title {
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .shot-code {
+      flex: 0 0 auto;
+      padding: 3px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #f9fafb;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .shot-main {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .shot-prompt {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fbfcfe;
+      overflow: hidden;
+    }
+
+    .shot-prompt h3 {
+      margin: 0;
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #f3f6fb;
+      font-size: 13px;
+    }
+
+    .prompt-body {
+      margin: 0;
+      padding: 12px;
+      color: #334155;
+      font: 12px/1.6 "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+      white-space: pre-wrap;
+    }
+
+    .window {
+      width: 100%;
+      min-height: 520px;
+      border: 2px solid #364152;
+      border-radius: var(--radius);
+      background: #fff;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .window.short { min-height: 450px; }
+    .window.tall { min-height: 590px; }
+
+    .top-bar {
+      height: 36px;
+      flex: 0 0 36px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--top);
+      color: #e5e7eb;
+      user-select: none;
+      font-size: 12px;
+    }
+
+    .top-left,
+    .top-tabs,
+    .win-controls,
+    .toolbar-left,
+    .toolbar-right,
+    .row,
+    .icon-row {
+      display: flex;
+      align-items: center;
+    }
+
+    .top-left { height: 100%; }
+    .top-tabs { height: 100%; }
+
+    .top-toggle {
+      width: 38px;
+      height: 100%;
+      display: grid;
+      place-items: center;
+      border-right: 1px solid #333b4a;
+      color: #c5ceda;
+      font-size: 15px;
+    }
+
+    .top-tab {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      padding: 0 15px;
+      border-bottom: 2px solid transparent;
+      color: #aab2c0;
+    }
+
+    .top-tab.active {
+      background: var(--top-2);
+      color: #fff;
+      border-bottom-color: var(--primary);
+    }
+
+    .drag-region {
+      flex: 1;
+      height: 100%;
+    }
+
+    .win-controls {
+      padding-right: 6px;
+      gap: 3px;
+    }
+
+    .win-btn,
+    .icon-btn,
+    .side-icon-btn {
+      display: grid;
+      place-items: center;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      color: inherit;
+    }
+
+    .win-btn {
+      width: 30px;
+      height: 28px;
+      color: #cfd6df;
+      font-size: 11px;
+    }
+
+    .win-btn.close { color: #ffb4b4; }
+
+    .app-body {
+      flex: 1;
+      display: flex;
+      min-height: 0;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .project-sidebar {
+      width: 210px;
+      flex: 0 0 210px;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      border-right: 1px solid var(--line);
+      background: #f8fafc;
+      min-height: 0;
+    }
+
+    .project-sidebar.collapsed {
+      width: 42px;
+      flex-basis: 42px;
+    }
+
+    .ps-header {
+      min-height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 8px 9px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .ps-title {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .side-icon-btn,
+    .icon-btn {
+      width: 25px;
+      height: 25px;
+      background: #fff;
+      border-color: var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .side-icon-btn.primary {
+      width: 34px;
+      border-color: #b8c7ff;
+      background: var(--primary-soft);
+      color: var(--primary);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .project-tree {
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+      padding: 8px;
+    }
+
+    .tree-scroll {
+      height: 100%;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .project-row,
+    .session-row,
+    .recent-row,
+    .menu-row,
+    .tool-row {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      border-radius: 6px;
+    }
+
+    .project-row {
+      gap: 6px;
+      padding: 7px 7px;
+      font-size: 12px;
+      color: var(--ink);
+    }
+
+    .project-row.active {
+      background: var(--primary-soft);
+      color: #1d4ed8;
+      font-weight: 700;
+    }
+
+    .project-row.drop-target {
+      border: 1px dashed var(--primary);
+      background: #f3f7ff;
+    }
+
+    .project-row-actions {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      margin-left: auto;
+    }
+
+    .project-row-action {
+      position: relative;
+      width: 20px;
+      height: 20px;
+      display: grid;
+      place-items: center;
+      border-radius: 5px;
+      color: currentColor;
+      font-size: 13px;
+      font-weight: 700;
+      opacity: 0.82;
+    }
+
+    .project-row-action.new-session::before {
+      content: "";
+      width: 10px;
+      height: 10px;
+      border: 1.5px solid currentColor;
+      border-radius: 3px;
+    }
+
+    .project-row-action.new-session::after {
+      content: "";
+      position: absolute;
+      right: 4px;
+      top: 5px;
+      width: 8px;
+      height: 1.6px;
+      border-radius: 999px;
+      background: currentColor;
+      transform: rotate(-45deg);
+      transform-origin: center;
+    }
+
+    .toggle-glyph,
+    .folder-glyph {
+      flex: 0 0 auto;
+      width: 16px;
+      text-align: center;
+    }
+
+    .name {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .session-list {
+      margin: 2px 0 6px 21px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .session-row {
+      gap: 6px;
+      padding: 5px 6px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .session-row.active {
+      background: transparent;
+      color: var(--primary);
+      box-shadow: inset 2px 0 0 var(--primary);
+    }
+
+    .session-row.renaming {
+      background: transparent;
+      box-shadow: inset 0 0 0 1px #f2c36b;
+    }
+
+    .status {
+      width: 8px;
+      height: 8px;
+      flex: 0 0 8px;
+      border-radius: 50%;
+      background: var(--off);
+    }
+
+    .status.idle { background: var(--idle); }
+    .status.running { background: var(--running); }
+
+    .x {
+      flex: 0 0 16px;
+      width: 16px;
+      height: 16px;
+      display: grid;
+      place-items: center;
+      border-radius: 4px;
+      color: var(--faint);
+      font-size: 13px;
+    }
+
+    .ps-footer {
+      padding: 8px;
+      border-top: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .settings-entry {
+      height: 31px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 10px;
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .center {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      background: #fff;
+      position: relative;
+    }
+
+    .module-toolbar {
+      height: 38px;
+      flex: 0 0 38px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 0 10px;
+      border-bottom: 1px solid var(--line);
+      background: #f9fafb;
+      font-size: 12px;
+    }
+
+    .toolbar-left {
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .toolbar-right {
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+
+    .session-title {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .content {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+      overflow: hidden;
+      background: var(--terminal);
+    }
+
+    .terminal {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      padding: 14px;
+      color: var(--terminal-text);
+      background:
+        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px) 0 0 / 100% 28px,
+        var(--terminal);
+      font: 12px/1.55 "Cascadia Mono", Consolas, monospace;
+    }
+
+    .prompt {
+      color: #63e6be;
+    }
+
+    .cursor {
+      display: inline-block;
+      width: 7px;
+      height: 14px;
+      margin-left: 2px;
+      background: #d8e1ee;
+      vertical-align: -2px;
+    }
+
+    .drawer {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 260px;
+      display: flex;
+      flex-direction: column;
+      border-left: 1px solid var(--line);
+      background: #fff;
+      box-shadow: -10px 0 22px rgba(15, 23, 42, 0.12);
+      z-index: 5;
+    }
+
+    .drawer.wide {
+      width: 360px;
+    }
+
+    .drawer-head {
+      height: 42px;
+      flex: 0 0 42px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .drawer-tabs-head {
+      position: relative;
+      min-height: 42px;
+      flex: 0 0 42px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+    }
+
+    .drawer-tab-strip {
+      min-width: 0;
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      overflow: hidden;
+    }
+
+    .drawer-tab {
+      max-width: 94px;
+      height: 27px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 0 7px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .drawer-tab.active {
+      border-color: #b8c7ff;
+      background: var(--primary-soft);
+      color: var(--primary);
+      font-weight: 700;
+    }
+
+    .drawer-tab-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .drawer-tab-close {
+      flex: 0 0 auto;
+      color: var(--faint);
+      font-size: 12px;
+      line-height: 1;
+    }
+
+    .drawer-add {
+      width: 28px;
+      height: 28px;
+      flex: 0 0 28px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      font-size: 18px;
+      line-height: 1;
+    }
+
+    .drawer-add-menu {
+      position: absolute;
+      top: 38px;
+      right: 8px;
+      width: 190px;
+      padding: 7px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      box-shadow: 0 12px 28px rgba(15, 23, 42, 0.16);
+      z-index: 20;
+    }
+
+    .drawer-add-menu .tool-row {
+      padding: 8px;
+    }
+
+    .drawer-body {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      background: #fff;
+    }
+
+    .drawer-drop-hint {
+      margin: 10px 10px 0;
+      padding: 8px 10px;
+      border: 1px dashed #94b6ff;
+      border-radius: var(--radius);
+      background: #f4f7ff;
+      color: #1d4ed8;
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
+    .drawer-section {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section-title {
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .tool-row {
+      gap: 8px;
+      padding: 7px 8px;
+      color: var(--ink);
+      font-size: 12px;
+    }
+
+    .shortcut {
+      margin-left: auto;
+      color: var(--faint);
+      font-size: 10px;
+      font-family: "Cascadia Mono", Consolas, monospace;
+    }
+
+    .recent-row {
+      gap: 7px;
+      padding: 6px 8px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .recent-row.active {
+      background: var(--accent-soft);
+      color: #0f766e;
+    }
+
+    .menu {
+      position: absolute;
+      min-width: 170px;
+      padding: 6px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16);
+      z-index: 8;
+    }
+
+    .menu-row {
+      gap: 8px;
+      padding: 7px 8px;
+      color: var(--ink);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .menu-row.danger {
+      color: var(--danger);
+    }
+
+    .project-menu {
+      left: 10px;
+      top: 47px;
+    }
+
+    .context-menu {
+      left: 132px;
+      top: 106px;
+    }
+
+    .toolbar-menu {
+      right: 45px;
+      top: 45px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      height: 22px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: #eef2f7;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .badge.ok { background: #e7f7ed; color: #15803d; }
+    .badge.warn { background: var(--warn-soft); color: #b45309; }
+    .badge.primary { background: var(--primary-soft); color: #1d4ed8; }
+    .badge.danger { background: var(--danger-soft); color: var(--danger); }
+
+    .callout {
+      border: 1px dashed var(--line-strong);
+      border-radius: var(--radius);
+      background: #fbfcfe;
+      padding: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .callout.primary {
+      border-color: #94b6ff;
+      background: #f4f7ff;
+      color: #1d4ed8;
+    }
+
+    .callout.warn {
+      border-color: #f0b75b;
+      background: #fffaf0;
+      color: #92400e;
+    }
+
+    .editor {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      height: 100%;
+      min-height: 328px;
+    }
+
+    .editor.single {
+      grid-template-columns: 1fr;
+    }
+
+    .file-mode-toolbar {
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 0 10px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .mode-switch {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #f8fafc;
+    }
+
+    .mode-option {
+      min-width: 42px;
+      height: 22px;
+      display: grid;
+      place-items: center;
+      border-radius: 5px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .mode-option.active {
+      background: #fff;
+      color: var(--primary);
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+      font-weight: 700;
+    }
+
+    .code-pane,
+    .preview-pane {
+      min-width: 0;
+      overflow: hidden;
+      border-right: 1px solid var(--line);
+      background: #fbfcfe;
+    }
+
+    .preview-pane {
+      border-right: 0;
+      background: #fff;
+    }
+
+    .pane-title {
+      height: 31px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 10px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .lines {
+      padding: 9px 0;
+      color: #334155;
+      font: 12px/1.7 "Cascadia Mono", Consolas, monospace;
+    }
+
+    .code-line {
+      display: grid;
+      grid-template-columns: 34px 1fr;
+      gap: 8px;
+      padding: 0 11px 0 0;
+      white-space: pre;
+    }
+
+    .ln {
+      color: #9aa4b2;
+      text-align: right;
+      user-select: none;
+    }
+
+    .preview {
+      padding: 13px 14px;
+      color: var(--ink);
+      font-size: 12px;
+    }
+
+    .preview h4 {
+      margin: 0 0 9px;
+      font-size: 15px;
+    }
+
+    .preview ul {
+      margin: 8px 0 0 18px;
+      padding: 0;
+    }
+
+    .syntax-key { color: #7c3aed; }
+    .syntax-str { color: #0f766e; }
+    .syntax-fn { color: #2563eb; }
+    .syntax-com { color: #8a94a3; }
+
+    .toast {
+      position: absolute;
+      left: 50%;
+      bottom: 22px;
+      transform: translateX(-50%);
+      max-width: 320px;
+      padding: 9px 13px;
+      border-radius: 999px;
+      background: #111827;
+      color: #fff;
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.24);
+      font-size: 12px;
+      white-space: nowrap;
+      z-index: 12;
+    }
+
+    .browser-toolbar {
+      height: 38px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 10px;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+    }
+
+    .browser-btn {
+      width: 24px;
+      height: 24px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .address {
+      flex: 1;
+      min-width: 0;
+      height: 25px;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .browser-empty,
+    .browser-page {
+      min-height: 282px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      background: #fff;
+    }
+
+    .browser-page {
+      align-items: stretch;
+      justify-content: flex-start;
+      padding: 12px;
+    }
+
+    .page-shell {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: #f8fafc;
+    }
+
+    .page-hero {
+      padding: 12px;
+      background: #eef5ff;
+      color: #1e3a8a;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .page-content {
+      padding: 12px;
+      color: var(--muted);
+    }
+
+    .mini-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .mini-grid.two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .mini-panel {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .mini-head {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .mini-body {
+      padding: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .drop-zone {
+      display: grid;
+      place-items: center;
+      min-height: 76px;
+      border: 1px dashed var(--primary);
+      border-radius: var(--radius);
+      background: #f4f7ff;
+      color: #1d4ed8;
+      text-align: center;
+      font-size: 12px;
+    }
+
+    .kbd-grid {
+      display: grid;
+      grid-template-columns: 150px 1fr;
+      gap: 7px 10px;
+      align-items: center;
+    }
+
+    .kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      padding: 0 8px;
+      border: 1px solid var(--line-strong);
+      border-bottom-width: 2px;
+      border-radius: 6px;
+      background: #fff;
+      color: #334155;
+      font: 11px "Cascadia Mono", Consolas, monospace;
+      white-space: nowrap;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .flow-node {
+      position: relative;
+      min-height: 86px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .flow-node strong {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--ink);
+      font-size: 13px;
+    }
+
+    .flow-node::after {
+      content: "→";
+      position: absolute;
+      right: -16px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--line-strong);
+      font-size: 18px;
+    }
+
+    .flow-node:last-child::after { display: none; }
+
+    .json-block {
+      margin: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #101827;
+      color: #dbeafe;
+      overflow: auto;
+      font: 12px/1.55 "Cascadia Mono", Consolas, monospace;
+    }
+
+    .check-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .check-table th,
+    .check-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .check-table th {
+      background: #f8fafc;
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    .check-table tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .notes {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 12px;
+      background: #fbfcfe;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .notes b {
+      display: block;
+      margin-bottom: 7px;
+      color: var(--ink);
+      font-size: 13px;
+    }
+
+    .notes ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    .notes li {
+      margin: 0 0 5px;
+    }
+
+    .prompt-library { display: none; }
+
+    @media (max-width: 1180px) {
+      body { padding: 18px; }
+      .art-brief,
+      .shot-card {
+        grid-template-columns: 1fr;
+      }
+      .flow {
+        grid-template-columns: 1fr;
+      }
+      .flow-node::after {
+        display: none;
+      }
+    }
+
+    @media (max-width: 820px) {
+      .window {
+        overflow-x: auto;
+      }
+      .app-body {
+        min-width: 760px;
+      }
+      .mini-grid,
+      .mini-grid.two {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>项目模块 UI 线框图 · 功能规划工作台</h1>
+    <p>来源：<code>项目功能开发文档.md</code>；制作规则：<code>UI线框图制作规范.md</code>。本页把项目模块的常规界面、状态反馈、数据流和验收点集中到同一个 HTML 中，后续 PNG 应从每个 <code>.shot-card</code> 截图导出。</p>
+  </header>
+
+  <section class="art-brief" aria-label="线框图公共前提">
+    <div class="brief-block">
+      <h2>公共前提</h2>
+      <p class="brief-text">新增“项目”主入口，配置、终端、编排三类现有 Tab 保持逻辑不变。项目 Tab 内采用左侧项目树、中部终端、右侧辅助抽屉的桌面工具布局。</p>
+      <div class="brief-tags">
+        <span class="pill">Tauri 桌面端</span>
+        <span class="pill">Windows 优先</span>
+        <span class="pill">终端复用</span>
+      </div>
+    </div>
+    <div class="brief-block">
+      <h2>线框风格</h2>
+      <p class="brief-text">保持灰白工作台、深色顶栏、清晰边框和状态色。所有按钮、菜单、抽屉、Toast、编辑器和数据流在真实界面语境中表达，不做脱离界面的状态大集合。</p>
+      <div class="brief-tags">
+        <span class="pill">结构优先</span>
+        <span class="pill">可截图卡片</span>
+        <span class="pill">左图右说明</span>
+      </div>
+    </div>
+    <div class="brief-block">
+      <h2>负向要求</h2>
+      <p class="brief-text">不新增文档外入口，不把右侧抽屉做成常驻面板，不让关闭终端等同删除会话，不混淆项目最近记录，不把导出 PNG 回填成线框源图。</p>
+      <div class="brief-tags">
+        <span class="pill">无营销页</span>
+        <span class="pill">无重复 prompt 堆叠</span>
+        <span class="pill">无乱码</span>
+      </div>
+    </div>
+  </section>
+
+  <main class="gallery">
+    <section class="shot-card" data-shot="01-main-collapsed">
+      <div class="shot-head">
+        <div class="shot-title">项目模块 · 主界面默认状态</div>
+        <div class="shot-code">UI-WF-01</div>
+      </div>
+      <div class="shot-main">
+        <div class="window">
+          <div class="top-bar">
+            <div class="top-left">
+              <div class="top-toggle" title="折叠/展开左侧项目边栏">☰</div>
+              <div class="top-tabs">
+                <div class="top-tab">配置</div>
+                <div class="top-tab">终端</div>
+                <div class="top-tab active">项目</div>
+                <div class="top-tab">编排</div>
+              </div>
+            </div>
+            <div class="drag-region" data-tauri-drag-region></div>
+            <div class="win-controls">
+              <div class="win-btn">—</div>
+              <div class="win-btn">□</div>
+              <div class="win-btn close">✕</div>
+            </div>
+          </div>
+
+          <div class="app-body">
+            <aside class="project-sidebar">
+              <div class="ps-header">
+                <div class="ps-title">项目 <span>▼</span></div>
+                <div class="icon-row">
+                  <div class="side-icon-btn" title="折叠项目边栏">↗</div>
+                  <div class="side-icon-btn primary" title="新增项目目录">📁+</div>
+                </div>
+              </div>
+              <div class="project-tree">
+                <div class="tree-scroll">
+                  <div class="project-row active">
+                    <span class="toggle-glyph">▼</span>
+                    <span class="folder-glyph">📁</span>
+                    <span class="name">医院仓库系统</span>
+                    <span class="project-row-actions"><span class="project-row-action more" title="项目更多菜单">⋯</span><span class="project-row-action new-session" title="新建项目会话"></span></span>
+                  </div>
+                  <div class="session-list">
+                    <div class="session-row active">
+                      <span class="status running"></span>
+                      <span class="name">主终端</span>
+                    </div>
+                    <div class="session-row">
+                      <span class="status idle"></span>
+                      <span class="name">测试分支</span>
+                    </div>
+                    <div class="session-row">
+                      <span class="status"></span>
+                      <span class="name">旧会话备份</span>
+                    </div>
+                  </div>
+                  <div class="project-row">
+                    <span class="toggle-glyph">▶</span>
+                    <span class="folder-glyph">📁</span>
+                    <span class="name">泡泡台球</span>
+                  </div>
+                  <div class="project-row">
+                    <span class="toggle-glyph">▶</span>
+                    <span class="folder-glyph">📁</span>
+                    <span class="name">Claude 启动器</span>
+                  </div>
+                </div>
+              </div>
+              <div class="ps-footer">
+                <div class="settings-entry">⚙ <span>设置</span></div>
+              </div>
+            </aside>
+
+            <section class="center">
+              <div class="module-toolbar">
+                <div class="toolbar-left">
+                  <div class="session-title">主终端</div>
+                </div>
+                <div class="toolbar-right">
+                  <div class="icon-btn" title="展开右侧辅助边栏">▯</div>
+                </div>
+              </div>
+              <div class="content">
+                <div class="terminal">
+                  <div>Microsoft Windows [Version 10.0.22631]</div>
+                  <div>(c) Microsoft Corporation. All rights reserved.</div>
+                  <br />
+                  <div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> claude</div>
+                  <div>Starting Claude Code...</div>
+                  <br />
+                  <div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> <span class="cursor"></span></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+        <div class="notes">
+          <b>说明</b>
+          <ul>
+            <li>顶部合并为单层应用栏：☰、配置/终端/项目/编排、窗口控制；中间空白区保留给 Tauri 拖拽。</li>
+            <li>左侧项目边栏宽度固定 210px，顶部贴住应用栏，底部放“设置”。</li>
+            <li>中部复用终端区域；右侧默认没有任何 UI，只有点击 ▯ 后才出现辅助抽屉。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="02-project-sidebar-actions">
+      <div class="shot-head">
+        <div class="shot-title">左侧项目边栏 · 项目选择、更多菜单、新增与拖拽</div>
+        <div class="shot-code">UI-WF-02</div>
+      </div>
+      <div class="shot-main">
+        <div class="window short">
+          <div class="top-bar">
+            <div class="top-left">
+              <div class="top-toggle">☰</div>
+              <div class="top-tabs">
+                <div class="top-tab">配置</div>
+                <div class="top-tab">终端</div>
+                <div class="top-tab active">项目</div>
+                <div class="top-tab">编排</div>
+              </div>
+            </div>
+            <div class="drag-region"></div>
+            <div class="win-controls"><div class="win-btn">—</div><div class="win-btn">□</div><div class="win-btn close">✕</div></div>
+          </div>
+          <div class="app-body">
+            <aside class="project-sidebar">
+              <div class="ps-header">
+                <div class="ps-title">项目 <span>▼</span></div>
+                <div class="icon-row">
+                  <div class="side-icon-btn">↗</div>
+                  <div class="side-icon-btn primary">📁+</div>
+                </div>
+              </div>
+              <div class="project-tree">
+                <div class="tree-scroll">
+                  <div class="project-row active"><span class="toggle-glyph">▼</span><span class="folder-glyph">📁</span><span class="name">医院仓库系统</span><span class="project-row-actions"><span class="project-row-action more" title="项目更多菜单">⋯</span><span class="project-row-action new-session" title="新建项目会话"></span></span></div>
+                  <div class="session-list">
+                    <div class="session-row"><span class="status running"></span><span class="name">主终端</span></div>
+                  </div>
+                  <div class="project-row drop-target"><span class="toggle-glyph"></span><span class="folder-glyph">📁</span><span class="name">拖入目录新增项目</span></div>
+                  <div class="project-row"><span class="toggle-glyph">▶</span><span class="folder-glyph">📁</span><span class="name">Claude 启动器</span></div>
+                </div>
+              </div>
+              <div class="ps-footer"><div class="settings-entry">⚙ <span>设置</span></div></div>
+            </aside>
+
+            <section class="center">
+              <div class="module-toolbar">
+                <div class="toolbar-left"><div class="session-title">主终端</div></div>
+                <div class="toolbar-right"><div class="icon-btn">▯</div></div>
+              </div>
+              <div class="content">
+                <div class="terminal">
+                  <div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> _</div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+        <div class="mini-grid">
+          <div class="mini-panel">
+            <div class="mini-head">项目选择菜单</div>
+            <div class="mini-body">
+              <div class="menu-row"><span>✓</span><span>医院仓库系统</span></div>
+              <div class="menu-row"><span></span><span>泡泡台球</span></div>
+              <div class="menu-row"><span></span><span>Claude 启动器</span></div>
+            </div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">项目更多菜单</div>
+            <div class="mini-body">
+              <div class="menu-row">✎ 重命名项目</div>
+              <div class="menu-row">↗ 打开项目目录</div>
+              <div class="menu-row danger">⌫ 删除项目</div>
+            </div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">新增项目目录</div>
+            <div class="mini-body">
+              <div class="callout primary">点击 📁+ 调用 Windows 文件夹选择对话框。</div>
+              <br />
+              <div class="callout">选择 <code>D:\Work\new-project</code> 后，新增项目并出现在左侧项目树。</div>
+            </div>
+          </div>
+        </div>
+        <div class="notes">
+          <b>交互说明</b>
+          <ul>
+            <li>“项目 ▼”打开项目选择菜单；项目行点击展开/收起会话树。</li>
+            <li>展开项目行右侧 <code>⋯</code> 提供重命名、打开目录、删除；最右侧新会话图标创建项目会话。</li>
+            <li>↗ 与顶栏 ☰ 功能一致；📁+ 调用 Windows 文件夹选择新增项目目录。</li>
+            <li>目录可拖拽到项目列表空白区新增项目；拖到已有项目上时进入路径替换/子目录打开确认流程。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="03-session-lifecycle">
+      <div class="shot-head">
+        <div class="shot-title">项目会话树 · 状态、切换、重命名与关闭语义</div>
+        <div class="shot-code">UI-WF-03</div>
+      </div>
+      <div class="shot-main">
+        <div class="window short">
+          <div class="top-bar">
+            <div class="top-left"><div class="top-toggle">☰</div><div class="top-tabs"><div class="top-tab">配置</div><div class="top-tab">终端</div><div class="top-tab active">项目</div><div class="top-tab">编排</div></div></div>
+            <div class="drag-region"></div>
+            <div class="win-controls"><div class="win-btn">—</div><div class="win-btn">□</div><div class="win-btn close">✕</div></div>
+          </div>
+          <div class="app-body">
+            <aside class="project-sidebar">
+              <div class="ps-header"><div class="ps-title">项目 <span>▼</span></div><div class="icon-row"><div class="side-icon-btn">↗</div><div class="side-icon-btn primary">📁+</div></div></div>
+              <div class="project-tree">
+                <div class="tree-scroll">
+                  <div class="project-row active"><span class="toggle-glyph">▼</span><span class="folder-glyph">📁</span><span class="name">医院仓库系统</span><span class="project-row-actions"><span class="project-row-action more" title="项目更多菜单">⋯</span><span class="project-row-action new-session" title="新建项目会话"></span></span></div>
+                  <div class="session-list">
+                    <div class="session-row"><span class="status"></span><span class="name">旧会话备份</span></div>
+                    <div class="session-row active"><span class="status idle"></span><span class="name">测试分支</span></div>
+                    <div class="session-row renaming"><span class="status running"></span><span class="name">主终端_重命名中</span></div>
+                  </div>
+                </div>
+              </div>
+              <div class="ps-footer"><div class="settings-entry">⚙ <span>设置</span></div></div>
+            </aside>
+            <section class="center">
+              <div class="module-toolbar">
+                <div class="toolbar-left">
+                  <div class="session-title">测试分支</div>
+                </div>
+                <div class="toolbar-right"><div class="icon-btn">▯</div></div>
+              </div>
+              <div class="content">
+                <div class="terminal">
+                  <div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> git status</div>
+                  <div>On branch test/session-routing</div>
+                  <br />
+                  <div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> <span class="cursor"></span></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+        <div class="mini-grid">
+          <div class="mini-panel">
+            <div class="mini-head">状态圆点</div>
+            <div class="mini-body"><span class="badge">灰色：未开启</span><br /><br /><span class="badge ok">绿色：待机</span><br /><br /><span class="badge warn">橙色：运行中</span></div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">会话切换</div>
+            <div class="mini-body">点击左侧会话行切换对应 <code>sessionId</code> 的终端实例，终端状态和输出保留。</div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">重命名</div>
+            <div class="mini-body">右键会话进入重命名；回车/失焦保存，Esc 取消。</div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">关闭语义</div>
+            <div class="mini-body">会话行负责展示状态圆点和会话名；关闭终端作为独立操作处理，关闭 PTY 时仍保留会话记录。</div>
+          </div>
+        </div>
+        <div class="notes">
+          <b>说明</b>
+          <ul>
+            <li>左侧项目下的会话行显示状态圆点和会话名称，不再带关闭按钮。</li>
+            <li>新建会话入口位于展开项目行最右侧，点击后创建并打开该项目的新会话；<code>Ctrl+T</code> 保留同样能力。</li>
+            <li>删除会话是独立操作：需要先关闭 PTY，再删除元数据。</li>
+            <li>状态判断复用终端运行态：无 PTY 为 off，2 秒内有输出为 running，否则 idle。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="04-module-toolbar-current-session">
+      <div class="shot-head">
+        <div class="shot-title">中部模块顶栏 · 当前会话与右侧抽屉入口</div>
+        <div class="shot-code">UI-WF-04</div>
+      </div>
+      <div class="shot-main">
+        <div class="window short">
+          <div class="top-bar">
+            <div class="top-left"><div class="top-toggle">☰</div><div class="top-tabs"><div class="top-tab">配置</div><div class="top-tab">终端</div><div class="top-tab active">项目</div><div class="top-tab">编排</div></div></div>
+            <div class="drag-region"></div>
+            <div class="win-controls"><div class="win-btn">—</div><div class="win-btn">□</div><div class="win-btn close">✕</div></div>
+          </div>
+          <div class="app-body">
+            <aside class="project-sidebar">
+              <div class="ps-header"><div class="ps-title">项目 ▼</div><div class="icon-row"><div class="side-icon-btn">↗</div><div class="side-icon-btn primary">📁+</div></div></div>
+              <div class="project-tree">
+                <div class="tree-scroll">
+                  <div class="project-row active"><span class="toggle-glyph">▼</span><span class="folder-glyph">📁</span><span class="name">医院仓库系统</span><span class="project-row-actions"><span class="project-row-action more" title="项目更多菜单">⋯</span><span class="project-row-action new-session" title="新建项目会话"></span></span></div>
+                  <div class="session-list"><div class="session-row active"><span class="status running"></span><span class="name">主终端</span></div><div class="session-row"><span class="status"></span><span class="name">新会话 2</span></div></div>
+                </div>
+              </div>
+              <div class="ps-footer"><div class="settings-entry">⚙ <span>设置</span></div></div>
+            </aside>
+            <section class="center">
+              <div class="module-toolbar">
+                <div class="toolbar-left">
+                  <div class="session-title">主终端</div>
+                </div>
+                <div class="toolbar-right">
+                  <div class="icon-btn">▯</div>
+                </div>
+              </div>
+              <div class="content">
+                <div class="terminal">
+                  <div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> claude</div>
+                  <div>Claude Code session started.</div>
+                  <br />
+                  <div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> <span class="cursor"></span></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+        <div class="mini-grid">
+          <div class="mini-panel">
+            <div class="mini-head">当前会话名</div>
+            <div class="mini-body">顶栏左侧直接显示当前会话名称，不再做终端标签页，也不显示关闭 <code>×</code>。</div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">项目上下文</div>
+            <div class="mini-body">项目上下文只通过左侧项目树体现，不放进中部终端模块顶栏。</div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">右侧抽屉</div>
+            <div class="mini-body">点击 <code>▯</code> 展开辅助边栏；再次点击或点边栏关闭按钮收起。</div>
+          </div>
+        </div>
+        <div class="notes">
+          <b>按钮定义</b>
+          <ul>
+            <li>中部顶栏只展示当前会话标题，不再承担标签页或项目切换功能。</li>
+            <li>顶栏最右侧只保留 <code>▯</code> 一个按钮，用于展开/收起右侧辅助边栏。</li>
+            <li>左侧项目下的会话行显示状态圆点和会话名称，状态通过圆点颜色表达，不用行底色表达。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="05-right-sidebar-tools-recent">
+      <div class="shot-head">
+        <div class="shot-title">右侧辅助边栏 · 工具菜单与按项目隔离的最近记录</div>
+        <div class="shot-code">UI-WF-05</div>
+      </div>
+      <div class="shot-main">
+        <div class="window">
+          <div class="top-bar">
+            <div class="top-left"><div class="top-toggle">☰</div><div class="top-tabs"><div class="top-tab">配置</div><div class="top-tab">终端</div><div class="top-tab active">项目</div><div class="top-tab">编排</div></div></div>
+            <div class="drag-region"></div>
+            <div class="win-controls"><div class="win-btn">—</div><div class="win-btn">□</div><div class="win-btn close">✕</div></div>
+          </div>
+          <div class="app-body">
+            <aside class="project-sidebar">
+              <div class="ps-header"><div class="ps-title">项目 ▼</div><div class="icon-row"><div class="side-icon-btn">↗</div><div class="side-icon-btn primary">📁+</div></div></div>
+              <div class="project-tree">
+                <div class="tree-scroll">
+                  <div class="project-row active"><span class="toggle-glyph">▼</span><span class="folder-glyph">📁</span><span class="name">医院仓库系统</span><span class="project-row-actions"><span class="project-row-action more" title="项目更多菜单">⋯</span><span class="project-row-action new-session" title="新建项目会话"></span></span></div>
+                  <div class="session-list"><div class="session-row active"><span class="status running"></span><span class="name">主终端</span></div></div>
+                  <div class="project-row"><span class="toggle-glyph">▶</span><span class="folder-glyph">📁</span><span class="name">泡泡台球</span></div>
+                </div>
+              </div>
+              <div class="ps-footer"><div class="settings-entry">⚙ <span>设置</span></div></div>
+            </aside>
+            <section class="center">
+              <div class="module-toolbar">
+                <div class="toolbar-left"><div class="session-title">主终端</div></div>
+                <div class="toolbar-right"><div class="icon-btn" style="background: var(--primary-soft); color: var(--primary); border-color: #b8c7ff;">▯</div></div>
+              </div>
+              <div class="content">
+                <div class="terminal"><div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> <span class="cursor"></span></div></div>
+                <aside class="drawer">
+                  <div class="drawer-tabs-head">
+                    <div class="drawer-tab-strip">
+                      <div class="drawer-tab active"><span class="drawer-tab-name">工具</span><span class="drawer-tab-close">×</span></div>
+                    </div>
+                    <div class="drawer-add">+</div>
+                  </div>
+                  <div class="drawer-body">
+                    <div class="drawer-section">
+                      <div class="section-title">打开</div>
+                      <div class="tool-row">📄 <span>文件</span><span class="shortcut">Ctrl+P</span></div>
+                      <div class="tool-row">🖥 <span>终端</span><span class="shortcut">Ctrl+T</span></div>
+                      <div class="tool-row">🌐 <span>浏览器</span><span class="shortcut">Ctrl+B</span></div>
+                    </div>
+                    <div class="drawer-section">
+                      <div class="section-title">最近（医院仓库系统）</div>
+                      <div class="recent-row active">📝 <span class="name">备忘录.md</span></div>
+                      <div class="recent-row">🌐 <span class="name">https://claude.ai</span></div>
+                      <div class="recent-row">🖥 <span class="name">辅助终端 · 09:41</span></div>
+                    </div>
+                  </div>
+                </aside>
+              </div>
+            </section>
+          </div>
+        </div>
+        <div class="mini-grid two">
+          <div class="mini-panel">
+            <div class="mini-head">医院仓库系统 recentItems</div>
+            <div class="mini-body">
+              <div class="recent-row active">📝 <span class="name">备忘录.md</span></div>
+              <div class="recent-row">🌐 <span class="name">https://claude.ai</span></div>
+              <div class="recent-row">🖥 <span class="name">辅助终端 · 09:41</span></div>
+            </div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">切到泡泡台球后</div>
+            <div class="mini-body">
+              <div class="recent-row">📄 <span class="name">关卡配置.json</span></div>
+              <div class="recent-row">🌐 <span class="name">localhost:5173</span></div>
+              <div class="callout">只显示当前项目记录，不混入其他项目。</div>
+            </div>
+          </div>
+        </div>
+        <div class="notes">
+          <b>说明</b>
+          <ul>
+            <li>抽屉从中部内容区右侧滑入，推荐覆盖终端，不压缩终端布局。</li>
+            <li>默认面板为“工具”；文件、终端、浏览器入口都在此处。</li>
+            <li>最近列表使用当前项目的 <code>recentItems</code>，按 <code>openedAt</code> 倒序并置顶新记录。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="06-file-editor-markdown">
+      <div class="shot-head">
+        <div class="shot-title">右侧辅助边栏 · Markdown 文件编辑与实时预览</div>
+        <div class="shot-code">UI-WF-06</div>
+      </div>
+      <div class="shot-main">
+        <div class="window tall">
+          <div class="top-bar">
+            <div class="top-left"><div class="top-toggle">☰</div><div class="top-tabs"><div class="top-tab">配置</div><div class="top-tab">终端</div><div class="top-tab active">项目</div><div class="top-tab">编排</div></div></div>
+            <div class="drag-region"></div>
+            <div class="win-controls"><div class="win-btn">—</div><div class="win-btn">□</div><div class="win-btn close">✕</div></div>
+          </div>
+          <div class="app-body">
+            <aside class="project-sidebar">
+              <div class="ps-header"><div class="ps-title">项目 ▼</div><div class="icon-row"><div class="side-icon-btn">↗</div><div class="side-icon-btn primary">📁+</div></div></div>
+              <div class="project-tree"><div class="tree-scroll"><div class="project-row active"><span class="toggle-glyph">▼</span><span class="folder-glyph">📁</span><span class="name">医院仓库系统</span><span class="project-row-actions"><span class="project-row-action more" title="项目更多菜单">⋯</span><span class="project-row-action new-session" title="新建项目会话"></span></span></div><div class="session-list"><div class="session-row active"><span class="status idle"></span><span class="name">主终端</span></div></div></div></div>
+              <div class="ps-footer"><div class="settings-entry">⚙ <span>设置</span></div></div>
+            </aside>
+            <section class="center">
+              <div class="module-toolbar">
+                <div class="toolbar-left"><div class="session-title">主终端</div></div>
+                <div class="toolbar-right"><div class="icon-btn" style="background: var(--primary-soft); color: var(--primary);">▯</div></div>
+              </div>
+              <div class="content">
+                <div class="terminal"><div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> <span class="cursor"></span></div></div>
+                <aside class="drawer wide">
+                  <div class="drawer-tabs-head">
+                    <div class="drawer-tab-strip">
+                      <div class="drawer-tab active"><span class="drawer-tab-name">备忘录.md</span><span class="drawer-tab-close">×</span></div>
+                      <div class="drawer-tab"><span class="drawer-tab-name">终端</span><span class="drawer-tab-close">×</span></div>
+                      <div class="drawer-tab"><span class="drawer-tab-name">claude.ai</span><span class="drawer-tab-close">×</span></div>
+                    </div>
+                    <div class="drawer-add">+</div>
+                    <div class="drawer-add-menu">
+                      <div class="tool-row">📄 <span>文件</span><span class="shortcut">Ctrl+P</span></div>
+                      <div class="tool-row">🖥 <span>终端</span><span class="shortcut">Ctrl+T</span></div>
+                      <div class="tool-row">🌐 <span>浏览器</span><span class="shortcut">Ctrl+B</span></div>
+                    </div>
+                  </div>
+                  <div class="drawer-body">
+                    <div class="drawer-drop-hint">拖拽 .md / .txt / 代码文件到右侧边栏，直接作为新标签打开</div>
+                    <div class="file-mode-toolbar">
+                      <span>● 备忘录.md <span class="badge warn">已修改</span></span>
+                      <div class="mode-switch" aria-label="Markdown 视图切换">
+                        <span class="mode-option active">源码</span>
+                        <span class="mode-option">预览</span>
+                      </div>
+                    </div>
+                    <div class="editor single">
+                      <div class="code-pane">
+                        <div class="pane-title"><span>Markdown 源码</span><span class="shortcut">Ctrl+S 保存</span></div>
+                        <div class="lines">
+                          <div class="code-line"><span class="ln">1</span><span># 备忘录</span></div>
+                          <div class="code-line"><span class="ln">2</span><span></span></div>
+                          <div class="code-line"><span class="ln">3</span><span>- 待办事项</span></div>
+                          <div class="code-line"><span class="ln">4</span><span>- 更新项目线框图</span></div>
+                          <div class="code-line"><span class="ln">5</span><span>- 检查 recentItems 持久化</span></div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </aside>
+              </div>
+            </section>
+          </div>
+        </div>
+        <div class="notes">
+          <b>说明</b>
+          <ul>
+            <li>Markdown 源码和实时预览通过“源码 / 预览”按钮切换，同一时间只展示一个视图。</li>
+            <li>右侧边栏顶部使用短标签页，可并列展示多个打开项；关闭按钮位于标签内，紧跟标题。</li>
+            <li>标签页最右侧 <code>+</code> 打开小列表，可选择文件、终端、浏览器等功能。</li>
+            <li>拖拽 md/txt/代码文件到右侧边栏任一区域时，直接作为新标签打开文件编辑器。</li>
+            <li><code>Ctrl+S</code> 调用保存命令写回磁盘；关闭 dirty 文件前提示保存。</li>
+            <li>打开文件后调用 <code>recordRecentItem('file', fileName, filePath)</code>，并在当前项目最近记录中置顶。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="07-file-editor-code-unsupported">
+      <div class="shot-head">
+        <div class="shot-title">右侧辅助边栏 · 代码/文本编辑与不支持类型提示</div>
+        <div class="shot-code">UI-WF-07</div>
+      </div>
+      <div class="shot-main">
+        <div class="mini-grid two">
+          <div class="mini-panel">
+            <div class="mini-head">代码文件：语法高亮 + 行号</div>
+            <div class="mini-body">
+              <div class="editor single" style="min-height: 260px;">
+                <div class="code-pane" style="border-right: 0;">
+                  <div class="pane-title"><span>project.ts</span><span class="badge ok">可保存</span></div>
+                  <div class="lines">
+                    <div class="code-line"><span class="ln">1</span><span><span class="syntax-key">export</span> <span class="syntax-key">interface</span> Project {</span></div>
+                    <div class="code-line"><span class="ln">2</span><span>  id: <span class="syntax-str">'string'</span></span></div>
+                    <div class="code-line"><span class="ln">3</span><span>  recentItems: RecentItem[]</span></div>
+                    <div class="code-line"><span class="ln">4</span><span>}</span></div>
+                    <div class="code-line"><span class="ln">5</span><span><span class="syntax-com">// js/ts/vue/html/css/rust/python/json/yaml</span></span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">纯文本与不支持文件</div>
+            <div class="mini-body">
+              <div class="callout primary">txt/log/env 等纯文本按普通编辑器打开，仍显示行号和保存状态。</div>
+              <br />
+              <div class="callout warn">pdf/exe/图片等不在内置编辑器中打开，使用飘字提示。</div>
+              <br />
+              <div style="position: relative; min-height: 92px; border: 1px solid var(--line); border-radius: var(--radius); background: #f8fafc;">
+                <div class="toast">无法打开该文件类型：installer.exe</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="notes">
+          <b>说明</b>
+          <ul>
+            <li>代码文件支持常见语法高亮、行号和基础主题；纯文本文件按文本编辑器展示。</li>
+            <li>无法打开的文件类型只给出清晰提示，不创建空编辑器。</li>
+            <li>拖拽 md/txt/代码文件到右侧边栏或会话区域时，也会打开右侧文件编辑器并记录最近项目。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="08-assistant-terminal">
+      <div class="shot-head">
+        <div class="shot-title">右侧辅助边栏 · 独立辅助终端</div>
+        <div class="shot-code">UI-WF-08</div>
+      </div>
+      <div class="shot-main">
+        <div class="window short">
+          <div class="top-bar">
+            <div class="top-left"><div class="top-toggle">☰</div><div class="top-tabs"><div class="top-tab">配置</div><div class="top-tab">终端</div><div class="top-tab active">项目</div><div class="top-tab">编排</div></div></div>
+            <div class="drag-region"></div>
+            <div class="win-controls"><div class="win-btn">—</div><div class="win-btn">□</div><div class="win-btn close">✕</div></div>
+          </div>
+          <div class="app-body">
+            <aside class="project-sidebar">
+              <div class="ps-header"><div class="ps-title">项目 ▼</div><div class="icon-row"><div class="side-icon-btn">↗</div><div class="side-icon-btn primary">📁+</div></div></div>
+              <div class="project-tree"><div class="tree-scroll"><div class="project-row active"><span class="toggle-glyph">▼</span><span class="folder-glyph">📁</span><span class="name">医院仓库系统</span><span class="project-row-actions"><span class="project-row-action more" title="项目更多菜单">⋯</span><span class="project-row-action new-session" title="新建项目会话"></span></span></div><div class="session-list"><div class="session-row active"><span class="status idle"></span><span class="name">主终端</span></div></div></div></div>
+              <div class="ps-footer"><div class="settings-entry">⚙ <span>设置</span></div></div>
+            </aside>
+            <section class="center">
+              <div class="module-toolbar">
+                <div class="toolbar-left"><div class="session-title">主终端</div></div>
+                <div class="toolbar-right"><div class="icon-btn" style="background: var(--primary-soft); color: var(--primary);">▯</div></div>
+              </div>
+              <div class="content">
+                <div class="terminal"><div><span class="prompt">D:\Work\hospital-warehouse&gt;</span> npm run dev</div><div>VITE ready in 420 ms</div></div>
+                <aside class="drawer">
+                  <div class="drawer-tabs-head">
+                    <div class="drawer-tab-strip">
+                      <div class="drawer-tab"><span class="drawer-tab-name">备忘录.md</span><span class="drawer-tab-close">×</span></div>
+                      <div class="drawer-tab active"><span class="drawer-tab-name">终端</span><span class="drawer-tab-close">×</span></div>
+                    </div>
+                    <div class="drawer-add">+</div>
+                  </div>
+                  <div class="drawer-body" style="background: var(--terminal);">
+                    <div class="terminal" style="position: static; min-height: 100%; background: var(--terminal);">
+                      <div><span class="prompt">$</span> cd D:\Work\hospital-warehouse</div>
+                      <div><span class="prompt">$</span> rg "TODO" src</div>
+                      <div>src\stores\project.ts:18: TODO persist</div>
+                      <br />
+                      <div><span class="prompt">$</span> <span class="cursor"></span></div>
+                    </div>
+                  </div>
+                </aside>
+              </div>
+            </section>
+          </div>
+        </div>
+        <div class="notes">
+          <b>说明</b>
+          <ul>
+            <li>辅助终端与中部终端共用 PTY 逻辑，但实例独立，默认 cwd 为当前项目路径。</li>
+            <li>辅助终端不显示在左侧项目会话树中，只作为右侧工具记录到当前项目最近项。</li>
+            <li>关闭抽屉终端时释放对应 PTY，避免长期运行积累实例。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="09-browser-panel">
+      <div class="shot-head">
+        <div class="shot-title">右侧辅助边栏 · 内置浏览器面板</div>
+        <div class="shot-code">UI-WF-09</div>
+      </div>
+      <div class="shot-main">
+        <div class="mini-grid two">
+          <div class="mini-panel">
+            <div class="mini-head">空状态</div>
+            <div class="mini-body">
+              <div class="browser-toolbar"><div class="browser-btn">◀</div><div class="browser-btn">▶</div><div class="browser-btn">↻</div><div class="address">输入 URL...</div></div>
+              <div class="browser-empty">
+                <div style="font-size: 34px;">🌐</div>
+                <strong style="color: var(--ink);">开始浏览</strong>
+                <span>输入 URL 以打开页面</span>
+              </div>
+            </div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">URL 加载后</div>
+            <div class="mini-body">
+              <div class="browser-toolbar"><div class="browser-btn">◀</div><div class="browser-btn">▶</div><div class="browser-btn">↻</div><div class="address">https://claude.ai</div></div>
+              <div class="browser-page">
+                <div class="page-shell">
+                  <div class="page-hero">claude.ai</div>
+                  <div class="page-content">使用 Tauri Webview 或 iframe 嵌入网页。导航按钮更新历史栈，刷新按钮重新加载当前 URL。</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="notes">
+          <b>说明</b>
+          <ul>
+            <li>地址栏回车后加载网页；前进、后退、刷新提供基础导航。</li>
+            <li>打开浏览器后调用 <code>recordRecentItem('browser', url, url)</code>，URL 进入当前项目 recentItems。</li>
+            <li>只加载用户主动输入的 URL；安全策略由 Tauri Webview/iframe 实现时进一步约束。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="10-drag-shortcuts">
+      <div class="shot-head">
+        <div class="shot-title">拖拽入口与快捷键分发</div>
+        <div class="shot-code">UI-WF-10</div>
+      </div>
+      <div class="shot-main">
+        <div class="mini-grid two">
+          <div class="mini-panel">
+            <div class="mini-head">拖拽反馈</div>
+            <div class="mini-body">
+              <div class="drop-zone">拖拽目录到项目列表空白处<br />新增项目</div>
+              <br />
+              <div class="drop-zone" style="border-color: #0f766e; background: #f0fdfa; color: #0f766e;">拖拽 md / txt / 代码文件到右侧边栏或会话区域<br />右侧打开文件编辑器</div>
+              <br />
+              <div class="callout warn">拖拽其他类型文件：显示“无法打开该文件类型：xxx.ext”。</div>
+            </div>
+          </div>
+          <div class="mini-panel">
+            <div class="mini-head">快捷键</div>
+            <div class="mini-body">
+              <div class="kbd-grid">
+                <span class="kbd">Ctrl + T</span><span>项目内新建会话；终端 Tab 内仍是新建终端标签。</span>
+                <span class="kbd">Ctrl + W</span><span>关闭当前活动会话终端。</span>
+                <span class="kbd">Ctrl + Tab</span><span>在项目会话间切换。</span>
+                <span class="kbd">Ctrl + P</span><span>右侧边栏打开文件。</span>
+                <span class="kbd">Ctrl + Shift + B</span><span>展开或收起右侧边栏。</span>
+                <span class="kbd">Ctrl + S</span><span>保存当前编辑文件。</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="notes">
+          <b>说明</b>
+          <ul>
+            <li>快捷键需要根据当前主 Tab 分发，避免项目内 <code>Ctrl+T</code> 与顶部终端 Tab 的行为冲突。</li>
+            <li>拖拽读取文件需要 Tauri 权限和路径校验，右侧边栏和会话区域共用同一套文件类型判断与打开流程。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="11-data-store-persistence">
+      <div class="shot-head">
+        <div class="shot-title">状态管理、后端命令与持久化路径</div>
+        <div class="shot-code">UI-WF-11</div>
+      </div>
+      <div class="shot-main">
+        <div class="flow" aria-label="项目数据流">
+          <div class="flow-node"><strong>ProjectPanel</strong>读取 activeProject、activeSession、activeSidebarTab，组合左侧树/终端/抽屉。</div>
+          <div class="flow-node"><strong>Pinia project store</strong>projects、sessions、recentItems、sidebarTabs、sidebarOpen。</div>
+          <div class="flow-node"><strong>Tauri commands</strong>load_projects、save_projects、pick_project_directory。</div>
+          <div class="flow-node"><strong>projects.json</strong>%APPDATA%\ClaudeEnvManager\projects.json。</div>
+          <div class="flow-node"><strong>启动恢复</strong>lastActiveMainTab 为 project 则进入项目，否则进入配置。</div>
+        </div>
+        <pre class="json-block">{
+  "projects": [
+    {
+      "id": "project-hospital",
+      "name": "医院仓库系统",
+      "path": "D:\\Work\\hospital-warehouse",
+      "recentItems": [
+        { "type": "file", "name": "备忘录.md", "path": "D:/Work/hospital-warehouse/备忘录.md", "openedAt": 1234567890 },
+        { "type": "browser", "name": "claude.ai", "url": "https://claude.ai", "openedAt": 1234567800 }
+      ]
+    }
+  ],
+  "sessions": [
+    { "id": "session-main", "projectId": "project-hospital", "name": "主终端", "cwd": "D:\\Work\\hospital-warehouse" }
+  ],
+  "lastActiveMainTab": "project"
+}</pre>
+        <div class="notes">
+          <b>说明</b>
+          <ul>
+            <li>项目/会话元数据和最近记录每次增删改后保存；终端输出不持久化。</li>
+            <li>右侧边栏展开状态不持久化，启动后默认收起。</li>
+            <li>关闭 App 前记录当前主 Tab；只有上次是项目 Tab 时，下次直接进入项目。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="shot-card" data-shot="12-acceptance-matrix">
+      <div class="shot-head">
+        <div class="shot-title">实现确认矩阵 · 对齐开发文档验收 checklist</div>
+        <div class="shot-code">UI-WF-12</div>
+      </div>
+      <div class="shot-main">
+        <table class="check-table">
+          <thead>
+            <tr>
+              <th>功能点</th>
+              <th>线框覆盖</th>
+              <th>确认要点</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>顶部单栏</td><td><span class="badge ok">WF-01</span></td><td>☰、四个主 Tab、窗口控制、拖拽区域。</td></tr>
+            <tr><td>项目边栏</td><td><span class="badge ok">WF-01 / WF-02</span></td><td>固定 210px、项目树、会话树、项目行更多与新会话入口、底部设置。</td></tr>
+            <tr><td>新增项目目录</td><td><span class="badge ok">WF-02</span></td><td>📁+ 调用文件夹选择；拖拽目录新增项目。</td></tr>
+            <tr><td>会话列表</td><td><span class="badge ok">WF-03</span></td><td>项目下显示状态圆点 + 会话名称；项目行最右侧图标创建新会话。</td></tr>
+            <tr><td>中部模块顶栏</td><td><span class="badge ok">WF-04</span></td><td>仅当前会话标题和右侧边栏开关；不再做标签页或项目切换。</td></tr>
+            <tr><td>右侧工具菜单</td><td><span class="badge ok">WF-05</span></td><td>文件、终端、浏览器、最近记录按项目隔离。</td></tr>
+            <tr><td>文件编辑器</td><td><span class="badge ok">WF-06 / WF-07</span></td><td>Markdown 源码/预览切换、代码高亮、纯文本、dirty、Ctrl+S、不支持类型提示。</td></tr>
+            <tr><td>辅助终端</td><td><span class="badge ok">WF-08</span></td><td>独立 PTY，默认当前项目 cwd，不进入左侧会话树。</td></tr>
+            <tr><td>内置浏览器</td><td><span class="badge ok">WF-09</span></td><td>地址栏、前进/后退/刷新、URL recentItem。</td></tr>
+            <tr><td>快捷键与拖拽</td><td><span class="badge ok">WF-10</span></td><td>按当前主 Tab 分发快捷键；拖拽目录新增项目，拖拽 md/txt/代码文件到右侧边栏或会话区域打开编辑器。</td></tr>
+            <tr><td>持久化与启动恢复</td><td><span class="badge ok">WF-11</span></td><td>projects.json、lastActiveMainTab、右侧抽屉不持久化。</td></tr>
+          </tbody>
+        </table>
+        <div class="notes">
+          <b>待确认</b>
+          <ul>
+            <li>我按文档把完整功能拆到了 12 张线框卡片；如果你认可这个范围，后续可以按这份 HTML 输出 PNG 或进入前端实现。</li>
+            <li>如需更贴近实际 App，可继续补一张“设置弹窗内容迁移”细节图，或把项目删除/未保存关闭确认弹窗拆成独立状态卡片。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <section class="prompt-library" aria-label="线框提示词数据源">
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-01 项目模块主界面默认状态</summary>
+        <pre class="prompt-text">中文：基于上传线框图生成桌面工具型项目模块 UI，严格遵守单层顶部应用栏、左侧 210px 项目树、中部终端、右侧默认空的布局；不要新增文档外按钮或营销装饰；保持灰白工作台、深色标题栏和清晰状态圆点。
+English: Generate a desktop productivity UI from the uploaded wireframe. Strictly preserve the single top title bar, 210px project tree, central terminal, and no visible right drawer by default. Do not add extra buttons, banners, or decorative marketing elements.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-02 左侧项目边栏操作</summary>
+        <pre class="prompt-text">中文：突出项目选择、折叠、项目行更多菜单、项目行最右侧新会话图标、文件夹新增和拖拽新增项目的交互状态；菜单必须贴近触发按钮；保持项目树可扫读。
+English: Emphasize project selection, collapse, the project-row more menu, the far-right new-session icon on the expanded project row, add-folder, and drag-to-add states. Menus should appear near their trigger and the project tree should stay scannable.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-03 项目会话生命周期</summary>
+        <pre class="prompt-text">中文：展示项目下的会话列表、当前会话切换和重命名状态；每个会话行左侧必须有灰/绿/橙状态圆点，右侧显示会话名称，不出现关闭按钮或终端标签页；展开项目行最右侧有新会话图标。
+English: Show the project session list, active session switching, and rename state. Each session row must have a gray/green/orange status dot on the left and the session name on the right, without close buttons or terminal-tab styling. The expanded project row has a far-right new-session icon.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-04 中部模块顶栏</summary>
+        <pre class="prompt-text">中文：中部模块顶栏只显示当前会话标题和一个右侧边栏展开按钮；不要显示项目名，不要做标签页，不要加入更多或新会话按钮。
+English: The central module toolbar should only show the active session title and one right-sidebar toggle. Do not show the project name, tabs, more-actions buttons, or creation buttons.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-05 右侧工具菜单与最近记录</summary>
+        <pre class="prompt-text">中文：右侧抽屉从中部内容区右边出现，工具菜单包含文件、终端、浏览器；最近记录必须标明当前项目，体现按项目隔离。
+English: The right drawer should slide from the right side of the central content. Include File, Terminal, and Browser tools. Recent items must show the active project and imply project isolation.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-06 Markdown 文件编辑器</summary>
+        <pre class="prompt-text">中文：展示右侧抽屉内 Markdown 编辑器，顶部是短标签页条，标签内关闭按钮紧跟标题，最右侧加号弹出打开功能列表；源码和预览通过按钮切换，不要并列展示；右侧边栏可接收 md/txt/代码文件拖拽并作为新标签打开。
+English: Show a Markdown editor inside the right drawer. The top uses short tabs with each close button next to its title, and a plus button on the far right opens a small function menu. Source and preview switch through a button instead of being shown side by side. The right drawer accepts dropped md/txt/code files and opens them as new tabs.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-07 代码文本与不支持类型</summary>
+        <pre class="prompt-text">中文：代码文件显示行号与基础语法高亮；纯文本可编辑；不支持文件类型用 toast 提示，不新增空白编辑面板。
+English: Code files should show line numbers and basic syntax highlighting; plain text remains editable; unsupported file types should show a toast instead of creating an empty editor panel.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-08 辅助终端</summary>
+        <pre class="prompt-text">中文：右侧终端是独立辅助实例，默认 cwd 为当前项目，不出现在左侧会话树；终端视觉与中部终端保持同源。
+English: The right-side terminal is an independent helper instance with cwd set to the active project. It must not appear in the left session tree, and should visually match the central terminal.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-09 内置浏览器</summary>
+        <pre class="prompt-text">中文：浏览器面板保留后退、前进、刷新和地址栏，展示空状态与 URL 加载后的页面骨架；不要新增复杂浏览器功能。
+English: The browser panel should keep back, forward, refresh, and address bar controls. Show both empty state and a loaded URL skeleton. Do not add advanced browser features.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-10 拖拽与快捷键</summary>
+        <pre class="prompt-text">中文：用真实界面语境表达拖拽目录、拖拽文件、快捷键分发；文件拖拽目标包含右侧边栏和左侧会话区域；强调 Ctrl+T 在项目 Tab 和终端 Tab 中含义不同。
+English: Present drag-and-drop directories, drag-and-drop files, and shortcut dispatch in realistic UI context. File drop targets include the right drawer and the left session area. Emphasize that Ctrl+T behaves differently in Project and Terminal tabs.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-11 状态管理与持久化</summary>
+        <pre class="prompt-text">中文：用清晰流程图表达 ProjectPanel、Pinia store、Tauri 命令、projects.json、启动恢复之间的数据流；保持工程文档风格。
+English: Use a clear flow diagram to show data moving through ProjectPanel, Pinia store, Tauri commands, projects.json, and launch restoration. Keep an engineering documentation style.</pre>
+      </details>
+    </article>
+    <article class="prompt-card">
+      <details>
+        <summary>UI-WF-12 实现确认矩阵</summary>
+        <pre class="prompt-text">中文：保留验收矩阵的功能点、线框覆盖和确认要点三列；用于策划和开发对齐，不做视觉发散。
+English: Preserve the acceptance matrix with columns for feature, wireframe coverage, and confirmation notes. This is for planning and engineering alignment, not visual exploration.</pre>
+      </details>
+    </article>
+  </section>
+
+  <script>
+    function attachPromptsToWireframes() {
+      const promptMap = {
+        '01-main-collapsed': 'UI-WF-01 项目模块主界面默认状态',
+        '02-project-sidebar-actions': 'UI-WF-02 左侧项目边栏操作',
+        '03-session-lifecycle': 'UI-WF-03 项目会话生命周期',
+        '04-module-toolbar-current-session': 'UI-WF-04 中部模块顶栏',
+        '05-right-sidebar-tools-recent': 'UI-WF-05 右侧工具菜单与最近记录',
+        '06-file-editor-markdown': 'UI-WF-06 Markdown 文件编辑器',
+        '07-file-editor-code-unsupported': 'UI-WF-07 代码文本与不支持类型',
+        '08-assistant-terminal': 'UI-WF-08 辅助终端',
+        '09-browser-panel': 'UI-WF-09 内置浏览器',
+        '10-drag-shortcuts': 'UI-WF-10 拖拽与快捷键',
+        '11-data-store-persistence': 'UI-WF-11 状态管理与持久化',
+        '12-acceptance-matrix': 'UI-WF-12 实现确认矩阵'
+      };
+
+      const prompts = new Map(
+        Array.from(document.querySelectorAll('.prompt-card')).map((card) => {
+          const title = card.querySelector('summary')?.textContent?.trim();
+          const text = card.querySelector('.prompt-text')?.textContent?.trim();
+          return [title, text];
+        })
+      );
+
+      document.querySelectorAll('.shot-card').forEach((shot) => {
+        const shotId = shot.getAttribute('data-shot');
+        const promptTitle = promptMap[shotId];
+        const promptText = prompts.get(promptTitle);
+        if (!promptTitle || !promptText) return;
+
+        const panel = document.createElement('aside');
+        panel.className = 'shot-prompt';
+        panel.innerHTML = `<h3>${promptTitle} · Prompt</h3><pre class="prompt-body"></pre>`;
+        panel.querySelector('.prompt-body').textContent = promptText;
+        shot.appendChild(panel);
+      });
+    }
+
+    attachPromptsToWireframes();
+  </script>
+</body>
+</html>
