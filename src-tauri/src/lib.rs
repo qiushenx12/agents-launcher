@@ -6,6 +6,7 @@ pub mod cli_runtime;
 pub mod codex_config;
 pub mod config_store;
 pub mod dependency_manager;
+pub mod env_applier;
 pub mod file_transaction;
 pub mod model_fetcher;
 pub mod opencode_config;
@@ -80,8 +81,8 @@ pub fn run() {
             // config_store commands
             config_store::load_claude_configs,
             config_store::save_claude_configs,
-            // registry commands
-            registry::apply_env_vars,
+            // env_applier commands (cross-platform env vars)
+            env_applier::apply_env_vars,
             // settings_manager commands
             settings_manager::load_claude_settings,
             settings_manager::save_claude_settings,

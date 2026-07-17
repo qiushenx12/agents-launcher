@@ -49,20 +49,42 @@ pub(crate) fn locate_claude_executable() -> Option<String> {
         return Some(path.to_string_lossy().to_string());
     }
 
-    // Hardcoded fallback paths
-    let candidates = vec![
-        expand_env(r"%LOCALAPPDATA%\Programs\claude\claude.exe"),
-        expand_env(r"%LOCALAPPDATA%\claude\claude.exe"),
-        expand_env(r"%ProgramFiles%\claude\claude.exe"),
-        expand_env(r"%ProgramFiles(x86)%\claude\claude.exe"),
-        expand_home(r"~\AppData\Local\Programs\claude\claude.exe"),
-        expand_home(r"~\AppData\Roaming\npm\claude.cmd"),
-        expand_home(r"~\AppData\Roaming\npm\claude"),
-    ];
+    // Platform-specific fallback paths
+    #[cfg(target_os = "windows")]
+    {
+        let candidates = vec![
+            expand_env(r"%LOCALAPPDATA%\Programs\claude\claude.exe"),
+            expand_env(r"%LOCALAPPDATA%\claude\claude.exe"),
+            expand_env(r"%ProgramFiles%\claude\claude.exe"),
+            expand_env(r"%ProgramFiles(x86)%\claude\claude.exe"),
+            expand_home("~/AppData/Local/Programs/claude/claude.exe"),
+            expand_home("~/AppData/Roaming/npm/claude.cmd"),
+            expand_home("~/AppData/Roaming/npm/claude"),
+        ];
 
-    for path in candidates {
-        if std::path::Path::new(&path).is_file() {
-            return Some(path);
+        for path in candidates {
+            if std::path::Path::new(&path).is_file() {
+                return Some(path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let candidates = vec![
+            "/opt/homebrew/bin/claude".to_string(),
+            "/usr/local/bin/claude".to_string(),
+        ];
+        for path in &candidates {
+            if std::path::Path::new(path).is_file() {
+                return Some(path.clone());
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            let npm_global = home.join(".npm-global").join("bin").join("claude");
+            if npm_global.is_file() {
+                return Some(npm_global.to_string_lossy().to_string());
+            }
         }
     }
 
@@ -163,8 +185,12 @@ fn expand_env(template: &str) -> String {
 }
 
 fn expand_home(template: &str) -> String {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    template.replacen('~', &home, 1)
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy().to_string();
+        template.replacen('~', &home_str, 1)
+    } else {
+        template.to_string()
+    }
 }
 
 #[tauri::command]
@@ -174,9 +200,6 @@ pub fn launch_claude(
     args: Vec<String>,
     cwd: Option<String>,
 ) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NEW_CONSOLE: u32 = 0x00000010;
-
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(&args);
 
@@ -193,7 +216,12 @@ pub fn launch_claude(
         }
     }
 
-    cmd.creation_flags(CREATE_NEW_CONSOLE);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+        cmd.creation_flags(CREATE_NEW_CONSOLE);
+    }
 
     cmd.spawn()
         .map_err(|e| format!("Failed to launch claude: {}", e))?;

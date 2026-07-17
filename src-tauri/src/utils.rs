@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
 
 #[tauri::command]
@@ -15,7 +17,7 @@ pub fn get_current_env_vars(var_names: Vec<String>) -> HashMap<String, String> {
 #[tauri::command]
 pub fn get_claude_config_dir() -> Result<String, String> {
     let dir = dirs::data_dir()
-        .ok_or("Cannot determine APPDATA")?
+        .ok_or("Cannot determine application data directory")?
         .join("ClaudeEnvManager");
     Ok(dir.to_string_lossy().to_string())
 }
@@ -25,6 +27,13 @@ pub fn open_directory(path: String) -> Result<(), String> {
     #[cfg(windows)]
     {
         Command::new("explorer")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open directory: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
             .arg(&path)
             .spawn()
             .map_err(|e| format!("Failed to open directory: {}", e))?;
@@ -40,6 +49,10 @@ pub fn open_env_vars_dialog() -> Result<(), String> {
             .args(["sysdm.cpl,EditEnvironmentVariables"])
             .spawn()
             .map_err(|e| format!("Failed to open env vars dialog: {}", e))?;
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        Err("此功能仅支持 Windows。macOS 请通过 ~/.claude/settings.json 配置环境变量。".to_string())
+    }
 }

@@ -66,7 +66,7 @@ fn broadcast_env_change() {
 }
 
 // ---------------------------------------------------------------------------
-// Tauri command
+// Windows implementation used by env_applier::apply_env_vars
 // ---------------------------------------------------------------------------
 
 /// Apply a map of environment variables to the Windows registry.
@@ -76,8 +76,7 @@ fn broadcast_env_change() {
 /// - Non-empty values are written as REG_EXPAND_SZ.
 /// - Empty values delete the registry entry (if it exists).
 /// - After all writes, WM_SETTINGCHANGE is broadcast.
-#[tauri::command]
-pub fn apply_env_vars(vars: HashMap<String, String>, scope: String) -> Result<(), String> {
+pub fn apply_env_vars_impl(vars: HashMap<String, String>, scope: String) -> Result<(), String> {
     #[cfg(windows)]
     {
         let (root_key, key_path) = if scope == "system" {

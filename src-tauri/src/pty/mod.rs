@@ -150,7 +150,11 @@ pub fn pty_create(
         cmd[0].clone()
     };
     #[cfg(not(windows))]
-    let exe = cmd[0].clone();
+    let exe = if cmd[0].eq_ignore_ascii_case("cmd.exe") || cmd[0].eq_ignore_ascii_case("cmd") {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+    } else {
+        cmd[0].clone()
+    };
 
     let mut cmd_builder = CommandBuilder::new(&exe);
     for arg in &cmd[1..] {
@@ -161,6 +165,13 @@ pub fn pty_create(
     }
     for (k, v) in &env {
         cmd_builder.env(k, v);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // GUI apps on macOS have a minimal PATH; prepend common locations
+        let extra = "/usr/local/bin:/opt/homebrew/bin";
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd_builder.env("PATH", format!("{}:{}", extra, path));
     }
     cmd_builder.env("TERM", "xterm-256color");
     cmd_builder.env("COLORTERM", "truecolor");

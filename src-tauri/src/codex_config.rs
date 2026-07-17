@@ -14,7 +14,7 @@ use crate::file_transaction::{restore_json_backup_if_missing, write_json_atomic}
 use crate::persistent_state::{
     load_profile_index_state, save_profile_index_state, ProfileIndexState,
 };
-use crate::{model_fetcher, registry};
+use crate::{env_applier, model_fetcher, registry};
 
 const CODEX_STATE_VERSION: u32 = 1;
 const CODEX_STATE_KEY: &str = "codex";
@@ -615,7 +615,7 @@ fn save_managed_global_env(record: &ManagedGlobalEnv) -> Result<(), String> {
 fn write_user_env_var(name: &str, value: Option<&str>) -> Result<(), String> {
     let mut vars = HashMap::new();
     vars.insert(name.to_string(), value.unwrap_or_default().to_string());
-    registry::apply_env_vars(vars, "user".to_string())
+    env_applier::apply_env_vars(vars, "user".to_string())
 }
 
 fn restore_user_env_snapshots(snapshots: &HashMap<String, Option<String>>) -> Result<(), String> {
@@ -623,7 +623,7 @@ fn restore_user_env_snapshots(snapshots: &HashMap<String, Option<String>>) -> Re
         .iter()
         .map(|(key, value)| (key.clone(), value.clone().unwrap_or_default()))
         .collect();
-    registry::apply_env_vars(vars, "user".to_string())
+    env_applier::apply_env_vars(vars, "user".to_string())
 }
 
 fn transition_managed_global_env(
