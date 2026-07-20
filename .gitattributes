@@ -1,0 +1,9 @@
+* text=auto
+
+*.toml text eol=lf
+*.rs text eol=lf
+*.sh text eol=lf
+
+*.png binary
+*.ico binary
+*.icns binary
