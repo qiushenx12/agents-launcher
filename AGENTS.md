@@ -150,3 +150,10 @@ These paths and `node_modules/` are ignored by Git. Do not add generated build o
 - Run checks in proportion to the change. For cross-layer work, run `npm run build`, the Node terminal-output tests when relevant, and `cargo test`.
 - Do not launch the Vite server, a browser, or the Tauri application for verification. Use static checks and automated tests, then ask the user to perform interactive validation.
 - This repository has no configured formatter or linter scripts; avoid unrelated formatting churn.
+
+## Documentation and Git
+
+- Ask the user for explicit confirmation before staging or committing any change under `docs/`.
+- Ask the user for explicit confirmation again before pushing a commit that contains changes under `docs/` to a remote repository.
+- Development-stage documents, plans, reviews, drafts, progress notes, and temporary records must remain local and must never be committed.
+- Only `docs/build.md` and `docs/依赖检测与安装开发文档.md` may remain tracked in `docs/`; changes to either file still require the confirmations above.
