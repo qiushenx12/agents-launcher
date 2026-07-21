@@ -4,6 +4,7 @@
 //! macOS:   写入 ~/.claude/settings.json 的 env 字段
 
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
 use serde_json::{Map, Value};
 
 #[tauri::command]

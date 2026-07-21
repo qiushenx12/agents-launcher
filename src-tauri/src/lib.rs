@@ -10,6 +10,7 @@ pub mod env_applier;
 pub mod file_transaction;
 pub mod model_fetcher;
 pub mod opencode_config;
+pub mod opencode_db;
 pub mod persistent_state;
 pub mod platform_env;
 pub mod project_manager;
@@ -65,8 +66,10 @@ pub fn run() {
             cli_runtime::check_cli,
             cli_runtime::discover_codex_projects,
             cli_runtime::list_codex_threads,
+            cli_runtime::list_all_codex_threads,
             cli_runtime::discover_opencode_projects,
             cli_runtime::list_opencode_sessions,
+            cli_runtime::list_all_opencode_sessions,
             // CodeX managed configuration
             codex_config::load_codex_profiles,
             codex_config::reveal_codex_profile_api_key,

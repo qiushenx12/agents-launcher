@@ -59,6 +59,14 @@ export function useTauriDrop(
     // Tauri v2 native event as fallback
     try {
       const win = getCurrentWebviewWindow()
+      // onDragDropEvent reports physical pixels; getBoundingClientRect uses
+      // logical pixels, so positions must be divided by the scale factor.
+      let scaleFactor = 1
+      try {
+        scaleFactor = await win.scaleFactor()
+      } catch {
+        scaleFactor = window.devicePixelRatio || 1
+      }
       unlisten = await win.onDragDropEvent((event) => {
         const payload = event.payload
         if (payload.type === 'leave') {
@@ -67,15 +75,15 @@ export function useTauriDrop(
         }
         if (payload.type === 'over') {
           options?.onOver?.({
-            x: payload.position.x,
-            y: payload.position.y,
+            x: payload.position.x / scaleFactor,
+            y: payload.position.y / scaleFactor,
           })
           return
         }
         if (payload.type === 'drop' && payload.paths.length > 0) {
           callback(payload.paths, {
-            x: payload.position.x,
-            y: payload.position.y,
+            x: payload.position.x / scaleFactor,
+            y: payload.position.y / scaleFactor,
           })
         }
       })

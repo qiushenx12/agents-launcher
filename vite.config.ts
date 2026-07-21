@@ -24,5 +24,14 @@ export default defineConfig({
     target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari13",
     minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vue: ["vue", "pinia"],
+          xterm: ["@xterm/xterm", "@xterm/addon-fit", "@xterm/addon-web-links"],
+          tauri: ["@tauri-apps/api", "@tauri-apps/plugin-dialog", "@tauri-apps/plugin-shell"],
+        },
+      },
+    },
   },
 });

@@ -4,6 +4,7 @@ export interface ResizableDividerOptions {
   min?: number
   max?: number
   invert?: boolean
+  axis?: 'x' | 'y'
   onChange?: (value: number) => void
 }
 
@@ -18,14 +19,14 @@ export function useResizableDivider(
 
   function start(e: MouseEvent) {
     isDragging.value = true
-    startX = e.clientX
+    startX = options.axis === 'y' ? e.clientY : e.clientX
     startValue = value.value
     e.preventDefault()
   }
 
   function move(e: MouseEvent) {
     if (!isDragging.value) return
-    const delta = e.clientX - startX
+    const delta = (options.axis === 'y' ? e.clientY : e.clientX) - startX
     const raw = options.invert ? startValue - delta : startValue + delta
     let next = raw
     if (options.min !== undefined) next = Math.max(options.min, next)

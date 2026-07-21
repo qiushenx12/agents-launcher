@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,8 @@ struct CodexSessionMetaEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct CodexSessionMeta {
+    #[serde(default)]
+    id: Option<String>,
     cwd: String,
     #[serde(default)]
     timestamp: Option<String>,
@@ -259,6 +261,45 @@ pub async fn check_cli(kind: CliKind) -> CliStatus {
         })
 }
 
+const CODEX_THREADS_CACHE_TTL: Duration = Duration::from_secs(20);
+
+struct CodexThreadsCacheEntry {
+    fetched_at: Instant,
+    threads: Vec<CodexThreadSummary>,
+}
+
+static CODEX_THREADS_CACHE: Mutex<Option<CodexThreadsCacheEntry>> = Mutex::new(None);
+
+fn all_codex_threads(max_count: u32, force: bool) -> Result<Vec<CodexThreadSummary>, String> {
+    let mut guard = CODEX_THREADS_CACHE
+        .lock()
+        .map_err(|_| "CodeX 会话缓存锁定失败。".to_string())?;
+    if !force {
+        if let Some(entry) = guard.as_ref() {
+            if entry.fetched_at.elapsed() < CODEX_THREADS_CACHE_TTL {
+                return Ok(entry.threads.clone());
+            }
+        }
+    }
+    let threads = query_all_codex_threads(max_count)
+        .or_else(|_| codex_threads_from_rollouts(max_count))?;
+    *guard = Some(CodexThreadsCacheEntry {
+        fetched_at: Instant::now(),
+        threads: threads.clone(),
+    });
+    Ok(threads)
+}
+
+#[tauri::command]
+pub async fn list_all_codex_threads(
+    max_count: Option<u32>,
+    force: Option<bool>,
+) -> Result<Vec<CodexThreadSummary>, String> {
+    tokio::task::spawn_blocking(move || all_codex_threads(max_count.unwrap_or(500), force.unwrap_or(false)))
+        .await
+        .map_err(|error| format!("CodeX 会话读取任务异常结束: {error}"))?
+}
+
 #[tauri::command]
 pub async fn list_codex_threads(
     project_path: String,
@@ -269,7 +310,15 @@ pub async fn list_codex_threads(
         if !cwd.is_dir() {
             return Err(format!("CodeX 项目目录不存在: {project_path}"));
         }
-        query_codex_threads(&cwd, max_count.unwrap_or(100))
+        let max_count = max_count.unwrap_or(100);
+        let normalized_target = normalize_path(&project_path);
+        match all_codex_threads(max_count, false) {
+            Ok(threads) => Ok(threads
+                .into_iter()
+                .filter(|thread| normalize_path(&thread.cwd) == normalized_target)
+                .collect()),
+            Err(_) => query_codex_threads(&cwd, max_count),
+        }
     })
     .await
     .map_err(|error| format!("CodeX 会话读取任务异常结束: {error}"))?
@@ -283,11 +332,8 @@ pub async fn discover_codex_projects() -> Result<CodexProjectDiscovery, String> 
 }
 
 fn discover_codex_projects_from_session_meta() -> Result<CodexProjectDiscovery, String> {
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
-    let sessions_root = codex_home.join("sessions");
+    let sessions_root =
+        codex_sessions_root().ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
     if !sessions_root.is_dir() {
         return Ok(CodexProjectDiscovery {
             projects: Vec::new(),
@@ -302,6 +348,7 @@ fn discover_codex_projects_from_session_meta() -> Result<CodexProjectDiscovery, 
     let mut skipped = 0_u32;
     collect_codex_jsonl_files(&sessions_root, &mut files, &mut skipped);
     let mut by_path: HashMap<String, CodexDiscoveredProject> = HashMap::new();
+    let mut validated_worktrees: HashMap<String, bool> = HashMap::new();
 
     for file_path in files {
         let Some(meta) = read_codex_session_meta(&file_path) else {
@@ -309,7 +356,10 @@ fn discover_codex_projects_from_session_meta() -> Result<CodexProjectDiscovery, 
             continue;
         };
         let worktree = clean_codex_worktree(&meta.cwd);
-        if worktree.is_empty() || !Path::new(&worktree).is_dir() {
+        let worktree_exists = *validated_worktrees
+            .entry(worktree.clone())
+            .or_insert_with(|| !worktree.is_empty() && Path::new(&worktree).is_dir());
+        if !worktree_exists {
             skipped = skipped.saturating_add(1);
             continue;
         }
@@ -393,28 +443,149 @@ fn clean_codex_worktree(path: &str) -> String {
     }
 }
 
-fn query_codex_threads(cwd: &Path, max_count: u32) -> Result<Vec<CodexThreadSummary>, String> {
+fn spawn_codex_app_server(cwd: Option<&Path>) -> Result<Child, String> {
     let path =
         locate_cli(CliKind::Codex).ok_or_else(|| "未检测到 CodeX，无法读取会话。".to_string())?;
     let mut command = hidden_command(&path);
     command
         .arg("app-server")
-        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = command
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command
         .spawn()
-        .map_err(|error| format!("无法启动 CodeX App Server: {error}"))?;
+        .map_err(|error| format!("无法启动 CodeX App Server: {error}"))
+}
 
-    let result = exchange_codex_thread_list(&mut child, cwd, max_count.clamp(1, 500));
+fn query_codex_threads(cwd: &Path, max_count: u32) -> Result<Vec<CodexThreadSummary>, String> {
+    let mut child = spawn_codex_app_server(Some(cwd))?;
+    let result = exchange_codex_thread_list(&mut child, Some(cwd), max_count.clamp(1, 500));
     terminate_child(&mut child);
     result
 }
 
+fn query_all_codex_threads(max_count: u32) -> Result<Vec<CodexThreadSummary>, String> {
+    let mut child = spawn_codex_app_server(None)?;
+    let result = exchange_codex_thread_list(&mut child, None, max_count.clamp(1, 2000));
+    terminate_child(&mut child);
+    result
+}
+
+fn codex_threads_from_rollouts(max_count: u32) -> Result<Vec<CodexThreadSummary>, String> {
+    let sessions_root =
+        codex_sessions_root().ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
+    if !sessions_root.is_dir() {
+        return Err(format!(
+            "未找到 CodeX 会话目录: {}",
+            sessions_root.display()
+        ));
+    }
+    Ok(codex_threads_from_rollout_root(&sessions_root, max_count))
+}
+
+fn codex_threads_from_rollout_root(
+    sessions_root: &Path,
+    max_count: u32,
+) -> Vec<CodexThreadSummary> {
+    let mut files = Vec::new();
+    let mut skipped = 0_u32;
+    collect_codex_jsonl_files(sessions_root, &mut files, &mut skipped);
+    let mut threads = Vec::new();
+    for file_path in files {
+        let Some(meta) = read_codex_session_meta(&file_path) else {
+            continue;
+        };
+        let Some(id) = meta.id.filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let worktree = clean_codex_worktree(&meta.cwd);
+        if worktree.is_empty() {
+            continue;
+        }
+        let created_at = meta
+            .timestamp
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.timestamp())
+            .unwrap_or(0);
+        let updated_at = fs::metadata(&file_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(created_at);
+        threads.push(CodexThreadSummary {
+            id,
+            name: None,
+            preview: read_codex_rollout_preview(&file_path),
+            cwd: worktree,
+            created_at,
+            updated_at,
+        });
+    }
+    threads.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    threads.truncate(max_count.clamp(1, 2000) as usize);
+    threads
+}
+
+fn read_codex_rollout_preview(path: &Path) -> String {
+    let Ok(file) = File::open(path) else {
+        return String::new();
+    };
+    for line in BufReader::new(file).lines().take(400) {
+        let Ok(line) = line else {
+            break;
+        };
+        if line.len() > 256 * 1024 {
+            continue;
+        }
+        let Ok(message) = serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}'))
+        else {
+            continue;
+        };
+        let Some(payload) = message.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("message")
+            || payload.get("role").and_then(Value::as_str) != Some("user")
+        {
+            continue;
+        }
+        let Some(content) = payload.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in content {
+            let Some(text) = part.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            let trimmed = text.trim();
+            if trimmed.is_empty() || trimmed.starts_with('<') {
+                continue;
+            }
+            return trimmed.chars().take(200).collect();
+        }
+    }
+    String::new()
+}
+
+fn codex_sessions_root() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|home| home.join("sessions"))
+}
+
 fn exchange_codex_thread_list(
     child: &mut Child,
-    cwd: &Path,
+    cwd: Option<&Path>,
     max_count: u32,
 ) -> Result<Vec<CodexThreadSummary>, String> {
     let stdout = child
@@ -439,6 +610,17 @@ fn exchange_codex_thread_list(
         }
     });
 
+    let mut thread_list_params = json!({
+        "limit": max_count,
+        "archived": false,
+        "sourceKinds": ["cli", "vscode", "appServer"],
+        "sortKey": "updated_at",
+        "sortDirection": "desc"
+    });
+    if let Some(cwd) = cwd {
+        thread_list_params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+    }
+
     for message in [
         json!({
             "method": "initialize",
@@ -455,14 +637,7 @@ fn exchange_codex_thread_list(
         json!({
             "method": "thread/list",
             "id": 1,
-            "params": {
-                "cwd": cwd.to_string_lossy(),
-                "limit": max_count,
-                "archived": false,
-                "sourceKinds": ["cli", "vscode", "appServer"],
-                "sortKey": "updated_at",
-                "sortDirection": "desc"
-            }
+            "params": thread_list_params
         }),
     ] {
         serde_json::to_writer(&mut stdin, &message)
@@ -524,38 +699,126 @@ fn terminate_child(child: &mut Child) {
 #[tauri::command]
 pub async fn discover_opencode_projects() -> Result<OpenCodeProjectDiscovery, String> {
     tokio::task::spawn_blocking(|| {
-        let output = run_cli_output(CliKind::Opencode, &["debug", "scrap"], None)?;
-        let projects = parse_opencode_projects(&String::from_utf8_lossy(&output.stdout))?;
-        let has_global_project = projects.iter().any(|project| project.worktree == "/");
-        let mut global_sessions = Vec::new();
-        let mut warning = None;
-
-        if has_global_project {
-            match opencode_global_probe_dir() {
-                Some(cwd) => match query_opencode_sessions(&cwd, 500) {
-                    Ok(sessions) => {
-                        global_sessions = sessions
-                            .into_iter()
-                            .filter(|session| Path::new(&session.directory).is_dir())
-                            .collect();
-                    }
-                    Err(error) => {
-                        warning = Some(format!("OpenCode 全局项目会话读取失败: {error}"));
-                    }
-                },
-                None => {
-                    warning = Some("找不到可用于读取 OpenCode 全局项目的系统根目录。".to_string());
-                }
-            }
+        if let Ok(discovery) = discover_opencode_projects_from_db() {
+            return Ok(discovery);
         }
-
-        Ok(OpenCodeProjectDiscovery {
-            projects: merge_opencode_discovered_projects(&projects, &global_sessions),
-            warning,
-        })
+        discover_opencode_projects_from_cli()
     })
     .await
     .map_err(|error| format!("OpenCode 项目发现任务异常结束: {error}"))?
+}
+
+fn clean_opencode_worktree(path: &str) -> String {
+    let trimmed = path.trim().trim_end_matches(['\\', '/']);
+    #[cfg(windows)]
+    {
+        let stripped = if let Some(rest) = trimmed.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else {
+            trimmed.strip_prefix(r"\\?\").unwrap_or(trimmed).to_string()
+        };
+        stripped.replace('/', "\\")
+    }
+    #[cfg(not(windows))]
+    {
+        trimmed.to_string()
+    }
+}
+
+fn discover_opencode_projects_from_db() -> Result<OpenCodeProjectDiscovery, String> {
+    let projects = crate::opencode_db::query_projects()?;
+    let sessions = crate::opencode_db::query_sessions(2000)?;
+    let mut seen_paths = HashSet::new();
+    let mut discovered = Vec::new();
+    let mut skipped = 0_u32;
+
+    for (id, worktree) in projects.iter().filter(|(_, worktree)| worktree != "/") {
+        let worktree = clean_opencode_worktree(worktree);
+        let normalized = normalize_path(&worktree);
+        if normalized.is_empty() || !seen_paths.insert(normalized) {
+            continue;
+        }
+        if !Path::new(&worktree).is_dir() {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        discovered.push(OpenCodeDiscoveredProject {
+            id: id.clone(),
+            worktree,
+        });
+    }
+
+    for session in &sessions {
+        let directory = clean_opencode_worktree(&session.directory);
+        let normalized = normalize_path(&directory);
+        if normalized.is_empty() || !seen_paths.insert(normalized.clone()) {
+            continue;
+        }
+        if !Path::new(&directory).is_dir() {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        discovered.push(OpenCodeDiscoveredProject {
+            id: format!("global:{normalized}"),
+            worktree: directory,
+        });
+    }
+
+    let warning = (skipped > 0)
+        .then(|| format!("已跳过 {skipped} 个目录已不存在的 OpenCode 项目记录"));
+    Ok(OpenCodeProjectDiscovery {
+        projects: discovered,
+        warning,
+    })
+}
+
+fn discover_opencode_projects_from_cli() -> Result<OpenCodeProjectDiscovery, String> {
+    let output = run_cli_output(CliKind::Opencode, &["debug", "scrap"], None)?;
+    let projects = parse_opencode_projects(&String::from_utf8_lossy(&output.stdout))?;
+    let has_global_project = projects.iter().any(|project| project.worktree == "/");
+    let mut global_sessions = Vec::new();
+    let mut warning = None;
+
+    if has_global_project {
+        match opencode_global_probe_dir() {
+            Some(cwd) => match query_opencode_sessions(&cwd, 500) {
+                Ok(sessions) => {
+                    global_sessions = sessions
+                        .into_iter()
+                        .filter(|session| Path::new(&session.directory).is_dir())
+                        .collect();
+                }
+                Err(error) => {
+                    warning = Some(format!("OpenCode 全局项目会话读取失败: {error}"));
+                }
+            },
+            None => {
+                warning = Some("找不到可用于读取 OpenCode 全局项目的系统根目录。".to_string());
+            }
+        }
+    }
+
+    Ok(OpenCodeProjectDiscovery {
+        projects: merge_opencode_discovered_projects(&projects, &global_sessions),
+        warning,
+    })
+}
+
+#[tauri::command]
+pub async fn list_all_opencode_sessions(
+    max_count: Option<u32>,
+) -> Result<Vec<OpenCodeSession>, String> {
+    tokio::task::spawn_blocking(move || {
+        let max_count = max_count.unwrap_or(500);
+        if let Ok(sessions) = crate::opencode_db::query_sessions(max_count) {
+            return Ok(sessions);
+        }
+        let cwd = opencode_global_probe_dir()
+            .ok_or_else(|| "找不到可用于读取 OpenCode 会话的目录。".to_string())?;
+        query_opencode_sessions(&cwd, max_count)
+    })
+    .await
+    .map_err(|error| format!("OpenCode 会话读取任务异常结束: {error}"))?
 }
 
 #[tauri::command]
@@ -568,8 +831,15 @@ pub async fn list_opencode_sessions(
         if !cwd.is_dir() {
             return Err(format!("OpenCode 项目目录不存在: {project_path}"));
         }
-        let sessions = query_opencode_sessions(&cwd, max_count.unwrap_or(100))?;
+        let max_count = max_count.unwrap_or(100);
         let normalized_target = normalize_path(&project_path);
+        if let Ok(sessions) = crate::opencode_db::query_sessions(max_count) {
+            return Ok(sessions
+                .into_iter()
+                .filter(|session| normalize_path(&session.directory) == normalized_target)
+                .collect());
+        }
+        let sessions = query_opencode_sessions(&cwd, max_count)?;
         Ok(sessions
             .into_iter()
             .filter(|session| normalize_path(&session.directory) == normalized_target)
@@ -751,6 +1021,59 @@ mod tests {
         assert_eq!(threads[0].cwd, r"D:\project\cc-launcher");
         assert_eq!(threads[0].name.as_deref(), Some("Desktop task"));
         assert_eq!(threads[1].preview, "CLI task prompt");
+    }
+
+    #[test]
+    fn codex_rollout_fallback_builds_threads_from_session_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nested = dir.path().join("2026").join("07").join("17");
+        fs::create_dir_all(&nested).expect("create nested");
+        let rollout = nested.join("rollout-2026-07-17T01-57-47-019f6c13-d886-7521-a0de-90cfe0a99c67.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"timestamp\":\"2026-07-17T01:57:47.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019f6c13-d886-7521-a0de-90cfe0a99c67\",\"timestamp\":\"2026-07-17T01:57:47.000Z\",\"cwd\":\"D:\\\\Project\\\\demo\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<environment_context>\\n  <cwd>D:\\\\Project\\\\demo</cwd>\\n</environment_context>\"}]}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"把当前项目的git更新到最新\"}]}}\n"
+            ),
+        )
+        .expect("write rollout");
+
+        let threads = codex_threads_from_rollout_root(dir.path(), 100);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "019f6c13-d886-7521-a0de-90cfe0a99c67");
+        assert_eq!(threads[0].cwd, r"D:\Project\demo");
+        assert_eq!(threads[0].created_at, 1784253467);
+        assert!(threads[0].updated_at >= threads[0].created_at);
+        assert_eq!(threads[0].preview, "把当前项目的git更新到最新");
+    }
+
+    #[test]
+    fn codex_rollout_preview_skips_non_user_and_wrapped_lines() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let rollout = dir.path().join("rollout.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n",
+                "not json\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"\"}]}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"真实问题\"}]}}\n"
+            ),
+        )
+        .expect("write rollout");
+        assert_eq!(read_codex_rollout_preview(&rollout), "真实问题");
+    }
+
+    #[test]
+    fn opencode_db_worktrees_normalize_to_native_display_form() {
+        let cleaned = clean_opencode_worktree("D:/Project/demo/");
+        #[cfg(windows)]
+        assert_eq!(cleaned, r"D:\Project\demo");
+        #[cfg(not(windows))]
+        assert_eq!(cleaned, "D:/Project/demo");
+        #[cfg(windows)]
+        assert_eq!(clean_opencode_worktree(r"\\?\D:\Project\demo\"), r"D:\Project\demo");
     }
 
     #[test]

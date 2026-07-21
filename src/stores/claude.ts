@@ -5,6 +5,7 @@ import { confirm } from '@tauri-apps/plugin-dialog'
 import type { ClaudeSettings, CliProfileRef, SessionEntry } from '@/types/config'
 import { formatRedactedEntries } from '@/utils/configSecurity'
 import { useConfigWorkspaceStore } from './configWorkspace'
+import { useProjectStore } from './project'
 
 export interface ClaudeCodeCheckResult {
   installed: boolean
@@ -642,7 +643,6 @@ export const useClaudeStore = defineStore('claude', () => {
         switchToProject.value = true
         await nextTick()
 
-        const { useProjectStore } = await import('./project')
         const projectStore = useProjectStore()
         const session = await projectStore.launchClaudeFromConfig(sessionId)
         if (session) {

@@ -106,6 +106,7 @@ import { useProjectStore } from '@/stores/project'
 import { useClaudeStore } from '@/stores/claude'
 import { useTerminalStore } from '@/stores/terminal'
 import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
+import { isInSidebarDropZone, isInTopSidebarDropZone } from '@/composables/useSidebarDropZone'
 import TerminalPane from '@/components/terminal/TerminalPane.vue'
 
 const store = useProjectStore()
@@ -197,11 +198,22 @@ async function handleDroppedFile(path: string) {
 useTauriDrop((paths, position) => {
   dragOver.value = false
   if (!isInside(position, terminalRef.value)) return
+  // Sidebar closed: the right 20% and top 20% zones belong to the sidebar-open drop.
+  if (!store.sidebarOpen && isInSidebarDropZone(position, terminalRef.value)) return
+  if (!store.sidebarOpen && isInTopSidebarDropZone(position, terminalRef.value)) return
   const path = paths[0]
   if (!path) return
   handleDroppedFile(path)
 }, {
   onOver: (position) => {
+    if (!store.sidebarOpen && isInSidebarDropZone(position, terminalRef.value)) {
+      dragOver.value = false
+      return
+    }
+    if (!store.sidebarOpen && isInTopSidebarDropZone(position, terminalRef.value)) {
+      dragOver.value = false
+      return
+    }
     dragOver.value = isInside(position, terminalRef.value)
   },
   onLeave: () => {

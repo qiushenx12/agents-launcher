@@ -2,7 +2,8 @@
   <aside
     ref="sidebarRef"
     class="right-sidebar"
-    :style="props.width ? { width: `${props.width}px`, flexBasis: `${props.width}px` } : undefined"
+    :class="{ 'right-sidebar--top': props.orientation === 'top' }"
+    :style="rootStyle"
   >
     <header class="right-sidebar__tabs">
       <div class="right-sidebar__tab-strip">
@@ -41,6 +42,7 @@ import { computed, defineComponent, h, ref, watch } from 'vue'
 import { useProjectStore } from '@/stores/project'
 import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import TerminalPane from '@/components/terminal/TerminalPane.vue'
+import FilePanel from '@/components/project/FilePanel.vue'
 import { usePlatform } from '@/composables/usePlatform'
 
 const store = useProjectStore()
@@ -50,9 +52,20 @@ const activeTab = computed(() => store.activeSidebarTab)
 const { isMacOS } = usePlatform()
 const shortcutModifier = computed(() => isMacOS.value ? '⌘' : 'Ctrl')
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   width?: number
-}>()
+  height?: number
+  orientation?: 'right' | 'top'
+}>(), {
+  orientation: 'right',
+})
+
+const rootStyle = computed(() => {
+  if (props.orientation === 'top') {
+    return props.height ? { height: `${props.height}px`, flexBasis: `${props.height}px` } : undefined
+  }
+  return props.width ? { width: `${props.width}px`, flexBasis: `${props.width}px` } : undefined
+})
 
 useTauriDrop((paths, position) => {
   if (isInside(position, sidebarRef.value) && paths[0]) {
@@ -97,66 +110,6 @@ const ToolsPanel = defineComponent({
             ),
       ]),
     ])
-  },
-})
-
-const FilePanel = defineComponent({
-  props: {
-    tabId: { type: String, required: true },
-  },
-  setup(props) {
-    const projectStore = useProjectStore()
-    const tab = computed(() => projectStore.visibleSidebarTabs.find((item) => item.id === props.tabId))
-    const isMarkdown = computed(() => {
-      const lang = tab.value?.language
-      return lang === 'markdown'
-    })
-    function markdownPreview(source: string) {
-      const escaped = source
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-      return escaped
-        .split('\n')
-        .map((line) => {
-          if (line.startsWith('# ')) return `<h3>${line.slice(2)}</h3>`
-          if (line.startsWith('## ')) return `<h4>${line.slice(3)}</h4>`
-          if (line.startsWith('- ')) return `<li>${line.slice(2)}</li>`
-          if (!line.trim()) return '<br />'
-          return `<p>${line}</p>`
-        })
-        .join('')
-    }
-    return () => {
-      const current = tab.value
-      if (!current) return h('div', { class: 'right-sidebar__empty' }, '文件不存在')
-      const content = current.content ?? ''
-      return h('div', { class: 'file-panel' }, [
-        h('div', { class: 'file-panel__toolbar' }, [
-          h('span', `${current.dirty ? '● ' : ''}${current.title}`),
-          isMarkdown.value
-            ? h('div', { class: 'file-panel__switch' }, [
-                h('button', {
-                  class: { active: current.viewMode !== 'preview' },
-                  onClick: () => projectStore.setFileViewMode(current.id, 'source'),
-                }, '源码'),
-                h('button', {
-                  class: { active: current.viewMode === 'preview' },
-                  onClick: () => projectStore.setFileViewMode(current.id, 'preview'),
-                }, '预览'),
-              ])
-            : h('span', { class: 'file-panel__language' }, current.language || 'text'),
-        ]),
-        current.viewMode === 'preview' && isMarkdown.value
-          ? h('div', { class: 'file-panel__preview', innerHTML: markdownPreview(content) })
-          : h('textarea', {
-              class: 'file-panel__editor',
-              value: content,
-              spellcheck: 'false',
-              onInput: (event: Event) => projectStore.updateFileContent(current.id, (event.target as HTMLTextAreaElement).value),
-            }),
-      ])
-    }
   },
 })
 
@@ -251,6 +204,14 @@ const BrowserPanel = defineComponent({
   min-height: 0;
   border-left: 1px solid var(--separator);
   background: var(--card);
+}
+
+.right-sidebar--top {
+  width: 100%;
+  flex: 0 0 240px;
+  min-width: 0;
+  border-left: 0;
+  border-bottom: 1px solid var(--separator);
 }
 
 .right-sidebar__tabs {
@@ -398,87 +359,6 @@ kbd,
   color: var(--text-secondary);
   font-size: var(--font-size-small);
   font-weight: 700;
-}
-
-:deep(.file-panel) {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-
-:deep(.file-panel__toolbar) {
-  height: 38px;
-  flex: 0 0 38px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 0 10px;
-  border-bottom: 1px solid var(--separator);
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-}
-
-:deep(.file-panel__switch) {
-  display: inline-flex;
-  padding: 2px;
-  border: 1px solid var(--separator);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-}
-
-:deep(.file-panel__switch button) {
-  border: 0;
-  border-radius: 4px;
-  padding: 3px 8px;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-}
-
-:deep(.file-panel__switch button.active) {
-  background: var(--card);
-  color: var(--primary);
-}
-
-:deep(.file-panel__language) {
-  font-family: var(--font-mono);
-}
-
-:deep(.file-panel__editor) {
-  flex: 1;
-  min-height: 0;
-  width: 100%;
-  resize: none;
-  border: 0;
-  outline: 0;
-  padding: 12px;
-  color: var(--text-primary);
-  background: var(--card);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.65;
-}
-
-:deep(.file-panel__preview) {
-  flex: 1;
-  overflow: auto;
-  padding: 14px;
-  color: var(--text-primary);
-}
-
-:deep(.file-panel__preview h3),
-:deep(.file-panel__preview h4) {
-  margin: 0 0 10px;
-}
-
-:deep(.file-panel__preview p) {
-  margin: 0 0 8px;
-}
-
-:deep(.file-panel__preview li) {
-  margin-left: 18px;
 }
 
 :deep(.terminal-panel) {

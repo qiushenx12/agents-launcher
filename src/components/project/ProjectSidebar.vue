@@ -74,7 +74,7 @@
           <span class="project-row__toggle">{{ isExpanded(project.id) ? '▾' : '▸' }}</span>
           <span class="project-row__folder">
             <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M1.5 3C1.5 2.17157 2.17157 1.5 3 1.5H5.5L7 3.5H13C13.8284 3.5 14.5 4.17157 14.5 5V12C14.5 12.8284 13.8284 13.5 13 13.5H3C2.17157 13.5 1.5 12.8284 1.5 12V3Z" stroke="white" stroke-width="1.2" stroke-linejoin="round"/>
+              <path d="M1.5 3C1.5 2.17157 2.17157 1.5 3 1.5H5.5L7 3.5H13C13.8284 3.5 14.5 4.17157 14.5 5V12C14.5 12.8284 13.8284 13.5 13 13.5H3C2.17157 13.5 1.5 12.8284 1.5 12V3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
             </svg>
           </span>
           <span class="project-row__name">{{ project.name }}</span>
@@ -684,6 +684,7 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   width: 16px;
   height: 16px;
   display: block;
+  color: var(--text-secondary);
 }
 
 .project-row__name,
@@ -884,21 +885,4 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   border-top: 1px solid var(--separator);
 }
 
-.settings-entry {
-  width: 100%;
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  padding: 7px 8px;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-}
-
-.settings-entry:hover {
-  background: var(--tab-bg);
-  color: var(--text-primary);
-}
 </style>

@@ -16,12 +16,9 @@
           <div class="sidebar__list">
             <ConfigList />
           </div>
-          <div class="sidebar__separator">
-            <span class="sidebar__separator-label">会话记录</span>
-          </div>
-          <div class="sidebar__sessions">
-            <SessionList />
-          </div>
+          <footer class="claude-panel__sidebar-footer">
+            <button class="settings-entry" type="button" @click="toggleSettings()">⚙ <span>设置</span></button>
+          </footer>
         </aside>
 
         <!-- Resize divider -->
@@ -36,7 +33,6 @@
     <!-- Right content -->
     <main class="claude-panel__content">
       <ConfigEditor />
-      <LaunchOptions />
     </main>
   </div>
 </template>
@@ -47,8 +43,9 @@ import { useClaudeStore } from '@/stores/claude'
 import { useResizablePanes } from '@/composables/useResizablePanes'
 import ConfigList from './ConfigList.vue'
 import ConfigEditor from './ConfigEditor.vue'
-import LaunchOptions from './LaunchOptions.vue'
-import SessionList from './SessionList.vue'
+import { useSettingsPopover } from '@/composables/useSettingsPopover'
+
+const { toggleSettings } = useSettingsPopover()
 
 const store = useClaudeStore()
 const props = defineProps<{
@@ -124,37 +121,15 @@ watch(isDragging, (val) => {
 }
 
 .sidebar__list {
-  flex-shrink: 0;
-  overflow-y: auto;
-  min-height: 0;
-  max-height: 40%;
-}
-
-.sidebar__separator {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 0 2px;
-}
-
-.sidebar__separator-label {
-  font-size: var(--font-size-small);
-  color: var(--text-secondary);
-  white-space: nowrap;
-}
-
-.sidebar__separator::after {
-  content: '';
-  flex: 1;
-  height: 1px;
-  background-color: var(--separator);
-}
-
-.sidebar__sessions {
   flex: 1;
   overflow-y: auto;
   min-height: 0;
+}
+
+.claude-panel__sidebar-footer {
+  flex-shrink: 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--separator);
 }
 
 /* Resize divider */

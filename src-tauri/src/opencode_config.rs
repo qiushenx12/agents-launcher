@@ -428,6 +428,7 @@ fn model_state_path() -> Result<PathBuf, String> {
         .join("model.json"))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn opencode_permission_directories(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".config").join("opencode"),

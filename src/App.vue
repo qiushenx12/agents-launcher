@@ -102,14 +102,15 @@
         <TerminalManager ref="terminalManagerRef" :launch-dir="activeLaunchDir" />
       </div>
 
-      <!-- Shared CLI workspace -->
+      <!-- Shared CLI workspace — keep mounted while on the config tab so
+           xterm instances (scrollback, mouse modes) survive tab switches. -->
       <div
-        v-if="activeCliKind && activeCliStatus?.state === 'ready'"
+        v-if="workspaceCliKind && workspaceCliStatus?.state === 'ready'"
         v-show="activeCliKind === mainTab"
         class="app-panel"
       >
         <ProjectPanel
-          :cli-kind="activeCliKind"
+          :cli-kind="workspaceCliKind"
           @open-settings="showSettings = !showSettings"
         />
       </div>
@@ -300,6 +301,21 @@
           @click="setAppFontSize(1)"
         >+</button>
       </div>
+
+      <div class="settings-dropdown__section">Markdown 字体大小</div>
+      <div class="settings-dropdown__item font-size-row">
+        <button
+          class="font-size-btn"
+          :disabled="mdFontSize <= MD_FONT_MIN"
+          @click="setMdFontSize(mdFontSize - 1)"
+        >−</button>
+        <span class="font-size-value">{{ mdFontSize }}px</span>
+        <button
+          class="font-size-btn"
+          :disabled="mdFontSize >= MD_FONT_MAX"
+          @click="setMdFontSize(mdFontSize + 1)"
+        >+</button>
+      </div>
     </div>
   </div>
 </template>
@@ -317,6 +333,8 @@ import OrchestrationManager from './components/orchestration/OrchestrationManage
 import StatusBar from './components/common/StatusBar.vue'
 import { useClaudeStore } from './stores/claude'
 import { useTerminalStore } from './stores/terminal'
+import { useMarkdownFontSize, MD_FONT_MIN, MD_FONT_MAX } from './composables/useMarkdownFontSize'
+import { useSettingsPopover } from './composables/useSettingsPopover'
 import { useProjectStore } from './stores/project'
 import { useCliRuntimeStore } from './stores/cliRuntime'
 import { useConfigWorkspaceStore } from './stores/configWorkspace'
@@ -370,6 +388,10 @@ const activeCliKind = computed<CliKind | null>(() => isCliKind(mainTab.value) ? 
 const activeCliStatus = computed(() => activeCliKind.value
   ? cliRuntimeStore.statuses[activeCliKind.value]
   : null)
+// The workspace panel must stay mounted on non-CLI tabs (e.g. config);
+// fall back to the kind persisted in the project store.
+const workspaceCliKind = computed<CliKind>(() => activeCliKind.value ?? projectStore.activeCliKind)
+const workspaceCliStatus = computed(() => cliRuntimeStore.statuses[workspaceCliKind.value] ?? null)
 const activeCliLabel = computed(() => activeCliKind.value
   ? CLI_DESCRIPTORS[activeCliKind.value].label
   : '')
@@ -579,7 +601,7 @@ function requestRestartAfterManualInstall() {
 }
 
 // ── Theme ──────────────────────────────────────────────────────────────────
-const showSettings = ref(false)
+const { showSettings } = useSettingsPopover()
 const theme = ref<'light' | 'dark'>('light')
 
 function applyTheme(t: 'light' | 'dark') {
@@ -605,6 +627,7 @@ function setProjectDropPathMode(mode: 'filename' | 'relative') {
 const APP_FONT_MIN = 10
 const APP_FONT_MAX = 18
 const appFontSize = ref(13)
+const { fontSize: mdFontSize, setFontSize: setMdFontSize } = useMarkdownFontSize()
 
 function applyAppFontSize(size: number) {
   const clamped = Math.max(APP_FONT_MIN, Math.min(APP_FONT_MAX, size))

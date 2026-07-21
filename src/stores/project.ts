@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -14,6 +14,7 @@ import { usePlatform } from '@/composables/usePlatform'
 
 export type TerminalStatus = 'off' | 'idle' | 'running'
 export type SidebarTabType = 'tools' | 'file' | 'terminal' | 'browser'
+export type SidebarPlacement = 'right' | 'top'
 export type FileViewMode = 'source' | 'preview'
 export type ProjectSortMode = 'manual' | 'time'
 
@@ -193,6 +194,10 @@ function historyTimestampToMs(ts: number) {
   return ts > 1_000_000_000_000 ? ts : ts * 1000
 }
 
+function normalizeFsPath(path: string) {
+  return path.trim().replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase()
+}
+
 function sessionDisplayName(entry: SessionEntry) {
   return entry.display.replace(/\n/g, ' ').replace(/\r/g, '').trim() || entry.id
 }
@@ -232,10 +237,25 @@ export const useProjectStore = defineStore('project', () => {
   const activeSessionIds = ref<Record<CliKind, string | null>>({ ...EMPTY_SELECTIONS })
   const projectSortMode = ref<ProjectSortMode>('manual')
   const sidebarOpen = ref(false)
+  const sidebarPlacement = ref<SidebarPlacement>('right')
   const leftSidebarCollapsed = ref(false)
   const sidebarTabs = ref<SidebarTab[]>([])
   const activeSidebarTabId = ref<string | null>(null)
   const statusMessage = ref('')
+
+  // Auto-dismiss status messages so stale toasts never linger across tabs.
+  let statusMessageTimer: ReturnType<typeof setTimeout> | null = null
+  watch(statusMessage, (message) => {
+    if (statusMessageTimer) {
+      clearTimeout(statusMessageTimer)
+      statusMessageTimer = null
+    }
+    if (!message) return
+    statusMessageTimer = setTimeout(() => {
+      statusMessageTimer = null
+      statusMessage.value = ''
+    }, 3000)
+  })
 
   const sessionTerminalIds = ref<Record<string, number>>({})
   const persistedRootExtras = ref<Record<string, unknown>>({})
@@ -309,6 +329,7 @@ export const useProjectStore = defineStore('project', () => {
       return
     }
     rememberActiveSelection()
+    statusMessage.value = ''
     activeCliKind.value = kind
     activeProjectId.value = activeProjectIds.value[kind]
     activeSessionId.value = activeSessionIds.value[kind]
@@ -342,10 +363,10 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   function findProjectByPath(path: string, cliKind: CliKind = activeCliKind.value) {
-    const normalizedPath = normalizeProjectPath(path).toLowerCase()
+    const normalizedPath = normalizeFsPath(path)
     return projects.value.find((project) =>
       project.cliKind === cliKind
-      && normalizeProjectPath(project.path).toLowerCase() === normalizedPath
+      && normalizeFsPath(project.path) === normalizedPath
     ) ?? null
   }
 
@@ -361,11 +382,11 @@ export const useProjectStore = defineStore('project', () => {
       if (!path) continue
       const normalized = normalizeProjectPath(path)
       if (!normalized) continue
-      const normalizedKey = normalized.toLowerCase()
+      const normalizedKey = normalizeFsPath(normalized)
 
       if (
-        existingForKind.some((project) => normalizeProjectPath(project.path).toLowerCase() === normalizedKey)
-        || incoming.some((project) => normalizeProjectPath(project.path).toLowerCase() === normalizedKey)
+        existingForKind.some((project) => normalizeFsPath(project.path) === normalizedKey)
+        || incoming.some((project) => normalizeFsPath(project.path) === normalizedKey)
       ) {
         continue
       }
@@ -588,7 +609,10 @@ export const useProjectStore = defineStore('project', () => {
       statusMessage.value = `CodeX 真实会话读取失败，可继续使用新会话或原生恢复：${String(error)}`
       return false
     }
+    return applyCodexThreadEntries(projectId, recent)
+  }
 
+  function applyCodexThreadEntries(projectId: string, recent: CodexThreadEntry[]) {
     let changed = false
     const current = sessions.value.filter(
       (session) => session.cliKind === 'codex' && session.projectId === projectId,
@@ -689,14 +713,36 @@ export const useProjectStore = defineStore('project', () => {
       statusMessage.value = `OpenCode 历史会话不可用：${String(error)}`
       return false
     }
+    return applyOpenCodeSessionEntries(projectId, recent)
+  }
 
+  function applyOpenCodeSessionEntries(projectId: string, recent: OpenCodeSessionEntry[]) {
     let changed = false
     const current = sessions.value.filter(
       (session) => session.cliKind === 'opencode' && session.projectId === projectId,
     )
     const recentIds = new Set(recent.map((entry) => entry.id))
+    const bindCandidates = current
+      .filter((session) => !session.nativeSessionId && sessionHasLiveTerminal(session.id))
+      .sort((a, b) => b.createdAt - a.createdAt)
+    const boundLocalIds = new Set<string>()
     for (const [index, entry] of recent.entries()) {
       let session = current.find((item) => item.nativeSessionId === entry.id)
+      let freshlyBound = false
+      if (!session) {
+        const candidates = bindCandidates.filter(
+          (item) => !boundLocalIds.has(item.id) && entry.created + HISTORY_BIND_GRACE_MS >= item.createdAt,
+        )
+        const candidate = candidates.find((item) => item.id === activeSessionId.value) ?? candidates[0] ?? null
+        if (candidate) {
+          session = candidate
+          boundLocalIds.add(candidate.id)
+          session.nativeSessionId = entry.id
+          session.launchMode = 'resume'
+          freshlyBound = true
+          changed = true
+        }
+      }
       if (!session) {
         session = {
           cliKind: 'opencode',
@@ -714,7 +760,8 @@ export const useProjectStore = defineStore('project', () => {
         changed = true
       } else {
         const nextName = normalizeSessionName(entry.title) || entry.id
-        if (session.name !== nextName) {
+        const renamable = !freshlyBound || isDefaultProjectSessionName(session.name)
+        if (renamable && session.name !== nextName) {
           session.name = nextName
           updateSessionTerminalTitle(session.id, nextName)
           changed = true
@@ -736,12 +783,54 @@ export const useProjectStore = defineStore('project', () => {
     return changed
   }
 
+  // Re-sync OpenCode session names shortly after naming completes, instead of
+  // only on workspace re-entry. Polls lightly: the CLI is only invoked when a
+  // session is still unnamed (title pending) or terminal output has settled
+  // since the last sync.
+  let lastOpenCodeNameSync = 0
+
+  async function pollOpenCodeSessionNames() {
+    if (activeCliKind.value !== 'opencode') return
+    const terminalStore = useTerminalStore()
+    const now = Date.now()
+    const projectIds = new Set<string>()
+    for (const session of sessions.value) {
+      if (session.cliKind !== 'opencode') continue
+      const tabId = sessionTerminalIds.value[session.id]
+      if (!tabId) continue
+      if (
+        session.nativeSessionId
+        && (session.name === session.nativeSessionId || isDefaultProjectSessionName(session.name))
+      ) {
+        projectIds.add(session.projectId)
+        continue
+      }
+      const lastOutput = terminalStore.outputActivity[tabId] ?? 0
+      if (lastOutput > lastOpenCodeNameSync && now - lastOutput > 2000) {
+        projectIds.add(session.projectId)
+      }
+    }
+    if (projectIds.size === 0) return
+    lastOpenCodeNameSync = now
+    let changed = false
+    for (const projectId of projectIds) {
+      if (await syncProjectSessionsFromOpenCode(projectId)) changed = true
+      historySyncedAt[`opencode:${projectId}`] = Date.now()
+    }
+    if (changed) await persist()
+  }
+
+  const opencodeNamePollTimer = setInterval(() => {
+    pollOpenCodeSessionNames().catch(() => {})
+  }, 4000)
+  void opencodeNamePollTimer
+
   async function discoverOpenCodeProjects() {
     let discovery: OpenCodeProjectDiscovery
     try {
       discovery = await invoke<OpenCodeProjectDiscovery>('discover_opencode_projects')
     } catch (error) {
-      statusMessage.value = `OpenCode 项目发现不可用，可手动选择目录：${String(error)}`
+      statusMessage.value = `OpenCode 项目发现不可用：${String(error)}`
       return false
     }
     if (discovery.warning) {
@@ -751,6 +840,53 @@ export const useProjectStore = defineStore('project', () => {
       .map((entry) => entry.worktree)
       .filter((path) => path && path !== '/' && (path.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(path)))
     return mergeRecentProjectPaths(paths, { prepend: true, cliKind: 'opencode' })
+  }
+
+  // Earlier builds keyed project dedupe on exact path strings, so the same
+  // directory could be persisted twice with different separator styles
+  // (e.g. "D:/work/demo" from OpenCode discovery vs "D:\work\demo").
+  // Merge those duplicates once on load, keeping the first record.
+  function dedupeDuplicateProjects() {
+    const keptByKey = new Map<string, Project>()
+    const redirected = new Map<string, Project>()
+    for (const project of projects.value) {
+      const key = `${project.cliKind}:${normalizeFsPath(project.path)}`
+      const kept = keptByKey.get(key)
+      if (!kept) {
+        keptByKey.set(key, project)
+        continue
+      }
+      redirected.set(project.id, kept)
+      const existingItems = new Set(
+        kept.recentItems.map((item) => `${item.type}:${item.path ?? item.url ?? item.name}`),
+      )
+      for (const item of project.recentItems) {
+        const itemKey = `${item.type}:${item.path ?? item.url ?? item.name}`
+        if (existingItems.has(itemKey)) continue
+        existingItems.add(itemKey)
+        kept.recentItems.push(item)
+      }
+      kept.createdAt = Math.min(kept.createdAt, project.createdAt)
+      kept.updatedAt = Math.max(kept.updatedAt, project.updatedAt)
+    }
+    if (redirected.size === 0) return false
+
+    projects.value = projects.value.filter((project) => !redirected.has(project.id))
+    for (const session of sessions.value) {
+      const kept = redirected.get(session.projectId)
+      if (kept) session.projectId = kept.id
+    }
+    for (const kind of Object.keys(activeProjectIds.value) as CliKind[]) {
+      const activeId = activeProjectIds.value[kind]
+      const kept = activeId ? redirected.get(activeId) : undefined
+      if (kept) activeProjectIds.value[kind] = kept.id
+    }
+    const activeRedirect = activeProjectId.value ? redirected.get(activeProjectId.value) : undefined
+    if (activeRedirect) activeProjectId.value = activeRedirect.id
+    expandedProjectIds.value = new Set(
+      [...expandedProjectIds.value].map((id) => redirected.get(id)?.id ?? id),
+    )
+    return true
   }
 
   async function loadProjects() {
@@ -798,6 +934,8 @@ export const useProjectStore = defineStore('project', () => {
       activeSessionId.value = activeSessionIds.value[activeCliKind.value]
       projectSortMode.value = data.projectSortMode === 'time' ? 'time' : 'manual'
 
+      dedupeDuplicateProjects()
+
       // Merge recent directories from the config-side launch directory history.
       // This keeps the project list in sync with Claude's own history even when
       // no projects have been explicitly added in this module. Most recent
@@ -821,6 +959,109 @@ export const useProjectStore = defineStore('project', () => {
     return loadPromise
   }
 
+  // Per-project history sync runs a CLI child process, so switching tabs used
+  // to cost one spawn per project, sequentially. Syncs now run concurrently
+  // and results are considered fresh for HISTORY_SYNC_TTL; manual refresh and
+  // targeted name polling bypass the TTL.
+  const HISTORY_SYNC_TTL = 60_000
+  const HISTORY_SYNC_CONCURRENCY = 4
+  const historySyncedAt: Record<string, number> = {}
+  const discoverySyncedAt: Partial<Record<CliKind, number>> = {}
+
+  async function discoverCliProjects(kind: 'codex' | 'opencode', force: boolean) {
+    const now = Date.now()
+    if (!force && now - (discoverySyncedAt[kind] ?? 0) <= HISTORY_SYNC_TTL) return false
+    const changed = kind === 'codex'
+      ? await discoverCodexProjects()
+      : await discoverOpenCodeProjects()
+    discoverySyncedAt[kind] = now
+    return changed
+  }
+
+  async function syncCliSessions(
+    kind: CliKind,
+    syncOne: (projectId: string) => Promise<boolean>,
+    options?: { force?: boolean; projectIds?: string[] },
+  ) {
+    let changed = false
+    const now = Date.now()
+    const targets = projects.value.filter((item) => item.cliKind === kind
+      && (!options?.projectIds || options.projectIds.includes(item.id)))
+    const queue = options?.force
+      ? [...targets]
+      : targets.filter((item) => now - (historySyncedAt[`${kind}:${item.id}`] ?? 0) > HISTORY_SYNC_TTL)
+    const workers = Array.from(
+      { length: Math.min(HISTORY_SYNC_CONCURRENCY, queue.length) },
+      async () => {
+        for (let project = queue.shift(); project; project = queue.shift()) {
+          if (await syncOne(project.id)) changed = true
+          historySyncedAt[`${kind}:${project.id}`] = Date.now()
+          const count = sessions.value.length
+          ensureProjectHasSession(project.id)
+          if (sessions.value.length !== count) changed = true
+        }
+      },
+    )
+    await Promise.all(workers)
+    normalizeActiveState()
+    if (changed) await persist()
+    return changed
+  }
+
+  // Batched history sync fetches every native session in one backend call
+  // (single app-server handshake for CodeX, one local DB read for OpenCode)
+  // and distributes entries to projects by path. Falls back to per-project
+  // syncing when the batched command is unavailable.
+  const batchSyncedAt: Partial<Record<CliKind, number>> = {}
+
+  async function syncCliSessionsBatched(kind: 'codex' | 'opencode', options?: { force?: boolean }) {
+    const now = Date.now()
+    if (!options?.force && now - (batchSyncedAt[kind] ?? 0) <= HISTORY_SYNC_TTL) return false
+
+    let grouped: Map<string, (CodexThreadEntry | OpenCodeSessionEntry)[]>
+    try {
+      const all = kind === 'codex'
+        ? await invoke<CodexThreadEntry[]>('list_all_codex_threads', {
+          maxCount: 500,
+          force: options?.force ?? false,
+        })
+        : await invoke<OpenCodeSessionEntry[]>('list_all_opencode_sessions', { maxCount: 500 })
+      grouped = new Map()
+      for (const entry of all) {
+        const path = kind === 'codex'
+          ? (entry as CodexThreadEntry).cwd
+          : (entry as OpenCodeSessionEntry).directory
+        const key = normalizeFsPath(path)
+        if (!key) continue
+        const bucket = grouped.get(key)
+        if (bucket) bucket.push(entry)
+        else grouped.set(key, [entry])
+      }
+    } catch {
+      return kind === 'codex'
+        ? syncCliSessions('codex', syncProjectSessionsFromCodex, { force: options?.force })
+        : syncCliSessions('opencode', syncProjectSessionsFromOpenCode, { force: options?.force })
+    }
+
+    let changed = false
+    const targets = projects.value.filter((item) => item.cliKind === kind)
+    for (const project of targets) {
+      const entries = grouped.get(normalizeFsPath(project.path)) ?? []
+      const applied = kind === 'codex'
+        ? applyCodexThreadEntries(project.id, entries as CodexThreadEntry[])
+        : applyOpenCodeSessionEntries(project.id, entries as OpenCodeSessionEntry[])
+      if (applied) changed = true
+      historySyncedAt[`${kind}:${project.id}`] = now
+      const count = sessions.value.length
+      ensureProjectHasSession(project.id)
+      if (sessions.value.length !== count) changed = true
+    }
+    batchSyncedAt[kind] = now
+    normalizeActiveState()
+    if (changed) await persist()
+    return changed
+  }
+
   async function prepareCliWorkspace(kind: CliKind) {
     if (activeCliKind.value !== kind) setActiveCliKind(kind)
     await loadProjects()
@@ -828,55 +1069,25 @@ export const useProjectStore = defineStore('project', () => {
     // user has already selected another CLI entry.
     if (activeCliKind.value !== kind) return
     if (kind === 'codex') {
-      let changed = await discoverCodexProjects()
-      for (const project of projects.value.filter((item) => item.cliKind === 'codex')) {
-        if (await syncProjectSessionsFromCodex(project.id)) changed = true
-        const count = sessions.value.length
-        ensureProjectHasSession(project.id)
-        if (sessions.value.length !== count) changed = true
-      }
-      normalizeActiveState()
-      if (changed) await persist()
+      await discoverCliProjects('codex', false)
+      await syncCliSessionsBatched('codex')
       return
     }
     if (kind === 'opencode') {
-      let changed = await discoverOpenCodeProjects()
-      for (const project of projects.value.filter((item) => item.cliKind === 'opencode')) {
-        if (await syncProjectSessionsFromOpenCode(project.id)) changed = true
-        const count = sessions.value.length
-        ensureProjectHasSession(project.id)
-        if (sessions.value.length !== count) changed = true
-      }
-      normalizeActiveState()
-      if (changed) await persist()
+      await discoverCliProjects('opencode', false)
+      await syncCliSessionsBatched('opencode')
     }
   }
 
   async function refreshActiveCliHistory() {
     if (activeCliKind.value === 'claude') return refreshClaudeHistory()
     if (activeCliKind.value === 'codex') {
-      let changed = await discoverCodexProjects()
-      for (const project of [...visibleProjects.value]) {
-        if (await syncProjectSessionsFromCodex(project.id)) changed = true
-        const count = sessions.value.length
-        ensureProjectHasSession(project.id)
-        if (sessions.value.length !== count) changed = true
-      }
-      normalizeActiveState()
-      if (changed) await persist()
-      return changed
+      await discoverCliProjects('codex', true)
+      return syncCliSessionsBatched('codex', { force: true })
     }
     if (activeCliKind.value === 'opencode') {
-      let changed = await discoverOpenCodeProjects()
-      for (const project of [...visibleProjects.value]) {
-        if (await syncProjectSessionsFromOpenCode(project.id)) changed = true
-        const count = sessions.value.length
-        ensureProjectHasSession(project.id)
-        if (sessions.value.length !== count) changed = true
-      }
-      normalizeActiveState()
-      if (changed) await persist()
-      return changed
+      await discoverCliProjects('opencode', true)
+      return syncCliSessionsBatched('opencode', { force: true })
     }
     return false
   }
@@ -925,9 +1136,10 @@ export const useProjectStore = defineStore('project', () => {
 
   async function addProject(path: string, name?: string) {
     const normalizedPath = normalizeProjectPath(path)
+    const normalizedKey = normalizeFsPath(normalizedPath)
     const existing = projects.value.find(
       (p) => p.cliKind === activeCliKind.value
-        && normalizeProjectPath(p.path).toLowerCase() === normalizedPath.toLowerCase(),
+        && normalizeFsPath(p.path) === normalizedKey,
     )
     if (existing) {
       activeProjectId.value = existing.id
@@ -1346,7 +1558,8 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  function openSidebar(defaultTab: SidebarTabType = 'tools') {
+  function openSidebar(defaultTab: SidebarTabType = 'tools', placement: SidebarPlacement = 'right') {
+    sidebarPlacement.value = placement
     sidebarOpen.value = true
     if (visibleSidebarTabs.value.length === 0 && defaultTab === 'tools') {
       const tab = makeSidebarTab(defaultTab)
@@ -1416,7 +1629,7 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  async function openFile(path?: string) {
+  async function openFile(path?: string, placement?: SidebarPlacement) {
     let filePath = path
     if (!filePath) {
       const selected = await open({ multiple: false, title: '选择文件' })
@@ -1424,6 +1637,7 @@ export const useProjectStore = defineStore('project', () => {
       filePath = selected
     }
 
+    if (placement) sidebarPlacement.value = placement
     sidebarOpen.value = true
     const existing = visibleSidebarTabs.value.find((tab) => tab.type === 'file' && tab.path === filePath)
     if (existing) {
@@ -1585,6 +1799,7 @@ export const useProjectStore = defineStore('project', () => {
     activeSessionId,
     projectSortMode,
     sidebarOpen,
+    sidebarPlacement,
     leftSidebarCollapsed,
     sidebarTabs,
     activeSidebarTabId,

@@ -136,6 +136,15 @@
   right: 5px;
 }
 
+.sidebar-toggle-icon--top::after {
+  top: 5px;
+  bottom: auto;
+  left: 4px;
+  right: 3px;
+  width: auto;
+  height: 1.5px;
+}
+
 /* ── Card ─────────────────────────────────────────────── */
 .card {
   background-color: var(--card);
@@ -307,4 +316,27 @@
   white-space: nowrap;
   color: var(--text-primary);
   font-weight: 500;
+}
+
+/* ── Settings entry (sidebar footers) ─────────────────────── */
+
+.settings-entry {
+  width: 100%;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-base);
+  font-size: var(--font-size-base);
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-entry:hover {
+  background: var(--tab-bg);
+  color: var(--text-primary);
 }

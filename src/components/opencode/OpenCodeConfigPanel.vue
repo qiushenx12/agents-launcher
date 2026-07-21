@@ -1,17 +1,18 @@
 <template>
   <div class="opencode-config-panel">
-    <aside class="provider-sidebar">
+    <aside class="provider-sidebar" :style="{ width: `${leftWidth}px`, flexBasis: `${leftWidth}px` }">
       <button class="btn btn-primary provider-sidebar__new" type="button" @click="store.addProvider()">
         新建供应商
       </button>
 
-      <div v-if="store.loading && !store.loaded" class="provider-sidebar__empty">
-        正在读取…
-      </div>
-      <div v-else-if="config.providers.length === 0" class="provider-sidebar__empty">
-        暂无自定义供应商
-      </div>
-      <div v-else class="provider-list">
+      <div class="provider-sidebar__body">
+        <div v-if="store.loading && !store.loaded" class="provider-sidebar__empty">
+          正在读取…
+        </div>
+        <div v-else-if="config.providers.length === 0" class="provider-sidebar__empty">
+          暂无自定义供应商
+        </div>
+        <div v-else class="provider-list">
         <button
           v-for="(item, index) in store.orderedProviders"
           :key="store.providerKey(item)"
@@ -50,8 +51,18 @@
                 : '已写入' }}
           </span>
         </button>
+        </div>
       </div>
+      <footer class="provider-sidebar__footer">
+        <button class="settings-entry" type="button" @click="toggleSettings()">⚙ <span>设置</span></button>
+      </footer>
     </aside>
+
+    <div
+      class="opencode-config-panel__divider"
+      :class="{ 'opencode-config-panel__divider--dragging': isDragging }"
+      @mousedown="onMouseDown"
+    />
 
     <main class="config-content">
       <section class="card global-options">
@@ -341,7 +352,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive } from 'vue'
+import { computed, onMounted, reactive, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { OpencodeGlobalModel, OpencodeGlobalProvider } from '@/types/config'
 import { useOpencodeConfigStore } from '@/stores/opencodeConfig'
@@ -350,6 +361,10 @@ import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
 import ModelField from '@/components/config/ModelField.vue'
 import SecretField from '@/components/config/SecretField.vue'
 import { useDragReorder } from '@/composables/useDragReorder'
+import { useResizablePanes } from '@/composables/useResizablePanes'
+import { useSettingsPopover } from '@/composables/useSettingsPopover'
+
+const { toggleSettings } = useSettingsPopover()
 import { usePlatform } from '@/composables/usePlatform'
 
 const store = useOpencodeConfigStore()
@@ -430,9 +445,17 @@ async function openConfigDirectory() {
   }
 }
 
+const { leftWidth, isDragging, onMouseDown, loadSizes, saveSizes } = useResizablePanes(280, 200, 400)
+const PANE_KEY = 'opencode-config-panel'
+
 onMounted(() => {
+  loadSizes(PANE_KEY).catch(() => {})
   store.checkPermissions().catch(() => {})
   store.loadConfig(true).catch(() => {})
+})
+
+watch(isDragging, (dragging) => {
+  if (!dragging) saveSizes(PANE_KEY).catch(() => {})
 })
 </script>
 
@@ -447,9 +470,54 @@ onMounted(() => {
 .provider-sidebar {
   width: 280px;
   flex: 0 0 auto;
+  min-width: 0;
   padding: 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.opencode-config-panel__divider {
+  width: 9px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.opencode-config-panel__divider::after {
+  content: '';
+  width: 1px;
+  height: 100%;
+  background-color: var(--separator);
+  transition: background-color 0.2s ease, width 0.2s ease, box-shadow 0.2s ease;
+}
+
+.opencode-config-panel__divider:hover::after,
+.opencode-config-panel__divider--dragging::after {
+  width: 2px;
+  background-color: var(--primary);
+}
+
+[data-theme="dark"] .opencode-config-panel__divider:hover::after,
+[data-theme="dark"] .opencode-config-panel__divider--dragging::after {
+  box-shadow: 0 0 6px 1px rgba(10, 132, 255, 0.5);
+}
+
+.provider-sidebar__body {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
-  border-right: 1px solid var(--separator);
+}
+
+.provider-sidebar__footer {
+  flex-shrink: 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--separator);
 }
 
 .provider-sidebar__new { width: 100%; margin-bottom: 8px; }

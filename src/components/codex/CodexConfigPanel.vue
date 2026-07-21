@@ -1,15 +1,16 @@
 <template>
   <div class="codex-config-panel">
-    <aside class="codex-config-panel__sidebar">
+    <aside class="codex-config-panel__sidebar" :style="{ width: `${leftWidth}px`, flexBasis: `${leftWidth}px` }">
       <button class="btn btn-primary sidebar__new-btn" type="button" @click="store.newProfile()">
         新建配置
       </button>
 
-      <div v-if="store.loading" class="codex-config-panel__empty">正在加载…</div>
-      <div v-else-if="store.orderedProfiles.length === 0" class="codex-config-panel__empty">
-        暂无 CodeX 配置
-      </div>
-      <div v-else class="codex-profile-list">
+      <div class="codex-config-panel__sidebar-body">
+        <div v-if="store.loading" class="codex-config-panel__empty">正在加载…</div>
+        <div v-else-if="store.orderedProfiles.length === 0" class="codex-config-panel__empty">
+          暂无 CodeX 配置
+        </div>
+        <div v-else class="codex-profile-list">
         <button
           v-for="(item, index) in store.orderedProfiles"
           :key="item.id"
@@ -50,8 +51,18 @@
             @keydown.enter.stop="store.deleteProfile(item.id)"
           >×</span>
         </button>
+        </div>
       </div>
+      <footer class="codex-config-panel__sidebar-footer">
+        <button class="settings-entry" type="button" @click="toggleSettings()">⚙ <span>设置</span></button>
+      </footer>
     </aside>
+
+    <div
+      class="codex-config-panel__divider"
+      :class="{ 'codex-config-panel__divider--dragging': isDragging }"
+      @mousedown="onMouseDown"
+    />
 
     <main class="codex-config-panel__content">
       <section class="card config-editor">
@@ -277,6 +288,10 @@ import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
 import ModelField from '@/components/config/ModelField.vue'
 import SecretField from '@/components/config/SecretField.vue'
 import { useDragReorder } from '@/composables/useDragReorder'
+import { useResizablePanes } from '@/composables/useResizablePanes'
+import { useSettingsPopover } from '@/composables/useSettingsPopover'
+
+const { toggleSettings } = useSettingsPopover()
 import { usePlatform } from '@/composables/usePlatform'
 
 const store = useCodexConfigStore()
@@ -355,8 +370,16 @@ function onEffortSelect(event: Event) {
   ;(event.target as HTMLSelectElement).value = ''
 }
 
+const { leftWidth, isDragging, onMouseDown, loadSizes, saveSizes } = useResizablePanes(280, 200, 400)
+const PANE_KEY = 'codex-config-panel'
+
 onMounted(() => {
+  loadSizes(PANE_KEY).catch(() => {})
   store.loadProfiles().catch(() => {})
+})
+
+watch(isDragging, (dragging) => {
+  if (!dragging) saveSizes(PANE_KEY).catch(() => {})
 })
 </script>
 
@@ -371,10 +394,55 @@ onMounted(() => {
 .codex-config-panel__sidebar {
   width: 280px;
   flex: 0 0 auto;
+  min-width: 0;
   padding: 12px;
-  overflow-y: auto;
-  border-right: 1px solid var(--separator);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--bg);
+}
+
+.codex-config-panel__divider {
+  width: 9px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.codex-config-panel__divider::after {
+  content: '';
+  width: 1px;
+  height: 100%;
+  background-color: var(--separator);
+  transition: background-color 0.2s ease, width 0.2s ease, box-shadow 0.2s ease;
+}
+
+.codex-config-panel__divider:hover::after,
+.codex-config-panel__divider--dragging::after {
+  width: 2px;
+  background-color: var(--primary);
+}
+
+[data-theme="dark"] .codex-config-panel__divider:hover::after,
+[data-theme="dark"] .codex-config-panel__divider--dragging::after {
+  box-shadow: 0 0 6px 1px rgba(10, 132, 255, 0.5);
+}
+
+.codex-config-panel__sidebar-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.codex-config-panel__sidebar-footer {
+  flex-shrink: 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--separator);
 }
 
 .sidebar__new-btn {

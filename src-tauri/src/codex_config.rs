@@ -12,10 +12,9 @@ use toml_edit::{Array, Value as TomlValue};
 use url::Url;
 use uuid::Uuid;
 
-use crate::file_transaction::{
-    restore_json_backup_if_missing, restore_private_json_backup_if_missing, write_json_atomic,
-    write_private_json_atomic,
-};
+use crate::file_transaction::{restore_json_backup_if_missing, write_json_atomic};
+#[cfg(target_os = "macos")]
+use crate::file_transaction::{restore_private_json_backup_if_missing, write_private_json_atomic};
 use crate::model_fetcher;
 use crate::persistent_state::{
     load_profile_index_state, save_profile_index_state, ProfileIndexState,

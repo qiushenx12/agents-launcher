@@ -22,6 +22,8 @@ export const useTerminalStore = defineStore('terminal', () => {
 
   // Per-tab output buffers: collect data before xterm is ready
   const outputBuffers = new Map<number, Uint8Array[]>()
+  // Per-tab last PTY output timestamp — used to trigger post-activity syncs
+  const outputActivity = ref<Record<number, number>>({})
   // Per-tab xterm write callbacks: set when TerminalPane calls registerWriter
   const writers = new Map<number, (data: Uint8Array) => void>()
 
@@ -63,6 +65,7 @@ export const useTerminalStore = defineStore('terminal', () => {
         const { tab_id, cli_kind, data } = event.payload
         const tab = tabs.value.find((item) => item.id === tab_id)
         if (tab && tab.cliKind !== cli_kind) return
+        outputActivity.value[tab_id] = Date.now()
 
         const binary = atob(data)
         const bytes = new Uint8Array(binary.length)
@@ -254,6 +257,7 @@ export const useTerminalStore = defineStore('terminal', () => {
     terminalTabs,
     fontSize,
     refitSignal,
+    outputActivity,
     createTab,
     closeTab,
     activateTab,
