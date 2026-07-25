@@ -129,6 +129,8 @@ pub struct AppState {
     pub terminal: TerminalState,
     #[serde(default = "default_last_active_main_tab")]
     pub last_active_main_tab: String,
+    #[serde(default = "default_title_bar_style")]
+    pub title_bar_style: String,
     #[serde(default = "default_top_bar_order")]
     pub top_bar_order: Vec<String>,
     #[serde(default)]
@@ -141,6 +143,22 @@ pub struct AppState {
 
 fn default_last_active_main_tab() -> String {
     "config".to_string()
+}
+
+fn default_title_bar_style() -> String {
+    if cfg!(target_os = "macos") {
+        "macos".to_string()
+    } else {
+        "windows".to_string()
+    }
+}
+
+fn normalize_title_bar_style(style: &str) -> String {
+    match style {
+        "macos" => "macos".to_string(),
+        "windows" => "windows".to_string(),
+        _ => default_title_bar_style(),
+    }
 }
 
 fn default_top_bar_order() -> Vec<String> {
@@ -389,6 +407,23 @@ pub fn save_window_state(mut state: WindowState) -> Result<(), String> {
         }
         current.window = state;
     })
+}
+
+pub(crate) fn load_title_bar_style_value() -> Result<String, String> {
+    Ok(normalize_title_bar_style(&load_state()?.title_bar_style))
+}
+
+#[tauri::command]
+pub fn load_title_bar_style() -> Result<String, String> {
+    load_title_bar_style_value()
+}
+
+#[tauri::command]
+pub fn save_title_bar_style(style: String) -> Result<(), String> {
+    if style != "macos" && style != "windows" {
+        return Err(format!("Unsupported title bar style: {style}"));
+    }
+    update_state(|state| state.title_bar_style = style)
 }
 
 // ---------------------------------------------------------------------------
@@ -673,5 +708,15 @@ mod tests {
             "claude".to_string(),
         ];
         assert_eq!(normalize_top_bar_hidden(&hidden), vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn title_bar_style_normalizes_unknown_values_to_the_platform_default() {
+        assert_eq!(normalize_title_bar_style("macos"), "macos");
+        assert_eq!(normalize_title_bar_style("windows"), "windows");
+        assert_eq!(
+            normalize_title_bar_style("unknown"),
+            default_title_bar_style()
+        );
     }
 }

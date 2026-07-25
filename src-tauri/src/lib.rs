@@ -8,6 +8,7 @@ pub mod config_store;
 pub mod dependency_manager;
 pub mod env_applier;
 pub mod file_transaction;
+pub mod macos_window;
 pub mod model_fetcher;
 pub mod opencode_config;
 pub mod opencode_db;
@@ -20,6 +21,8 @@ pub mod session_manager;
 pub mod settings_manager;
 pub mod tab_cli;
 pub mod utils;
+
+use tauri::Manager;
 
 mod window_theme {
     #[cfg(target_os = "windows")]
@@ -57,6 +60,42 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             session_manager::start_history_watcher(app.handle().clone());
+            if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "macos")]
+                {
+                    let style = persistent_state::load_title_bar_style_value()
+                        .unwrap_or_else(|_| "macos".to_string());
+                    let style_result = if style == "macos" {
+                        // Keep native traffic lights and AppKit's fullscreen
+                        // transition; the green button is wired below so the
+                        // web title-bar animation can run in the correct order.
+                        window
+                            .set_decorations(true)
+                            .and_then(|_| {
+                                window.set_title_bar_style(tauri::TitleBarStyle::Overlay)
+                            })
+                    } else {
+                        window
+                            .set_title_bar_style(tauri::TitleBarStyle::Visible)
+                            .and_then(|_| window.set_decorations(false))
+                    };
+                    if let Err(error) = style_result {
+                        eprintln!("Failed to apply macOS title bar style: {error}");
+                        let _ = window.set_title_bar_style(tauri::TitleBarStyle::Visible);
+                        let _ = window.set_decorations(false);
+                        let _ =
+                            persistent_state::save_title_bar_style("windows".to_string());
+                    } else if style == "macos" {
+                        if let Err(error) =
+                            macos_window::install_animated_fullscreen_button(app.handle(), &window)
+                        {
+                            eprintln!("Failed to install animated fullscreen button: {error}");
+                        }
+                    }
+                }
+                window.show()?;
+                let _ = window.set_focus();
+            }
             Ok(())
         })
         .manage(std::sync::Mutex::new(pty::PtyManager::new()))
@@ -105,6 +144,8 @@ pub fn run() {
             // persistent_state commands
             persistent_state::load_window_state,
             persistent_state::save_window_state,
+            persistent_state::load_title_bar_style,
+            persistent_state::save_title_bar_style,
             persistent_state::load_launch_dir,
             persistent_state::save_launch_dir,
             persistent_state::load_terminal_font_size,
@@ -168,6 +209,8 @@ pub fn run() {
             tab_cli::load_preset,
             // window theme
             window_theme::set_titlebar_theme,
+            // native macOS fullscreen transition
+            macos_window::toggle_animated_fullscreen,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

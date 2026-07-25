@@ -18,6 +18,8 @@ dependencies = [
  "jsonc-parser",
  "libc",
  "notify",
+ "objc2",
+ "objc2-app-kit",
  "portable-pty",
  "reqwest 0.12.28",
  "rusqlite",
