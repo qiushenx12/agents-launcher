@@ -1,5 +1,11 @@
 <template>
-  <div class="app-layout">
+  <div
+    class="app-layout"
+    :class="{
+      'app-layout--mac-title-bar': usesNativeMacTitleBar,
+      'app-layout--mac-fullscreen': usesNativeMacTitleBar && isMacFullscreen,
+    }"
+  >
     <!-- Custom title bar -->
     <header
       class="title-bar"
@@ -69,7 +75,7 @@
         </button>
       </nav>
 
-      <div class="title-bar__controls">
+      <div v-if="!usesNativeMacTitleBar" class="title-bar__controls" @dblclick.stop>
         <button
           class="title-bar__control"
           data-tauri-drag-region="false"
@@ -300,6 +306,61 @@
           <div class="settings-dropdown__font-row"><span>Markdown 字体</span><div class="font-size-row"><button class="font-size-btn" type="button" :disabled="mdFontSize <= MD_FONT_MIN" aria-label="减小 Markdown 字体" @click="setMdFontSize(mdFontSize - 1)">−</button><span class="font-size-value">{{ mdFontSize }}px</span><button class="font-size-btn" type="button" :disabled="mdFontSize >= MD_FONT_MAX" aria-label="增大 Markdown 字体" @click="setMdFontSize(mdFontSize + 1)">+</button></div></div>
         </div>
       </div>
+      <div class="settings-dropdown__section">Markdown 字体大小</div>
+      <div class="settings-dropdown__item font-size-row">
+        <button
+          class="font-size-btn"
+          :disabled="mdFontSize <= MD_FONT_MIN"
+          @click="setMdFontSize(mdFontSize - 1)"
+        >−</button>
+        <span class="font-size-value">{{ mdFontSize }}px</span>
+        <button
+          class="font-size-btn"
+          :disabled="mdFontSize >= MD_FONT_MAX"
+          @click="setMdFontSize(mdFontSize + 1)"
+        >+</button>
+      </div>
+
+      <template v-if="isMacOS">
+        <div class="settings-dropdown__section">标题栏风格</div>
+        <button
+          class="settings-dropdown__item"
+          :class="{ active: preferredTitleBarStyle === 'macos' }"
+          @click="setPreferredTitleBarStyle('macos')"
+        >
+          <span class="settings-dropdown__check" v-if="preferredTitleBarStyle === 'macos'">✓</span>
+          <span class="settings-dropdown__check" v-else></span>
+          <span class="settings-dropdown__item-label">macOS 原生交通灯</span>
+          <span
+            v-if="titleBarRestartPending && preferredTitleBarStyle === 'macos'"
+            class="settings-dropdown__meta"
+          >
+            重启后生效
+          </span>
+        </button>
+        <button
+          class="settings-dropdown__item"
+          :class="{ active: preferredTitleBarStyle === 'windows' }"
+          @click="setPreferredTitleBarStyle('windows')"
+        >
+          <span class="settings-dropdown__check" v-if="preferredTitleBarStyle === 'windows'">✓</span>
+          <span class="settings-dropdown__check" v-else></span>
+          <span class="settings-dropdown__item-label">Windows 风格</span>
+          <span
+            v-if="titleBarRestartPending && preferredTitleBarStyle === 'windows'"
+            class="settings-dropdown__meta"
+          >
+            重启后生效
+          </span>
+        </button>
+      </template>
+
+      <div class="settings-dropdown__section">界面布局</div>
+      <button class="settings-dropdown__item" @click="openTopBarOrderModal">
+        <span class="settings-dropdown__check">↕</span>
+        <span class="settings-dropdown__item-label">顶栏排序</span>
+        <span class="settings-dropdown__chevron">›</span>
+      </button>
     </div>
 
     <TopBarOrderModal
@@ -346,6 +407,7 @@ import type { ClaudeAgentEvent } from './types/claudeObserver'
 type DependencyName = 'node' | 'git'
 type DependencyStatus = 'installed' | 'missing' | 'unsupported' | 'error'
 type DependencyGateState = 'checking' | 'missing' | 'unsupported' | 'error' | 'installing' | 'restart_required' | 'ready'
+type TitleBarStyle = 'macos' | 'windows'
 
 interface DependencyCheckResult {
   dependency: DependencyName
@@ -370,6 +432,18 @@ const cliRuntimeStore = useCliRuntimeStore()
 const configWorkspaceStore = useConfigWorkspaceStore()
 const topBarStore = useTopBarStore()
 const { isWindows, isMacOS } = usePlatform()
+const cachedTitleBarStyle = localStorage.getItem('title-bar-style')
+const initialTitleBarStyle: TitleBarStyle = isMacOS.value && cachedTitleBarStyle !== 'windows'
+  ? 'macos'
+  : 'windows'
+const appliedTitleBarStyle = ref<TitleBarStyle>(initialTitleBarStyle)
+const preferredTitleBarStyle = ref<TitleBarStyle>(initialTitleBarStyle)
+const usesNativeMacTitleBar = computed(() => (
+  isMacOS.value && appliedTitleBarStyle.value === 'macos'
+))
+const titleBarRestartPending = computed(() => (
+  preferredTitleBarStyle.value !== appliedTitleBarStyle.value
+))
 const terminalManagerRef = ref<InstanceType<typeof TerminalManager> | null>(null)
 const topBarOrderModalOpen = ref(false)
 const sharedSidebarHeaderWidth = ref(285)
@@ -494,6 +568,67 @@ async function selectCliKind(kind: CliKind) {
 // ── Window controls ────────────────────────────────────────────────────────
 const win = getCurrentWindow()
 const isMaximized = ref(false)
+const isMacFullscreen = ref(false)
+const macFullscreenTransitioning = ref(false)
+const MAC_TITLE_BAR_TRANSITION_MS = 260
+let macFullscreenSyncTimer: ReturnType<typeof setTimeout> | null = null
+let unlistenMacFullscreenRequest: (() => void) | undefined
+let unlistenWindowResized: (() => void) | undefined
+
+function waitForMacTitleBarTransition() {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    return Promise.resolve()
+  }
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, MAC_TITLE_BAR_TRANSITION_MS)
+  })
+}
+
+async function syncMacFullscreenState() {
+  if (!usesNativeMacTitleBar.value) return
+  const fullscreen = await win.isFullscreen().catch(() => isMacFullscreen.value)
+  isMacFullscreen.value = fullscreen
+  isMaximized.value = fullscreen
+  macFullscreenTransitioning.value = false
+}
+
+function scheduleMacFullscreenSync(delay = 140) {
+  if (macFullscreenSyncTimer !== null) {
+    clearTimeout(macFullscreenSyncTimer)
+  }
+  macFullscreenSyncTimer = setTimeout(() => {
+    macFullscreenSyncTimer = null
+    syncMacFullscreenState().catch(() => {})
+  }, delay)
+}
+
+async function requestAnimatedFullscreenToggle(knownFullscreen?: boolean) {
+  if (!usesNativeMacTitleBar.value || macFullscreenTransitioning.value) return
+
+  const fullscreen = knownFullscreen
+    ?? await win.isFullscreen().catch(() => isMacFullscreen.value)
+  macFullscreenTransitioning.value = true
+
+  if (fullscreen) {
+    // While the webview is still stable in fullscreen, first move all title-bar
+    // content back to its traffic-light-safe position. Only then ask AppKit to
+    // leave fullscreen, so the returning native buttons never overlap it.
+    isMacFullscreen.value = false
+    await nextTick()
+    await waitForMacTitleBarTransition()
+  }
+
+  try {
+    await invoke('toggle_animated_fullscreen')
+    // `onResized` normally fires once the native transition completes. Keep a
+    // fallback for Reduce Motion and macOS versions that omit the final event.
+    scheduleMacFullscreenSync(1400)
+  } catch (error) {
+    macFullscreenTransitioning.value = false
+    await syncMacFullscreenState()
+    console.error('Failed to toggle native macOS fullscreen:', error)
+  }
+}
 
 function startTitleBarDrag(event: MouseEvent) {
   if (!shouldStartTitleBarDrag(event)) return
@@ -510,6 +645,10 @@ async function minimizeWindow() {
 }
 
 async function toggleMaximize() {
+  if (usesNativeMacTitleBar.value) {
+    await requestAnimatedFullscreenToggle()
+    return
+  }
   await win.toggleMaximize().catch(() => {})
   isMaximized.value = await win.isMaximized().catch(() => false)
 }
@@ -679,6 +818,42 @@ async function setClaudeBusyInputMode(mode: 'native' | 'after-stop') {
     showSettings.value = false
   } catch (error) {
     console.error('Failed to save Claude busy input mode:', error)
+  }
+}
+
+async function loadTitleBarStyle() {
+  if (!isMacOS.value) return
+  try {
+    const saved = await invoke<TitleBarStyle>('load_title_bar_style')
+    const style = saved === 'windows' ? 'windows' : 'macos'
+    appliedTitleBarStyle.value = style
+    preferredTitleBarStyle.value = style
+    localStorage.setItem('title-bar-style', style)
+  } catch {
+    // The backend already applied the platform default before showing the window.
+  }
+}
+
+async function setPreferredTitleBarStyle(style: TitleBarStyle) {
+  if (!isMacOS.value || style === preferredTitleBarStyle.value) {
+    showSettings.value = false
+    return
+  }
+
+  try {
+    await invoke('save_title_bar_style', { style })
+    preferredTitleBarStyle.value = style
+    localStorage.setItem('title-bar-style', style)
+    showSettings.value = false
+    const label = style === 'macos' ? 'macOS 原生交通灯' : 'Windows 风格'
+    const closeNow = window.confirm(
+      `标题栏已切换为”${label}”，重启应用后生效。\n\n是否现在关闭应用？`
+    )
+    if (closeNow) {
+      await closeWindow()
+    }
+  } catch (error) {
+    window.alert(`无法保存标题栏设置：${String(error)}`)
   }
 }
 
@@ -994,10 +1169,16 @@ onMounted(async () => {
   loadTheme()
   loadAppFontSize()
   await claudeObserverStore.loadBusyInputMode()
+  await loadTitleBarStyle()
   await topBarStore.loadOrder()
   await loadWindowState()
   await loadLastMainTab()
-  isMaximized.value = await win.isMaximized().catch(() => false)
+  if (usesNativeMacTitleBar.value) {
+    isMacFullscreen.value = await win.isFullscreen().catch(() => false)
+    isMaximized.value = isMacFullscreen.value
+  } else {
+    isMaximized.value = await win.isMaximized().catch(() => false)
+  }
 
   window.addEventListener('keydown', onKeyDown)
   document.addEventListener('click', onDocumentClick)
@@ -1013,10 +1194,20 @@ onMounted(async () => {
     })
   }).catch(() => undefined)
 
-  // NOTE: Removed `onResized` handler — it fired on every resize event
-  // (including drag), accumulating IPC calls that blocked the event loop.
-  // The maximize icon still updates correctly via toggleMaximize().
-  let unlisten = () => {}
+  unlistenMacFullscreenRequest = await listen<boolean>(
+    'macos-fullscreen-toggle-requested',
+    ({ payload }) => {
+      requestAnimatedFullscreenToggle(payload).catch(() => {})
+    },
+  ).catch(() => undefined)
+
+  // Query only after resizing has settled. This tracks native fullscreen
+  // completion without accumulating an IPC request for every resize frame.
+  unlistenWindowResized = await win.onResized(() => {
+    if (usesNativeMacTitleBar.value) {
+      scheduleMacFullscreenSync()
+    }
+  }).catch(() => undefined)
 
   // Save window state on close, then explicitly close the window.
   // In Tauri v2, registering onCloseRequested prevents the default close —
@@ -1033,7 +1224,10 @@ onMounted(async () => {
     } catch (e) {
       console.error('Failed to save window state on close:', e)
     }
-    unlisten()
+    unlistenWindowResized?.()
+    unlistenWindowResized = undefined
+    unlistenMacFullscreenRequest?.()
+    unlistenMacFullscreenRequest = undefined
     await win.destroy()
   })
 
@@ -1045,6 +1239,12 @@ onBeforeUnmount(() => {
   document.removeEventListener('click', onDocumentClick)
   unlistenClaudeSessionLifecycle?.()
   unlistenClaudeHistory?.()
+  unlistenMacFullscreenRequest?.()
+  unlistenWindowResized?.()
+  if (macFullscreenSyncTimer !== null) {
+    clearTimeout(macFullscreenSyncTimer)
+    macFullscreenSyncTimer = null
+  }
   saveWindowState()
 })
 </script>
@@ -1097,6 +1297,24 @@ onBeforeUnmount(() => {
 
 .title-bar__mode-tabs {
   min-width: 0;
+}
+
+.app-layout--mac-title-bar .title-bar {
+  padding-left: 80px;
+  transition: padding-left 0.26s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.app-layout--mac-title-bar.app-layout--mac-fullscreen .title-bar {
+  padding-left: 8px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-layout--mac-title-bar .title-bar {
+    transition: none;
+  }
+}
+
+.title-bar__left {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -1438,6 +1656,13 @@ onBeforeUnmount(() => {
   color: var(--primary);
 }
 
+.settings-dropdown__meta {
+  margin-left: auto;
+  color: var(--text-secondary);
+  font-size: var(--font-size-small);
+  white-space: nowrap;
+}
+
 .settings-dropdown__check {
   display: inline-block;
   width: 16px;
@@ -1447,6 +1672,7 @@ onBeforeUnmount(() => {
 
 .settings-dropdown__item-label {
   flex: 1;
+  min-width: 0;
 }
 
 .settings-dropdown__item--described {

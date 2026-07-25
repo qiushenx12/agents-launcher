@@ -43,8 +43,8 @@ if ! xcode-select -p >/dev/null 2>&1; then
   fail "未检测到 Xcode Command Line Tools，请先执行 xcode-select --install。"
 fi
 
-if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
-  fail "当前 Python 版本为 $(python3 --version 2>/dev/null)，需要 Python 3.10 或更高版本。"
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)'; then
+  fail "当前 Python 版本为 $(python3 --version 2>/dev/null)，需要 Python 3.9 或更高版本。"
 fi
 
 NODE_MAJOR="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null)"

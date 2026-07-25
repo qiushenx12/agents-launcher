@@ -20,6 +20,7 @@
         "decorations": false,
         "transparent": false,
         "center": true,
+        "visible": false,
         "theme": null
       }
     ],
