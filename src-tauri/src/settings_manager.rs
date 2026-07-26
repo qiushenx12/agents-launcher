@@ -218,8 +218,8 @@ pub fn load_claude_env() -> Result<HashMap<String, String>, String> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("读取 settings.json 失败: {}", e))?;
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("读取 settings.json 失败: {}", e))?;
     let json: Value = serde_json::from_str(&raw).unwrap_or(Value::Object(Map::new()));
     let mut result = HashMap::new();
     if let Some(env_obj) = json.get("env").and_then(|v| v.as_object()) {
@@ -241,8 +241,8 @@ pub fn save_claude_env(env: HashMap<String, String>) -> Result<(), String> {
     let paths = settings_paths()?;
     let path = &paths.canonical;
     let mut obj: Map<String, Value> = if path.exists() {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("读取 settings.json 失败: {}", e))?;
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| format!("读取 settings.json 失败: {}", e))?;
         serde_json::from_str::<Value>(&raw)
             .ok()
             .and_then(|v| v.as_object().cloned())
@@ -257,13 +257,11 @@ pub fn save_claude_env(env: HashMap<String, String>) -> Result<(), String> {
         .collect();
     obj.insert("env".to_string(), Value::Object(env_map));
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
     }
     let json = serde_json::to_string_pretty(&Value::Object(obj))
         .map_err(|e| format!("序列化 settings.json 失败: {}", e))?;
-    std::fs::write(path, json.as_bytes())
-        .map_err(|e| format!("写入 settings.json 失败: {}", e))?;
+    std::fs::write(path, json.as_bytes()).map_err(|e| format!("写入 settings.json 失败: {}", e))?;
     Ok(())
 }
 

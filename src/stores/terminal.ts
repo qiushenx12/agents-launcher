@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { TerminalTab, PtyOutput, PtyStatus, PtyTitle } from '@/types/terminal'
 import type { CliKind } from '@/types/cli'
+import { useClaudeObserverStore } from '@/stores/claudeObserver'
 
 export interface CreateTerminalTabOptions {
   scope?: TerminalTab['scope']
@@ -11,6 +12,7 @@ export interface CreateTerminalTabOptions {
   sidebarTabId?: string
   activate?: boolean
   cliKind?: CliKind
+  observeClaude?: boolean
 }
 
 export const useTerminalStore = defineStore('terminal', () => {
@@ -163,6 +165,8 @@ export const useTerminalStore = defineStore('terminal', () => {
       rows: 30,
       sessionId,
       cliKind: options.cliKind ?? 'claude',
+      observeClaude: options.observeClaude ?? false,
+      projectSessionId: options.projectSessionId,
     })
 
     const tab: TerminalTab = {
@@ -194,6 +198,7 @@ export const useTerminalStore = defineStore('terminal', () => {
     // Clean up timers and Claude session tracking
     clearIdleTimer(id)
     claudeTabs.delete(id)
+    useClaudeObserverStore().removeTab(id)
     const idx = tabs.value.findIndex((t) => t.id === id)
     if (idx !== -1) tabs.value.splice(idx, 1)
 
@@ -203,6 +208,7 @@ export const useTerminalStore = defineStore('terminal', () => {
         ? visibleTabs[visibleTabs.length - 1].id
         : null
     }
+
   }
 
   function activateTab(id: number) {

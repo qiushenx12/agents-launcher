@@ -50,6 +50,8 @@ pub struct ToolState {
     pub use_builtin_terminal: bool,
     #[serde(default = "default_drop_path_mode")]
     pub project_drop_path_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_busy_input_mode: Option<String>,
     #[serde(default = "default_pane_width")]
     pub pane_width: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,6 +84,17 @@ fn default_drop_path_mode() -> String {
     "relative".to_string()
 }
 
+fn default_claude_busy_input_mode() -> String {
+    "native".to_string()
+}
+
+fn normalize_claude_busy_input_mode(value: &str) -> String {
+    match value {
+        "after-stop" => "after-stop".to_string(),
+        _ => default_claude_busy_input_mode(),
+    }
+}
+
 impl Default for ToolState {
     fn default() -> Self {
         Self {
@@ -89,6 +102,7 @@ impl Default for ToolState {
             launch_dir: String::new(),
             use_builtin_terminal: false,
             project_drop_path_mode: default_drop_path_mode(),
+            claude_busy_input_mode: None,
             pane_width: default_pane_width(),
             pane_sizes: None,
             active_profile_id: None,
@@ -533,6 +547,27 @@ pub fn save_project_drop_path_mode(key: String, value: String) -> Result<(), Str
 }
 
 // ---------------------------------------------------------------------------
+// Tauri commands — Claude busy input mode
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn load_claude_busy_input_mode() -> Result<String, String> {
+    Ok(normalize_claude_busy_input_mode(
+        load_state()?
+            .claude
+            .claude_busy_input_mode
+            .as_deref()
+            .unwrap_or("native"),
+    ))
+}
+
+#[tauri::command]
+pub fn save_claude_busy_input_mode(mode: String) -> Result<(), String> {
+    let normalized = normalize_claude_busy_input_mode(&mode);
+    update_tool_state("claude", |tool| tool.claude_busy_input_mode = Some(normalized))
+}
+
+// ---------------------------------------------------------------------------
 // Tauri commands — last active main tab
 // ---------------------------------------------------------------------------
 
@@ -634,17 +669,18 @@ mod tests {
             "pane_widths": { "project-left-sidebar": 260.0 }
         });
         let mut state: AppState = serde_json::from_value(input).expect("decode state");
-        assert_eq!(
-            state.pane_widths.get("project-left-sidebar"),
-            Some(&260.0)
-        );
+        assert_eq!(state.pane_widths.get("project-left-sidebar"), Some(&260.0));
         assert!(tool_state_ref(&state, "project-left-sidebar").is_err());
 
-        state.pane_widths.insert("project-right-sidebar".to_string(), 340.0);
+        state
+            .pane_widths
+            .insert("project-right-sidebar".to_string(), 340.0);
         let output = serde_json::to_value(&state).expect("encode state");
         assert_eq!(output["pane_widths"]["project-right-sidebar"], 340.0);
         assert_eq!(
-            tool_state_ref(&state, "claude").expect("claude state").pane_width,
+            tool_state_ref(&state, "claude")
+                .expect("claude state")
+                .pane_width,
             default_pane_width(),
         );
     }
@@ -673,5 +709,12 @@ mod tests {
             "claude".to_string(),
         ];
         assert_eq!(normalize_top_bar_hidden(&hidden), vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn claude_busy_input_mode_defaults_and_rejects_unknown_values() {
+        assert_eq!(default_claude_busy_input_mode(), "native");
+        assert_eq!(normalize_claude_busy_input_mode("after-stop"), "after-stop");
+        assert_eq!(normalize_claude_busy_input_mode("future-mode"), "native");
     }
 }

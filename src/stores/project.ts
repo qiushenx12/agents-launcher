@@ -1,4 +1,4 @@
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -11,6 +11,12 @@ import { CLI_DESCRIPTORS, type CliKind } from '@/types/cli'
 import { useCliRuntimeStore } from './cliRuntime'
 import { getDefaultShell } from '@/composables/useDefaultShell'
 import { usePlatform } from '@/composables/usePlatform'
+import { clearClaudeConversationScroll } from '@/utils/claudeConversationScroll'
+import {
+  parseClaudeClearSessionLifecycleEvent,
+  rebindClaudeSessionRecordsAfterClear,
+} from '@/utils/claudeSessionLifecycle'
+import type { ClaudeAgentEvent } from '@/types/claudeObserver'
 
 export type TerminalStatus = 'off' | 'idle' | 'running'
 export type SidebarTabType = 'tools' | 'file' | 'terminal' | 'browser'
@@ -18,6 +24,11 @@ export type SidebarPlacement = 'right' | 'top'
 export type BottomTerminalLocation = 'home' | 'project'
 export type FileViewMode = 'source' | 'preview'
 export type ProjectSortMode = 'manual' | 'time'
+
+export interface SessionTerminalLaunchOptions {
+  publishStatus?: boolean
+  throwOnError?: boolean
+}
 
 export interface Project {
   cliKind: CliKind
@@ -107,6 +118,7 @@ interface CodexThreadEntry {
   id: string
   name?: string | null
   preview: string
+  modelProvider?: string | null
   cwd: string
   createdAt: number
   updatedAt: number
@@ -207,6 +219,19 @@ function normalizeSessionName(name: string) {
   return name.replace(/\n/g, ' ').replace(/\r/g, '').trim()
 }
 
+function isCodexInstructionTitle(name: string) {
+  const normalized = normalizeSessionName(name)
+  return normalized.startsWith('# AGENTS.md') || normalized.startsWith('<')
+}
+
+function codexThreadDisplayName(entry: CodexThreadEntry) {
+  const candidate = [entry.name, entry.preview]
+    .filter((value): value is string => !!value)
+    .map(normalizeSessionName)
+    .find((value) => value && !isCodexInstructionTitle(value))
+  return candidate?.slice(0, 120) || `CodeX 会话 ${entry.id.slice(0, 8)}`
+}
+
 function isDefaultProjectSessionName(name: string) {
   const normalized = normalizeSessionName(name)
   return normalized === '主终端' || /^新会话\s+\d+$/.test(normalized)
@@ -264,6 +289,7 @@ export const useProjectStore = defineStore('project', () => {
 
   const sessionTerminalIds = ref<Record<string, number>>({})
   const persistedRootExtras = ref<Record<string, unknown>>({})
+  const pendingClaudeClearSessionIds = new Map<number, string>()
   let projectsLoaded = false
   let loadPromise: Promise<void> | null = null
 
@@ -620,15 +646,27 @@ export const useProjectStore = defineStore('project', () => {
     return false
   }
 
-  async function syncProjectSessionsFromCodex(projectId: string) {
+  async function resolveActiveCodexProfileId() {
+    const codexStore = useCodexConfigStore()
+    await codexStore.ensureLoaded()
+    return codexStore.activeProfileRef?.profileId ?? null
+  }
+
+  async function syncProjectSessionsFromCodex(
+    projectId: string,
+    options: { force?: boolean } = {},
+  ) {
     const project = projects.value.find((item) => item.id === projectId && item.cliKind === 'codex')
     if (!project) return false
 
     let recent: CodexThreadEntry[]
     try {
+      const profileId = await resolveActiveCodexProfileId()
       recent = await invoke<CodexThreadEntry[]>('list_codex_threads', {
         projectPath: project.path,
         maxCount: 200,
+        force: options.force ?? false,
+        profileId,
       })
     } catch (error) {
       statusMessage.value = `CodeX 真实会话读取失败，可继续使用新会话或原生恢复：${String(error)}`
@@ -643,12 +681,67 @@ export const useProjectStore = defineStore('project', () => {
       (session) => session.cliKind === 'codex' && session.projectId === projectId,
     )
     const recentIds = new Set(recent.map((entry) => entry.id))
+    const localCandidates = current
+      .filter((session) => !session.nativeSessionId && isDefaultProjectSessionName(session.name))
+      .sort((left, right) => {
+        const leftLive = sessionHasLiveTerminal(left.id) ? 1 : 0
+        const rightLive = sessionHasLiveTerminal(right.id) ? 1 : 0
+        return rightLive - leftLive || right.createdAt - left.createdAt
+      })
+    const boundLocalIds = new Set<string>()
+
+    const removeCurrentSession = (session: ProjectSession) => {
+      sessions.value = sessions.value.filter((item) => item.id !== session.id)
+      const index = current.findIndex((item) => item.id === session.id)
+      if (index !== -1) current.splice(index, 1)
+      boundLocalIds.add(session.id)
+      if (activeSessionId.value === session.id) activeSessionId.value = null
+      changed = true
+    }
+
+    const findLocalCandidate = (createdAt: number) => localCandidates
+      .filter((candidate) => {
+        if (boundLocalIds.has(candidate.id)) return false
+        if (!current.some((item) => item.id === candidate.id)) return false
+        return Math.abs(candidate.createdAt - createdAt) <= HISTORY_BIND_GRACE_MS
+      })
+      .sort((left, right) => {
+        const leftActive = left.id === activeSessionId.value ? 1 : 0
+        const rightActive = right.id === activeSessionId.value ? 1 : 0
+        return rightActive - leftActive
+          || Math.abs(left.createdAt - createdAt) - Math.abs(right.createdAt - createdAt)
+      })[0] ?? null
+
     for (const [index, entry] of recent.entries()) {
       const createdAt = historyTimestampToMs(entry.createdAt)
       const updatedAt = historyTimestampToMs(entry.updatedAt)
-      const nextName = normalizeSessionName(entry.name || entry.preview).slice(0, 120)
-        || `CodeX 会话 ${entry.id.slice(0, 8)}`
+      const nextName = codexThreadDisplayName(entry)
       let session = current.find((item) => item.nativeSessionId === entry.id)
+
+      // A newly created Codex thread is written to Codex history after the
+      // launcher has already persisted its local placeholder. Bind the
+      // native id to that placeholder so the same row receives the real
+      // title instead of creating a second history row.
+      const candidate = findLocalCandidate(createdAt)
+      if (candidate && (!session || session.id !== candidate.id)) {
+        if (session && sessionHasLiveTerminal(session.id)) {
+          // Prefer the already-running native row if both rows are live.
+          if (!sessionHasLiveTerminal(candidate.id)) {
+            removeCurrentSession(candidate)
+            if (activeSessionId.value === null) activeSessionId.value = session.id
+          }
+        } else {
+          const wasActive = session?.id === activeSessionId.value
+          if (session) removeCurrentSession(session)
+          session = candidate
+          boundLocalIds.add(candidate.id)
+          session.nativeSessionId = entry.id
+          session.launchMode = 'resume'
+          if (wasActive) activeSessionId.value = candidate.id
+          changed = true
+        }
+      }
+
       if (!session) {
         session = {
           cliKind: 'codex',
@@ -683,7 +776,7 @@ export const useProjectStore = defineStore('project', () => {
       }
     }
 
-    for (const session of current) {
+    for (const session of [...current]) {
       if (!session.nativeSessionId || recentIds.has(session.nativeSessionId)) continue
       if (sessionHasLiveTerminal(session.id)) continue
       sessions.value = sessions.value.filter((item) => item.id !== session.id)
@@ -705,6 +798,65 @@ export const useProjectStore = defineStore('project', () => {
       }
     })
     return changed
+  }
+
+  async function handleClaudeSessionLifecycleEvent(event: ClaudeAgentEvent) {
+    const lifecycle = parseClaudeClearSessionLifecycleEvent(event)
+    if (!lifecycle) return false
+
+    if (lifecycle.kind === 'end') {
+      pendingClaudeClearSessionIds.set(lifecycle.tabId, lifecycle.sessionId)
+      return false
+    }
+
+    const previousNativeSessionId = pendingClaudeClearSessionIds.get(lifecycle.tabId)
+    pendingClaudeClearSessionIds.delete(lifecycle.tabId)
+    const liveLocalSession = sessions.value.find(session => (
+      session.cliKind === 'claude'
+      && sessionTerminalIds.value[session.id] === lifecycle.tabId
+    ))
+    if (!liveLocalSession) return false
+
+    const receivedAt = Date.parse(event.receivedAt)
+    const timestamp = Number.isFinite(receivedAt) ? receivedAt : now()
+    const result = rebindClaudeSessionRecordsAfterClear(
+      sessions.value,
+      sessionTerminalIds.value,
+      {
+        tabId: lifecycle.tabId,
+        previousNativeSessionId,
+        nextNativeSessionId: lifecycle.sessionId,
+        timestamp,
+        makeOldSessionId: nativeSessionId => uniqueSessionId(
+          projectSessionIdForClaude(liveLocalSession.projectId, nativeSessionId),
+        ),
+        makeNewSessionName: otherProjectSessions => defaultSessionName(otherProjectSessions),
+      },
+    )
+    if (!result) return false
+
+    result.liveSession.profileRef = undefined
+    if (result.oldSession) result.oldSession.profileRef = undefined
+    if (result.removedDuplicate && activeSessionId.value === result.removedDuplicate.id) {
+      activeSessionId.value = result.liveSession.id
+    }
+
+    const terminalStore = useTerminalStore()
+    const tab = terminalStore.tabs.find(item => item.id === lifecycle.tabId)
+    if (tab) tab.sessionId = lifecycle.sessionId
+    updateSessionTerminalTitle(result.liveSession.id, result.liveSession.name)
+    clearClaudeConversationScroll(result.liveSession.id)
+    if (result.removedDuplicate) clearClaudeConversationScroll(result.removedDuplicate.id)
+
+    await invoke('pty_set_session_id', {
+      tabId: lifecycle.tabId,
+      sessionId: lifecycle.sessionId,
+    }).catch((error) => {
+      console.error('Failed to update Claude PTY session id after /clear:', error)
+    })
+    normalizeActiveState()
+    await persist()
+    return true
   }
 
   async function discoverCodexProjects() {
@@ -813,6 +965,55 @@ export const useProjectStore = defineStore('project', () => {
   // session is still unnamed (title pending) or terminal output has settled
   // since the last sync.
   let lastOpenCodeNameSync = 0
+
+  let lastCodexNameSync = 0
+
+  async function pollCodexSessionNames() {
+    if (activeCliKind.value !== 'codex') return
+    const terminalStore = useTerminalStore()
+    const currentTime = Date.now()
+    const projectIds = new Set<string>()
+
+    for (const session of sessions.value) {
+      if (session.cliKind !== 'codex') continue
+      const tabId = sessionTerminalIds.value[session.id]
+      if (!tabId) continue
+
+      const lastOutput = terminalStore.outputActivity[tabId] ?? 0
+      const waitingForNativeTitle = !session.nativeSessionId || isDefaultProjectSessionName(session.name)
+      const newerActivity = session.createdAt > lastCodexNameSync || lastOutput > lastCodexNameSync
+      const quietSince = Math.max(session.createdAt, lastOutput)
+      if (waitingForNativeTitle && newerActivity && currentTime - quietSince > 1500) {
+        projectIds.add(session.projectId)
+      }
+    }
+
+    // The first pass also repairs placeholders left by an earlier build, even
+    // when their terminal is no longer running after an application restart.
+    if (lastCodexNameSync === 0) {
+      sessions.value
+        .filter((session) =>
+          session.cliKind === 'codex'
+          && !session.nativeSessionId
+          && isDefaultProjectSessionName(session.name),
+        )
+        .forEach((session) => projectIds.add(session.projectId))
+    }
+
+    if (projectIds.size === 0) return
+    lastCodexNameSync = currentTime
+    let changed = false
+    for (const projectId of projectIds) {
+      if (await syncProjectSessionsFromCodex(projectId, { force: true })) changed = true
+      historySyncedAt[`codex:${projectId}`] = Date.now()
+    }
+    if (changed) await persist()
+  }
+
+  const codexNamePollTimer = setInterval(() => {
+    pollCodexSessionNames().catch(() => {})
+  }, 4000)
+  void codexNamePollTimer
 
   async function pollOpenCodeSessionNames() {
     if (activeCliKind.value !== 'opencode') return
@@ -1037,11 +1238,22 @@ export const useProjectStore = defineStore('project', () => {
   // (single app-server handshake for CodeX, one local DB read for OpenCode)
   // and distributes entries to projects by path. Falls back to per-project
   // syncing when the batched command is unavailable.
-  const batchSyncedAt: Partial<Record<CliKind, number>> = {}
+  const batchSyncedAt: Record<string, number> = {}
 
   async function syncCliSessionsBatched(kind: 'codex' | 'opencode', options?: { force?: boolean }) {
     const now = Date.now()
-    if (!options?.force && now - (batchSyncedAt[kind] ?? 0) <= HISTORY_SYNC_TTL) return false
+    let profileId: string | null = null
+    if (kind === 'codex') {
+      try {
+        profileId = await resolveActiveCodexProfileId()
+      } catch {
+        return syncCliSessions('codex', syncProjectSessionsFromCodex, { force: options?.force })
+      }
+    }
+    const syncKey = kind === 'codex'
+      ? `codex:${profileId ?? 'global'}`
+      : kind
+    if (!options?.force && now - (batchSyncedAt[syncKey] ?? 0) <= HISTORY_SYNC_TTL) return false
 
     let grouped: Map<string, (CodexThreadEntry | OpenCodeSessionEntry)[]>
     try {
@@ -1049,6 +1261,7 @@ export const useProjectStore = defineStore('project', () => {
         ? await invoke<CodexThreadEntry[]>('list_all_codex_threads', {
           maxCount: 500,
           force: options?.force ?? false,
+          profileId,
         })
         : await invoke<OpenCodeSessionEntry[]>('list_all_opencode_sessions', { maxCount: 500 })
       grouped = new Map()
@@ -1081,7 +1294,7 @@ export const useProjectStore = defineStore('project', () => {
       ensureProjectHasSession(project.id)
       if (sessions.value.length !== count) changed = true
     }
-    batchSyncedAt[kind] = now
+    batchSyncedAt[syncKey] = now
     normalizeActiveState()
     if (changed) await persist()
     return changed
@@ -1206,6 +1419,7 @@ export const useProjectStore = defineStore('project', () => {
 
   async function launchClaudeFromConfig(
     claudeSessionId?: string,
+    launchOptions: SessionTerminalLaunchOptions = {},
   ) {
     await prepareCliWorkspace('claude')
     const claudeStore = useClaudeStore()
@@ -1264,7 +1478,7 @@ export const useProjectStore = defineStore('project', () => {
     // starts. A project session is history, not a snapshot of an old provider.
     session.profileRef = undefined
     await persist()
-    await ensureSessionTerminal(session.id)
+    await ensureSessionTerminal(session.id, launchOptions)
     return session
   }
 
@@ -1276,6 +1490,8 @@ export const useProjectStore = defineStore('project', () => {
       if (tabId) await terminalStore.closeTab(tabId)
       delete sessionTerminalIds.value[id]
     }
+    await nextTick()
+    for (const id of relatedSessionIds) clearClaudeConversationScroll(id)
     projects.value = projects.value.filter((p) => p.id !== projectId)
     sessions.value = sessions.value.filter((s) => s.projectId !== projectId)
     expandedProjectIds.value.delete(projectId)
@@ -1401,7 +1617,11 @@ export const useProjectStore = defineStore('project', () => {
     return session
   }
 
-  async function createSession(projectId = activeProjectId.value, name?: string) {
+  async function createSession(
+    projectId = activeProjectId.value,
+    name?: string,
+    launchOptions: SessionTerminalLaunchOptions = {},
+  ) {
     if (!projectId) return null
     const project = projects.value.find(
       (item) => item.id === projectId && item.cliKind === activeCliKind.value,
@@ -1410,7 +1630,7 @@ export const useProjectStore = defineStore('project', () => {
 
     const session = createSessionRecord(projectId, name)
     await persist()
-    await ensureSessionTerminal(session.id)
+    await ensureSessionTerminal(session.id, launchOptions)
     return session
   }
 
@@ -1467,6 +1687,8 @@ export const useProjectStore = defineStore('project', () => {
 
   async function removeSession(sessionId: string) {
     await closeSessionTerminal(sessionId)
+    await nextTick()
+    clearClaudeConversationScroll(sessionId)
     sessions.value = sessions.value.filter((s) => s.id !== sessionId)
     delete sessionTerminalIds.value[sessionId]
     if (activeSessionId.value === sessionId) {
@@ -1484,14 +1706,25 @@ export const useProjectStore = defineStore('project', () => {
     return tab.active ? 'running' : 'idle'
   }
 
-  async function ensureSessionTerminal(sessionId: string) {
+  function failSessionTerminalLaunch(
+    message: string,
+    options: SessionTerminalLaunchOptions,
+  ): null {
+    if (options.publishStatus !== false) statusMessage.value = message
+    if (options.throwOnError) throw new Error(message)
+    return null
+  }
+
+  async function ensureSessionTerminal(
+    sessionId: string,
+    options: SessionTerminalLaunchOptions = {},
+  ) {
     const session = sessions.value.find((s) => s.id === sessionId)
     if (!session) return null
     const project = projects.value.find((p) => p.id === session.projectId)
     if (!project) return null
     if (project.cliKind !== session.cliKind) {
-      statusMessage.value = '项目与会话的 CLI 类型不一致，已阻止启动。'
-      return null
+      return failSessionTerminalLaunch('项目与会话的 CLI 类型不一致，已阻止启动。', options)
     }
 
     const terminalStore = useTerminalStore()
@@ -1502,8 +1735,7 @@ export const useProjectStore = defineStore('project', () => {
     const runtimeStore = useCliRuntimeStore()
     const runtimeStatus = await runtimeStore.check(session.cliKind)
     if (runtimeStatus.state !== 'ready') {
-      statusMessage.value = runtimeStatus.message
-      return null
+      return failSessionTerminalLaunch(runtimeStatus.message, options)
     }
     const envVars: Record<string, string> = {}
     let cmd: string[]
@@ -1528,8 +1760,7 @@ export const useProjectStore = defineStore('project', () => {
       try {
         await codexStore.ensureLoaded()
         if (codexStore.globalConfigError) {
-          statusMessage.value = codexStore.globalConfigError
-          return null
+          return failSessionTerminalLaunch(codexStore.globalConfigError, options)
         }
         const activeProfileRef = codexStore.activeProfileRef
         if (activeProfileRef) {
@@ -1538,8 +1769,7 @@ export const useProjectStore = defineStore('project', () => {
           Object.assign(envVars, context.envVars)
         }
       } catch (error) {
-        statusMessage.value = `CodeX 配置无法用于启动：${error}`
-        return null
+        return failSessionTerminalLaunch(`CodeX 配置无法用于启动：${error}`, options)
       }
       args.push('-C', project.path)
       if (session.nativeSessionId) {
@@ -1556,8 +1786,10 @@ export const useProjectStore = defineStore('project', () => {
           session.cwd || project.path,
         )
       } catch (error) {
-        statusMessage.value = `OpenCode 当前配置获取失败，已阻止启动：${error}`
-        return null
+        return failSessionTerminalLaunch(
+          `OpenCode 当前配置获取失败，已阻止启动：${error}`,
+          options,
+        )
       }
       if (session.nativeSessionId) args.push('--session', session.nativeSessionId)
       cmd = [runtimeStore.executable('opencode'), ...args]
@@ -1568,6 +1800,7 @@ export const useProjectStore = defineStore('project', () => {
       projectSessionId: session.id,
       activate: false,
       cliKind: session.cliKind,
+      observeClaude: session.cliKind === 'claude',
     })
     sessionTerminalIds.value[session.id] = tabId
     return tabId
@@ -1953,6 +2186,7 @@ export const useProjectStore = defineStore('project', () => {
     setActiveCliKind,
     refreshActiveCliHistory,
     refreshClaudeHistory,
+    handleClaudeSessionLifecycleEvent,
     pickAndAddProject,
     addProject,
     removeProject,

@@ -3,9 +3,9 @@
 //! Windows: 转发到 registry.rs（注册表写入）
 //! macOS:   写入 ~/.claude/settings.json 的 env 字段
 
-use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 
 #[tauri::command]
 pub fn apply_env_vars(vars: HashMap<String, String>, scope: String) -> Result<(), String> {
@@ -60,8 +60,7 @@ fn apply_env_vars_macos(vars: HashMap<String, String>) -> Result<(), String> {
 
     // 确保目录存在
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
     }
 
     let json = serde_json::to_string_pretty(&Value::Object(obj))

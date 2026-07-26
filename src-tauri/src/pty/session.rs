@@ -22,4 +22,6 @@ pub struct PtySession {
     pub title: Arc<StdMutex<String>>,
     /// Session ID parsed from the `-r` flag in the launch command.
     pub session_id: Option<String>,
+    /// Claude observer capture bound to this PTY, when structured capture is enabled.
+    pub capture_id: Option<String>,
 }

@@ -29,8 +29,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/app.ico"],
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/app.ico"
+    ],
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
@@ -38,7 +42,9 @@
       "nsis": {
         "displayLanguageSelector": false,
         "installerIcon": "icons/app.ico",
-        "languages": ["SimpChinese"],
+        "languages": [
+          "SimpChinese"
+        ],
         "installMode": "currentUser"
       }
     }

@@ -1,4 +1,4 @@
-const CONPTY_RELEASE_ONLY_CHARACTERS = new Set(['‘', '’', '“', '”'])
+const CONPTY_RELEASE_ONLY_CHARACTERS = new Set(['‘', '’', '“', '”', '✱'])
 
 function win32InputRecord(character: string, keyDown: boolean): string {
   const codePoint = character.codePointAt(0)
@@ -9,10 +9,10 @@ function win32InputRecord(character: string, keyDown: boolean): string {
 }
 
 /**
- * The system ConPTY used by portable-pty reports these IME punctuation
- * characters as key-up only when they are sent as plain UTF-8. Codex ignores
- * key-up events. Send explicit Win32 input records so typing and paste both
- * produce the key-down event expected by Codex.
+ * The system ConPTY used by portable-pty reports these IME punctuation and
+ * terminal-symbol characters as key-up only when they are sent as plain
+ * UTF-8. Codex ignores key-up events. Send explicit Win32 input records so
+ * typing and paste both produce the key-down event expected by Codex.
  */
 export function encodeCodexConptyInput(data: string): string {
   if (![...data].some(character => CONPTY_RELEASE_ONLY_CHARACTERS.has(character))) {

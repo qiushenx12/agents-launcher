@@ -43,3 +43,12 @@ test('macOS Codex input passes UTF-8, IME text, and bracketed paste through unch
 test('Windows Codex input retains the ConPTY workaround', () => {
   assert.notEqual(encodeCodexTerminalInput('“', true), '“')
 })
+
+test('Windows Codex input sends the star symbol as explicit Win32 records', () => {
+  const input = encodeCodexTerminalInput('✱', true)
+
+  assert.equal(
+    input,
+    `${ESC}[0;0;10033;1;0;1_${ESC}[0;0;10033;0;0;1_`,
+  )
+})

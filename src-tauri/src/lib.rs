@@ -1,4 +1,5 @@
 pub mod claude_launcher;
+pub mod claude_observer;
 pub mod cli_capabilities;
 pub mod cli_contract;
 pub mod cli_migration;
@@ -20,6 +21,8 @@ pub mod session_manager;
 pub mod settings_manager;
 pub mod tab_cli;
 pub mod utils;
+
+use tauri::Manager;
 
 mod window_theme {
     #[cfg(target_os = "windows")]
@@ -57,6 +60,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             session_manager::start_history_watcher(app.handle().clone());
+            app.manage(claude_observer::ClaudeObserverManager::start(
+                app.handle().clone(),
+            ));
             Ok(())
         })
         .manage(std::sync::Mutex::new(pty::PtyManager::new()))
@@ -121,6 +127,8 @@ pub fn run() {
             persistent_state::save_use_builtin_terminal,
             persistent_state::load_project_drop_path_mode,
             persistent_state::save_project_drop_path_mode,
+            persistent_state::load_claude_busy_input_mode,
+            persistent_state::save_claude_busy_input_mode,
             persistent_state::load_last_active_main_tab,
             persistent_state::save_last_active_main_tab,
             persistent_state::load_top_bar_layout,
@@ -130,6 +138,8 @@ pub fn run() {
             project_manager::save_projects,
             project_manager::path_kind,
             project_manager::read_text_file,
+            project_manager::read_image_base64,
+            project_manager::save_pasted_image,
             project_manager::save_text_file,
             // model_fetcher commands
             model_fetcher::fetch_claude_models,
@@ -153,9 +163,14 @@ pub fn run() {
             utils::get_current_env_vars,
             // pty commands
             pty::pty_create,
+            pty::pty_set_session_id,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
+            claude_observer::get_claude_observer_snapshot,
+            claude_observer::get_claude_terminal_log,
+            claude_observer::open_claude_log_dir,
+            claude_observer::report_claude_observer_timeout,
             // tab_cli commands (inter-tab communication)
             tab_cli::set_tab_permission,
             tab_cli::get_tab_permission,

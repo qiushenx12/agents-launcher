@@ -39,6 +39,8 @@ pub struct CodexThreadSummary {
     pub name: Option<String>,
     #[serde(default)]
     pub preview: String,
+    #[serde(default)]
+    pub model_provider: Option<String>,
     pub cwd: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -73,6 +75,8 @@ struct CodexSessionMeta {
     cwd: String,
     #[serde(default)]
     timestamp: Option<String>,
+    #[serde(default)]
+    model_provider: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,26 +269,57 @@ const CODEX_THREADS_CACHE_TTL: Duration = Duration::from_secs(20);
 
 struct CodexThreadsCacheEntry {
     fetched_at: Instant,
+    cache_key: String,
     threads: Vec<CodexThreadSummary>,
 }
 
 static CODEX_THREADS_CACHE: Mutex<Option<CodexThreadsCacheEntry>> = Mutex::new(None);
 
-fn all_codex_threads(max_count: u32, force: bool) -> Result<Vec<CodexThreadSummary>, String> {
+fn all_codex_threads(
+    max_count: u32,
+    force: bool,
+    profile_id: Option<String>,
+) -> Result<Vec<CodexThreadSummary>, String> {
+    let runtime = crate::codex_config::resolve_codex_runtime_context(profile_id.as_deref())?;
     let mut guard = CODEX_THREADS_CACHE
         .lock()
         .map_err(|_| "CodeX 会话缓存锁定失败。".to_string())?;
     if !force {
         if let Some(entry) = guard.as_ref() {
-            if entry.fetched_at.elapsed() < CODEX_THREADS_CACHE_TTL {
+            if entry.cache_key == runtime.cache_key
+                && entry.fetched_at.elapsed() < CODEX_THREADS_CACHE_TTL
+            {
                 return Ok(entry.threads.clone());
             }
         }
     }
-    let threads = query_all_codex_threads(max_count)
-        .or_else(|_| codex_threads_from_rollouts(max_count))?;
+    let threads = match query_all_codex_threads(max_count, &runtime) {
+        Ok(threads) => {
+            let rollout_threads = codex_threads_from_rollouts(max_count).unwrap_or_default();
+            let threads = enrich_codex_thread_titles(threads, &rollout_threads);
+            let filtered = filter_codex_threads_by_provider(threads, &runtime.model_provider);
+            if filtered.is_empty() {
+                let fallback = filter_codex_threads_by_provider(
+                    rollout_threads,
+                    &runtime.model_provider,
+                );
+                if fallback.is_empty() {
+                    filtered
+                } else {
+                    fallback
+                }
+            } else {
+                filtered
+            }
+        }
+        Err(_) => filter_codex_threads_by_provider(
+            codex_threads_from_rollouts(max_count)?,
+            &runtime.model_provider,
+        ),
+    };
     *guard = Some(CodexThreadsCacheEntry {
         fetched_at: Instant::now(),
+        cache_key: runtime.cache_key,
         threads: threads.clone(),
     });
     Ok(threads)
@@ -294,16 +329,25 @@ fn all_codex_threads(max_count: u32, force: bool) -> Result<Vec<CodexThreadSumma
 pub async fn list_all_codex_threads(
     max_count: Option<u32>,
     force: Option<bool>,
+    profile_id: Option<String>,
 ) -> Result<Vec<CodexThreadSummary>, String> {
-    tokio::task::spawn_blocking(move || all_codex_threads(max_count.unwrap_or(500), force.unwrap_or(false)))
-        .await
-        .map_err(|error| format!("CodeX 会话读取任务异常结束: {error}"))?
+    tokio::task::spawn_blocking(move || {
+        all_codex_threads(
+            max_count.unwrap_or(500),
+            force.unwrap_or(false),
+            profile_id,
+        )
+    })
+    .await
+    .map_err(|error| format!("CodeX 会话读取任务异常结束: {error}"))?
 }
 
 #[tauri::command]
 pub async fn list_codex_threads(
     project_path: String,
     max_count: Option<u32>,
+    force: Option<bool>,
+    profile_id: Option<String>,
 ) -> Result<Vec<CodexThreadSummary>, String> {
     tokio::task::spawn_blocking(move || {
         let cwd = PathBuf::from(&project_path);
@@ -312,12 +356,21 @@ pub async fn list_codex_threads(
         }
         let max_count = max_count.unwrap_or(100);
         let normalized_target = normalize_path(&project_path);
-        match all_codex_threads(max_count, false) {
+        match all_codex_threads(max_count, force.unwrap_or(false), profile_id.clone()) {
             Ok(threads) => Ok(threads
                 .into_iter()
                 .filter(|thread| normalize_path(&thread.cwd) == normalized_target)
                 .collect()),
-            Err(_) => query_codex_threads(&cwd, max_count),
+            Err(_) => {
+                let runtime = crate::codex_config::resolve_codex_runtime_context(
+                    profile_id.as_deref(),
+                )?;
+                let threads = query_codex_threads(&cwd, max_count, &runtime)?;
+                Ok(filter_codex_threads_by_provider(
+                    threads,
+                    &runtime.model_provider,
+                ))
+            }
         }
     })
     .await
@@ -443,15 +496,22 @@ fn clean_codex_worktree(path: &str) -> String {
     }
 }
 
-fn spawn_codex_app_server(cwd: Option<&Path>) -> Result<Child, String> {
+fn spawn_codex_app_server(
+    cwd: Option<&Path>,
+    runtime: &crate::codex_config::CodexRuntimeContext,
+) -> Result<Child, String> {
     let path =
         locate_cli(CliKind::Codex).ok_or_else(|| "未检测到 CodeX，无法读取会话。".to_string())?;
     let mut command = hidden_command(&path);
+    if let Some(profile_name) = runtime.profile_name.as_deref() {
+        command.args(["--profile", profile_name]);
+    }
     command
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    command.envs(&runtime.env_vars);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -460,15 +520,22 @@ fn spawn_codex_app_server(cwd: Option<&Path>) -> Result<Child, String> {
         .map_err(|error| format!("无法启动 CodeX App Server: {error}"))
 }
 
-fn query_codex_threads(cwd: &Path, max_count: u32) -> Result<Vec<CodexThreadSummary>, String> {
-    let mut child = spawn_codex_app_server(Some(cwd))?;
+fn query_codex_threads(
+    cwd: &Path,
+    max_count: u32,
+    runtime: &crate::codex_config::CodexRuntimeContext,
+) -> Result<Vec<CodexThreadSummary>, String> {
+    let mut child = spawn_codex_app_server(Some(cwd), runtime)?;
     let result = exchange_codex_thread_list(&mut child, Some(cwd), max_count.clamp(1, 500));
     terminate_child(&mut child);
     result
 }
 
-fn query_all_codex_threads(max_count: u32) -> Result<Vec<CodexThreadSummary>, String> {
-    let mut child = spawn_codex_app_server(None)?;
+fn query_all_codex_threads(
+    max_count: u32,
+    runtime: &crate::codex_config::CodexRuntimeContext,
+) -> Result<Vec<CodexThreadSummary>, String> {
+    let mut child = spawn_codex_app_server(None, runtime)?;
     let result = exchange_codex_thread_list(&mut child, None, max_count.clamp(1, 2000));
     terminate_child(&mut child);
     result
@@ -521,6 +588,7 @@ fn codex_threads_from_rollout_root(
             id,
             name: None,
             preview: read_codex_rollout_preview(&file_path),
+            model_provider: meta.model_provider,
             cwd: worktree,
             created_at,
             updated_at,
@@ -547,8 +615,7 @@ fn read_codex_rollout_preview(path: &Path) -> String {
         if line.len() > 256 * 1024 {
             continue;
         }
-        let Ok(message) = serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}'))
-        else {
+        let Ok(message) = serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}')) else {
             continue;
         };
         let Some(payload) = message.get("payload") else {
@@ -567,7 +634,7 @@ fn read_codex_rollout_preview(path: &Path) -> String {
                 continue;
             };
             let trimmed = text.trim();
-            if trimmed.is_empty() || trimmed.starts_with('<') {
+            if trimmed.is_empty() || is_codex_instruction_text(trimmed) {
                 continue;
             }
             return trimmed.chars().take(200).collect();
@@ -576,11 +643,65 @@ fn read_codex_rollout_preview(path: &Path) -> String {
     String::new()
 }
 
+fn is_codex_instruction_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md") || trimmed.starts_with('<')
+}
+
+fn enrich_codex_thread_titles(
+    mut threads: Vec<CodexThreadSummary>,
+    rollout_threads: &[CodexThreadSummary],
+) -> Vec<CodexThreadSummary> {
+    let by_id = rollout_threads
+        .iter()
+        .map(|thread| (thread.id.as_str(), thread))
+        .collect::<HashMap<_, _>>();
+
+    for thread in &mut threads {
+        let Some(rollout) = by_id.get(thread.id.as_str()) else {
+            continue;
+        };
+        if thread
+            .model_provider
+            .as_deref()
+            .is_none_or(|provider| provider.is_empty())
+        {
+            thread.model_provider = rollout.model_provider.clone();
+        }
+        if thread
+            .name
+            .as_deref()
+            .is_some_and(is_codex_instruction_text)
+        {
+            thread.name = None;
+        }
+        if (thread.preview.trim().is_empty() || is_codex_instruction_text(&thread.preview))
+            && !rollout.preview.trim().is_empty()
+        {
+            thread.preview = rollout.preview.clone();
+        }
+    }
+    threads
+}
+
 fn codex_sessions_root() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
         .map(|home| home.join("sessions"))
+}
+
+fn filter_codex_threads_by_provider(
+    threads: Vec<CodexThreadSummary>,
+    model_provider: &str,
+) -> Vec<CodexThreadSummary> {
+    threads
+        .into_iter()
+        .filter(|thread| match thread.model_provider.as_deref() {
+            Some(provider) => provider == model_provider,
+            None => model_provider == "openai",
+        })
+        .collect()
 }
 
 fn exchange_codex_thread_list(
@@ -764,8 +885,8 @@ fn discover_opencode_projects_from_db() -> Result<OpenCodeProjectDiscovery, Stri
         });
     }
 
-    let warning = (skipped > 0)
-        .then(|| format!("已跳过 {skipped} 个目录已不存在的 OpenCode 项目记录"));
+    let warning =
+        (skipped > 0).then(|| format!("已跳过 {skipped} 个目录已不存在的 OpenCode 项目记录"));
     Ok(OpenCodeProjectDiscovery {
         projects: discovered,
         warning,
@@ -1020,7 +1141,72 @@ mod tests {
         assert_eq!(threads[0].id, "019f5f28-5a4d-71b2-8d69-5f7d8b2c9da1");
         assert_eq!(threads[0].cwd, r"D:\project\cc-launcher");
         assert_eq!(threads[0].name.as_deref(), Some("Desktop task"));
+        assert_eq!(threads[0].model_provider.as_deref(), Some("openai"));
         assert_eq!(threads[1].preview, "CLI task prompt");
+    }
+
+    #[test]
+    fn codex_thread_filter_isolates_the_active_model_provider() {
+        let thread = |id: &str, model_provider: Option<&str>| CodexThreadSummary {
+            id: id.to_string(),
+            name: None,
+            preview: String::new(),
+            model_provider: model_provider.map(str::to_string),
+            cwd: r"D:\project\cc-launcher".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let custom = filter_codex_threads_by_provider(
+            vec![
+                thread("custom", Some("company_proxy")),
+                thread("official", Some("openai")),
+                thread("legacy", None),
+            ],
+            "company_proxy",
+        );
+        assert_eq!(
+            custom.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            vec!["custom"]
+        );
+
+        let official = filter_codex_threads_by_provider(
+            vec![thread("official", Some("openai")), thread("legacy", None)],
+            "openai",
+        );
+        assert_eq!(
+            official
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["official", "legacy"]
+        );
+    }
+
+    #[test]
+    fn codex_thread_title_enrichment_replaces_injected_instruction_text() {
+        let app_server = CodexThreadSummary {
+            id: "thread-1".to_string(),
+            name: Some("# AGENTS.md instructions for D:\\project\\cc-launcher".to_string()),
+            preview: "# AGENTS.md instructions".to_string(),
+            model_provider: Some("company_proxy".to_string()),
+            cwd: r"D:\project\cc-launcher".to_string(),
+            created_at: 1,
+            updated_at: 2,
+        };
+        let rollout = CodexThreadSummary {
+            id: "thread-1".to_string(),
+            name: None,
+            preview: "真实用户问题".to_string(),
+            model_provider: Some("company_proxy".to_string()),
+            cwd: r"D:\project\cc-launcher".to_string(),
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let enriched = enrich_codex_thread_titles(vec![app_server], &[rollout]);
+        assert_eq!(enriched[0].name, None);
+        assert_eq!(enriched[0].preview, "真实用户问题");
     }
 
     #[test]
@@ -1028,7 +1214,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let nested = dir.path().join("2026").join("07").join("17");
         fs::create_dir_all(&nested).expect("create nested");
-        let rollout = nested.join("rollout-2026-07-17T01-57-47-019f6c13-d886-7521-a0de-90cfe0a99c67.jsonl");
+        let rollout =
+            nested.join("rollout-2026-07-17T01-57-47-019f6c13-d886-7521-a0de-90cfe0a99c67.jsonl");
         fs::write(
             &rollout,
             concat!(
@@ -1057,6 +1244,7 @@ mod tests {
             concat!(
                 "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n",
                 "not json\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for D:\\\\project\\\\cc-launcher\"}]}}\n",
                 "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"\"}]}}\n",
                 "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"真实问题\"}]}}\n"
             ),
@@ -1073,7 +1261,10 @@ mod tests {
         #[cfg(not(windows))]
         assert_eq!(cleaned, "D:/Project/demo");
         #[cfg(windows)]
-        assert_eq!(clean_opencode_worktree(r"\\?\D:\Project\demo\"), r"D:\Project\demo");
+        assert_eq!(
+            clean_opencode_worktree(r"\\?\D:\Project\demo\"),
+            r"D:\Project\demo"
+        );
     }
 
     #[test]

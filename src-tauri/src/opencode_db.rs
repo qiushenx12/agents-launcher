@@ -71,7 +71,9 @@ pub fn query_projects() -> Result<Vec<(String, String)>, String> {
         .prepare("SELECT id, worktree FROM project")
         .map_err(|error| format!("OpenCode 本地数据库项目查询不可用: {error}"))?;
     let rows = statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|error| format!("OpenCode 本地数据库项目读取失败: {error}"))?;
     let mut projects = Vec::new();
     for row in rows {

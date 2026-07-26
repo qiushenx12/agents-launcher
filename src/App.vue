@@ -249,6 +249,32 @@
         仅文件名
       </button>
 
+      <div class="settings-dropdown__section">Claude 运行中消息</div>
+      <button
+        class="settings-dropdown__item settings-dropdown__item--described"
+        :class="{ active: claudeObserverStore.busyInputMode === 'native' }"
+        @click="setClaudeBusyInputMode('native')"
+      >
+        <span class="settings-dropdown__check" v-if="claudeObserverStore.busyInputMode === 'native'">✓</span>
+        <span class="settings-dropdown__check" v-else></span>
+        <span class="settings-dropdown__item-copy">
+          <span>执行间隙插入</span>
+          <small>交给 Claude Code 原生等待队列</small>
+        </span>
+      </button>
+      <button
+        class="settings-dropdown__item settings-dropdown__item--described"
+        :class="{ active: claudeObserverStore.busyInputMode === 'after-stop' }"
+        @click="setClaudeBusyInputMode('after-stop')"
+      >
+        <span class="settings-dropdown__check" v-if="claudeObserverStore.busyInputMode === 'after-stop'">✓</span>
+        <span class="settings-dropdown__check" v-else></span>
+        <span class="settings-dropdown__item-copy">
+          <span>完全停止后发送</span>
+          <small>当前轮次结束后再提交</small>
+        </span>
+      </button>
+
       <div class="settings-dropdown__section">终端字体大小</div>
       <div class="settings-dropdown__item font-size-row">
         <button
@@ -322,6 +348,7 @@ import OrchestrationManager from './components/orchestration/OrchestrationManage
 import StatusBar from './components/common/StatusBar.vue'
 import TopBarOrderModal from './components/common/TopBarOrderModal.vue'
 import { useClaudeStore } from './stores/claude'
+import { useClaudeObserverStore } from './stores/claudeObserver'
 import { useTerminalStore } from './stores/terminal'
 import { useMarkdownFontSize, MD_FONT_MIN, MD_FONT_MAX } from './composables/useMarkdownFontSize'
 import { useSettingsPopover } from './composables/useSettingsPopover'
@@ -337,6 +364,7 @@ import {
   type CliKind,
   type MainTab,
 } from './types/cli'
+import type { ClaudeAgentEvent } from './types/claudeObserver'
 
 type DependencyName = 'node' | 'git'
 type DependencyStatus = 'installed' | 'missing' | 'unsupported' | 'error'
@@ -358,6 +386,7 @@ interface DependencyInstallResult {
 
 const mainTab = ref<MainTab>('config')
 const claudeStore = useClaudeStore()
+const claudeObserverStore = useClaudeObserverStore()
 const terminalStore = useTerminalStore()
 const projectStore = useProjectStore()
 const cliRuntimeStore = useCliRuntimeStore()
@@ -467,6 +496,8 @@ function openConfigTab() {
 }
 
 async function openTopBarItem(item: TopBarItem) {
+  if (mainTab.value === item) return
+
   if (item === 'config') {
     openConfigTab()
     return
@@ -617,6 +648,15 @@ function setProjectDropPathMode(mode: 'filename' | 'relative') {
   showSettings.value = false
 }
 
+async function setClaudeBusyInputMode(mode: 'native' | 'after-stop') {
+  try {
+    await claudeObserverStore.setBusyInputMode(mode)
+    showSettings.value = false
+  } catch (error) {
+    console.error('Failed to save Claude busy input mode:', error)
+  }
+}
+
 function openTopBarOrderModal() {
   showSettings.value = false
   topBarOrderModalOpen.value = true
@@ -718,6 +758,7 @@ async function retryCliGateCheck() {
 
 const activeLaunchDir = computed(() => claudeStore.launchDir)
 let unlistenClaudeHistory: (() => void) | undefined
+let unlistenClaudeSessionLifecycle: (() => void) | undefined
 let refreshingClaudeHistory = false
 
 async function refreshClaudeHistory() {
@@ -957,6 +998,7 @@ async function initializeReadyApp() {
 onMounted(async () => {
   loadTheme()
   loadAppFontSize()
+  await claudeObserverStore.loadBusyInputMode()
   await topBarStore.loadOrder()
   await loadWindowState()
   await loadLastMainTab()
@@ -964,6 +1006,11 @@ onMounted(async () => {
 
   window.addEventListener('keydown', onKeyDown)
   document.addEventListener('click', onDocumentClick)
+  unlistenClaudeSessionLifecycle = await listen<ClaudeAgentEvent>('claude_agent_event', (event) => {
+    projectStore.handleClaudeSessionLifecycleEvent(event.payload).catch((error) => {
+      console.error('Failed to synchronize Claude session after /clear:', error)
+    })
+  }).catch(() => undefined)
   unlistenClaudeHistory = await listen('claude_history_changed', () => {
     if (!appReady.value) return
     refreshClaudeHistory().catch((error) => {
@@ -1001,6 +1048,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown)
   document.removeEventListener('click', onDocumentClick)
+  unlistenClaudeSessionLifecycle?.()
   unlistenClaudeHistory?.()
   saveWindowState()
 })
@@ -1206,7 +1254,7 @@ onBeforeUnmount(() => {
   position: absolute;
   left: 8px;
   bottom: 34px;
-  min-width: 140px;
+  min-width: 250px;
   background-color: var(--card);
   border-radius: var(--radius);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15), 0 0 0 1px var(--separator);
@@ -1272,6 +1320,22 @@ onBeforeUnmount(() => {
 
 .settings-dropdown__item-label {
   flex: 1;
+}
+
+.settings-dropdown__item--described {
+  align-items: flex-start;
+}
+
+.settings-dropdown__item-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.settings-dropdown__item-copy small {
+  color: var(--text-secondary);
+  font-size: var(--font-size-small);
+  font-weight: 400;
 }
 
 .settings-dropdown__chevron {

@@ -63,6 +63,7 @@ export interface CodexProfilesPayload {
 
 export interface CodexLaunchContext {
   managedProfileName: string
+  modelProvider: string
   envVars: Record<string, string>
 }
 

@@ -62,6 +62,18 @@ test('only clear and cursor side effects inside synchronized frames are removed'
   )
 })
 
+test('Codex symbols pass through output stabilization unchanged', () => {
+  const output = collector()
+  const writer = createTerminalOutputWriter('codex', output.sink)
+
+  writer.write(encoder.encode(`${START}✱Grep "createTab\\(" in src${END}`))
+
+  assert.equal(
+    output.text(),
+    `${START}${HIDE_CURSOR}✱Grep "createTab\\(" in src${SHOW_CURSOR}${END}`,
+  )
+})
+
 test('multiple synchronized frames in one chunk remain separate atomic writes', () => {
   const output = collector()
   const writer = createTerminalOutputWriter('codex', output.sink)

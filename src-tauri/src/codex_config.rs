@@ -159,7 +159,16 @@ pub struct DeleteCodexProfileRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CodexLaunchContext {
     pub managed_profile_name: String,
+    pub model_provider: String,
     pub env_vars: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexRuntimeContext {
+    pub profile_name: Option<String>,
+    pub model_provider: String,
+    pub env_vars: BTreeMap<String, String>,
+    pub cache_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1647,9 +1656,54 @@ pub fn resolve_codex_profile(profile_id: String) -> Result<CodexLaunchContext, S
         let api_key = resolve_profile_api_key(&profile)?;
         env_vars.insert(profile.env_key.clone(), api_key);
     }
+    let model_provider = match profile.auth_mode {
+        CodexAuthMode::Official => "openai".to_string(),
+        CodexAuthMode::Custom => profile.provider_id.clone(),
+    };
     Ok(CodexLaunchContext {
         managed_profile_name: profile.managed_profile_name,
+        model_provider,
         env_vars,
+    })
+}
+
+fn global_model_provider() -> Result<String, String> {
+    let path = global_config_path()?;
+    if !path.exists() {
+        return Ok("openai".to_string());
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("无法读取全局 config.toml：{error}"))?;
+    let document = DocumentMut::from_str(&raw)
+        .map_err(|error| format!("全局 config.toml 无法解析：{error}"))?;
+    Ok(document
+        .get("model_provider")
+        .and_then(Item::as_value)
+        .and_then(|item| item.as_str())
+        .filter(|provider| !provider.trim().is_empty())
+        .unwrap_or("openai")
+        .to_string())
+}
+
+pub fn resolve_codex_runtime_context(
+    profile_id: Option<&str>,
+) -> Result<CodexRuntimeContext, String> {
+    if let Some(profile_id) = profile_id {
+        let launch = resolve_codex_profile(profile_id.to_string())?;
+        return Ok(CodexRuntimeContext {
+            profile_name: Some(launch.managed_profile_name),
+            model_provider: launch.model_provider,
+            env_vars: launch.env_vars,
+            cache_key: format!("profile:{profile_id}"),
+        });
+    }
+
+    let model_provider = global_model_provider()?;
+    Ok(CodexRuntimeContext {
+        profile_name: None,
+        model_provider: model_provider.clone(),
+        env_vars: BTreeMap::new(),
+        cache_key: format!("global:{model_provider}"),
     })
 }
 

@@ -25,6 +25,23 @@
       </div>
     </div>
 
+    <ClaudeConversationPane
+      v-else-if="showClaudeEmptyComposer"
+      ref="conversationEmptyPaneRef"
+      :key="`startup-${claudeEmptyPaneSessionId}`"
+      :project-id="store.activeProject!.id"
+      :project-name="store.activeProject!.name"
+      :session-id="claudeEmptyPaneSessionId"
+      :startup-mode="true"
+      :startup-pending="claudeEmptyPending"
+      :external-error="claudeEmptyError"
+      :submit-startup-prompt="submitClaudeEmptyPrompt"
+      :clear-session-draft="clearClaudeSessionDraft"
+      :restore-session-draft="restoreClaudeSessionDraft"
+      v-model:session-draft="activeClaudeSessionDraft"
+      v-model:session-attachment-paths="activeClaudeSessionAttachmentPaths"
+    />
+
     <div v-else-if="!store.activeSession" class="project-terminal__empty">
       <div class="project-terminal__actions">
         <button class="btn btn-primary" @click="store.createSession()">新建项目会话</button>
@@ -53,6 +70,39 @@
           :tab-id="tabId"
           :active="tabId === activeTerminalId"
         />
+      </template>
+      <template v-if="activeTerminalId && isActiveClaudeSession">
+        <ClaudeConversationPane
+          v-if="activeClaudeView === 'conversation'"
+          ref="conversationPaneRef"
+          :key="`conversation-${activeTerminalId}`"
+          :tab-id="activeTerminalId"
+          :project-id="store.activeSession!.projectId"
+          :project-name="store.activeProject!.name"
+          :session-id="store.activeSession!.id"
+          :startup-pending="activeClaudeStartupPending"
+          :clear-session-draft="clearClaudeSessionDraft"
+          :restore-session-draft="restoreClaudeSessionDraft"
+          v-model:session-draft="activeClaudeSessionDraft"
+          v-model:session-attachment-paths="activeClaudeSessionAttachmentPaths"
+          @show-terminal="selectClaudeView('terminal')"
+        />
+        <ClaudeTerminalLogPane
+          v-else-if="activeClaudeView === 'log'"
+          :key="`log-${activeTerminalId}`"
+          :tab-id="activeTerminalId"
+        />
+        <nav class="claude-view-switch" aria-label="Claude 会话视图">
+          <button
+            v-for="option in claudeViewOptions"
+            :key="option.value"
+            type="button"
+            :class="{ active: activeClaudeView === option.value }"
+            @click="selectClaudeView(option.value)"
+          >
+            {{ option.label }}
+          </button>
+        </nav>
       </template>
       <div v-if="!activeTerminalId" class="project-terminal__empty">
         <div class="project-terminal__project-name">{{ store.activeProject?.name }}</div>
@@ -100,19 +150,69 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useProjectStore } from '@/stores/project'
 import { useClaudeStore } from '@/stores/claude'
 import { useTerminalStore } from '@/stores/terminal'
+import { useClaudeObserverStore } from '@/stores/claudeObserver'
 import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import { isInSidebarDropZone, isInTopSidebarDropZone } from '@/composables/useSidebarDropZone'
 import TerminalPane from '@/components/terminal/TerminalPane.vue'
+import ClaudeConversationPane from '@/components/claude/conversation/ClaudeConversationPane.vue'
+import ClaudeTerminalLogPane from '@/components/claude/conversation/ClaudeTerminalLogPane.vue'
+import {
+  ClaudeStartupPromptCancelledError,
+  waitForClaudePromptReady,
+} from '@/utils/claudeStartupPrompt'
+
+type ClaudeView = 'conversation' | 'terminal' | 'log'
 
 const store = useProjectStore()
 const claudeStore = useClaudeStore()
+const claudeObserverStore = useClaudeObserverStore()
 const terminalRef = ref<HTMLElement | null>(null)
+const conversationPaneRef = ref<InstanceType<typeof ClaudeConversationPane> | null>(null)
+const conversationEmptyPaneRef = ref<InstanceType<typeof ClaudeConversationPane> | null>(null)
 const dragOver = ref(false)
+const claudeEmptyError = ref('')
+const claudeEmptyPending = ref(false)
+const claudeEmptyDrafts = ref<Record<string, string>>({})
+const claudeEmptyAttachmentPaths = ref<Record<string, string[]>>({})
+const claudeEmptyPrompt = computed({
+  get() {
+    const key = claudeEmptyDraftKey(store.activeProjectId, store.activeSessionId)
+    return key ? (claudeEmptyDrafts.value[key] ?? '') : ''
+  },
+  set(prompt: string) {
+    const key = claudeEmptyDraftKey(store.activeProjectId, store.activeSessionId)
+    setClaudeEmptyDraft(key, prompt)
+  },
+})
+const claudeViews = ref<Record<number, ClaudeView>>({})
+const claudeViewOptions: Array<{ value: ClaudeView; label: string }> = [
+  { value: 'conversation', label: '对话' },
+  { value: 'terminal', label: '终端' },
+  { value: 'log', label: '日志' },
+]
+
+interface ClaudeEmptyOperation {
+  id: number
+  projectId: string
+  sessionId: string | null
+  draftKey: string
+  cancelled: boolean
+}
+
+interface ClaudeEmptyTarget {
+  projectId: string
+  sessionId: string
+  tabId: number
+}
+
+let claudeEmptyOperationSequence = 0
+let activeClaudeEmptyOperation: ClaudeEmptyOperation | null = null
+let claudeEmptyDisposed = false
 
 const activeTerminalId = computed(() => {
   const sessionId = store.activeSessionId
@@ -125,10 +225,262 @@ const terminalTabIds = computed(() =>
     .filter((id): id is number => typeof id === 'number')
 )
 
+const isActiveClaudeSession = computed(() => store.activeSession?.cliKind === 'claude')
+
+const showClaudeEmptyComposer = computed(() => (
+  !!store.activeProject
+  && store.activeCliKind === 'claude'
+  && !activeTerminalId.value
+))
+
+const claudeEmptyPaneSessionId = computed(() => (
+  store.activeSession?.id ?? `new:${store.activeProjectId ?? 'claude'}`
+))
+
+const activeClaudeStartupPending = computed(() => {
+  const operation = activeClaudeEmptyOperation
+  return !!operation
+    && claudeEmptyPending.value
+    && !operation.cancelled
+    && operation.projectId === store.activeProjectId
+    && operation.sessionId === store.activeSessionId
+})
+
+const activeClaudeSessionDraft = computed({
+  get() {
+    const key = claudeEmptyDraftKey(store.activeProjectId, store.activeSessionId)
+    return key ? (claudeEmptyDrafts.value[key] ?? '') : ''
+  },
+  set(prompt: string) {
+    const key = claudeEmptyDraftKey(store.activeProjectId, store.activeSessionId)
+    setClaudeEmptyDraft(key, prompt)
+  },
+})
+
+const activeClaudeSessionAttachmentPaths = computed({
+  get() {
+    const key = claudeEmptyDraftKey(store.activeProjectId, store.activeSessionId)
+    return key ? (claudeEmptyAttachmentPaths.value[key] ?? []) : []
+  },
+  set(paths: string[]) {
+    const key = claudeEmptyDraftKey(store.activeProjectId, store.activeSessionId)
+    if (!key) return
+    if (paths.length) claudeEmptyAttachmentPaths.value[key] = paths
+    else delete claudeEmptyAttachmentPaths.value[key]
+  },
+})
+
+const activeClaudeView = computed<ClaudeView>({
+  get() {
+    const tabId = activeTerminalId.value
+    return tabId ? (claudeViews.value[tabId] ?? 'conversation') : 'conversation'
+  },
+  set(view) {
+    const tabId = activeTerminalId.value
+    if (tabId) claudeViews.value[tabId] = view
+  },
+})
+
+async function selectClaudeView(view: ClaudeView) {
+  const tabId = activeTerminalId.value
+  if (!tabId || view === activeClaudeView.value) return
+  const previousView = activeClaudeView.value
+
+  if (view === 'terminal') {
+    try {
+      await claudeObserverStore.pausePromptQueueForRawTerminal(tabId)
+    } catch (error) {
+      store.statusMessage = `切换终端前无法安全暂停等待队列：${errorMessage(error)}`
+    }
+  }
+
+  activeClaudeView.value = view
+  if (previousView === 'terminal' && view !== 'terminal') {
+    claudeObserverStore.resumePromptQueueFromRawTerminal(tabId)
+  }
+}
+
 const isFreshProject = computed(() => {
   const session = store.activeSession
   if (!session || activeTerminalId.value) return false
   return store.sessionsOfActiveProject.every((s) => !s.nativeSessionId && !s.claudeSessionId)
+})
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function claudeEmptyDraftKey(projectId: string | null, sessionId: string | null) {
+  return projectId ? `${projectId}\u0000${sessionId ?? 'new'}` : ''
+}
+
+function setClaudeEmptyDraft(key: string, prompt: string) {
+  if (!key) return
+  if (prompt) claudeEmptyDrafts.value[key] = prompt
+  else delete claudeEmptyDrafts.value[key]
+}
+
+function clearClaudeSessionDraft(projectId: string, sessionId: string) {
+  const key = claudeEmptyDraftKey(projectId, sessionId)
+  if (key) delete claudeEmptyDrafts.value[key]
+}
+
+function restoreClaudeSessionDraft(projectId: string, sessionId: string, prompt: string) {
+  const key = claudeEmptyDraftKey(projectId, sessionId)
+  if (!key) return
+  const existing = claudeEmptyDrafts.value[key] ?? ''
+  setClaudeEmptyDraft(key, existing.trim() ? `${prompt}\n${existing}` : prompt)
+}
+
+function moveClaudeEmptyOperationDraft(operation: ClaudeEmptyOperation, sessionId: string) {
+  const nextKey = claudeEmptyDraftKey(operation.projectId, sessionId)
+  if (nextKey === operation.draftKey) return
+  const prompt = claudeEmptyDrafts.value[operation.draftKey] ?? claudeEmptyPrompt.value
+  setClaudeEmptyDraft(nextKey, prompt)
+  delete claudeEmptyDrafts.value[operation.draftKey]
+  operation.draftKey = nextKey
+}
+
+function beginClaudeEmptyOperation() {
+  const projectId = store.activeProjectId
+  if (!projectId || store.activeCliKind !== 'claude') {
+    throw new Error('请先选择 Claude Code 项目')
+  }
+  const operation: ClaudeEmptyOperation = {
+    id: ++claudeEmptyOperationSequence,
+    projectId,
+    sessionId: store.activeSession?.id ?? null,
+    draftKey: claudeEmptyDraftKey(projectId, store.activeSession?.id ?? null),
+    cancelled: false,
+  }
+  setClaudeEmptyDraft(operation.draftKey, claudeEmptyPrompt.value)
+  activeClaudeEmptyOperation = operation
+  return operation
+}
+
+function isClaudeEmptyOperationCancelled(
+  operation: ClaudeEmptyOperation,
+  target?: ClaudeEmptyTarget,
+) {
+  if (
+    claudeEmptyDisposed
+    || operation.cancelled
+    || activeClaudeEmptyOperation !== operation
+    || store.activeCliKind !== 'claude'
+    || store.activeProjectId !== operation.projectId
+    || (operation.sessionId !== null && store.activeSessionId !== operation.sessionId)
+  ) return true
+
+  return !!target && (
+    target.projectId !== operation.projectId
+    || target.sessionId !== operation.sessionId
+    || store.sessionTerminalIds[target.sessionId] !== target.tabId
+  )
+}
+
+function assertClaudeEmptyOperationActive(
+  operation: ClaudeEmptyOperation,
+  target?: ClaudeEmptyTarget,
+) {
+  if (isClaudeEmptyOperationCancelled(operation, target)) {
+    throw new ClaudeStartupPromptCancelledError()
+  }
+}
+
+async function ensureClaudeEmptyTerminal(operation: ClaudeEmptyOperation) {
+  assertClaudeEmptyOperationActive(operation)
+  const launchOptions = {
+    publishStatus: false,
+    throwOnError: true,
+  }
+  let session = store.activeSession
+  if (!session) {
+    const creation = store.createSession(operation.projectId, undefined, launchOptions)
+    operation.sessionId = store.activeSessionId
+    if (operation.sessionId) moveClaudeEmptyOperationDraft(operation, operation.sessionId)
+    session = await creation
+  }
+  if (!session) throw new Error('无法创建 Claude 会话')
+  if (session.projectId !== operation.projectId || session.cliKind !== 'claude') {
+    throw new ClaudeStartupPromptCancelledError()
+  }
+  operation.sessionId = session.id
+  moveClaudeEmptyOperationDraft(operation, session.id)
+  assertClaudeEmptyOperationActive(operation)
+
+  const tabId = store.sessionTerminalIds[session.id]
+    ?? await store.ensureSessionTerminal(session.id, launchOptions)
+  if (!tabId) throw new Error('Claude 终端启动失败')
+  const target = { projectId: session.projectId, sessionId: session.id, tabId }
+  assertClaudeEmptyOperationActive(operation, target)
+  return target
+}
+
+function finishClaudeEmptyOperation(operation: ClaudeEmptyOperation) {
+  if (activeClaudeEmptyOperation !== operation) return
+  activeClaudeEmptyOperation = null
+  claudeEmptyPending.value = false
+}
+
+async function submitClaudeEmptyPrompt(prompt: string) {
+  if (claudeEmptyPending.value || !prompt.trim()) return false
+  setClaudeEmptyDraft(
+    claudeEmptyDraftKey(store.activeProjectId, store.activeSessionId),
+    prompt,
+  )
+  let operation: ClaudeEmptyOperation
+  try {
+    operation = beginClaudeEmptyOperation()
+  } catch (error) {
+    const message = errorMessage(error)
+    claudeEmptyError.value = message
+    store.statusMessage = message
+    return false
+  }
+  claudeEmptyPending.value = true
+  claudeEmptyError.value = ''
+
+  try {
+    const target = await ensureClaudeEmptyTerminal(operation)
+    await waitForClaudePromptReady({
+      refresh: () => claudeObserverStore.loadSnapshot(target.tabId),
+      readState: () => claudeObserverStore.states[target.tabId],
+      isCancelled: () => isClaudeEmptyOperationCancelled(operation, target),
+    })
+    assertClaudeEmptyOperationActive(operation, target)
+    const submitted = await claudeObserverStore.submitPrompt(target.tabId, prompt, {
+      isCancelled: () => isClaudeEmptyOperationCancelled(operation, target),
+    })
+    if (!submitted) throw new ClaudeStartupPromptCancelledError()
+    delete claudeEmptyDrafts.value[operation.draftKey]
+    return true
+  } catch (error) {
+    if (
+      error instanceof ClaudeStartupPromptCancelledError
+      || isClaudeEmptyOperationCancelled(operation)
+    ) return false
+    const message = errorMessage(error)
+    claudeEmptyError.value = message
+    store.statusMessage = message
+    return false
+  } finally {
+    finishClaudeEmptyOperation(operation)
+  }
+}
+
+watch(() => [store.activeProjectId, store.activeSessionId, store.activeCliKind] as const, () => {
+  const operation = activeClaudeEmptyOperation
+  if (operation && !isClaudeEmptyOperationCancelled(operation)) return
+  if (operation) {
+    operation.cancelled = true
+    finishClaudeEmptyOperation(operation)
+  }
+  claudeEmptyError.value = ''
+}, { immediate: true })
+
+onBeforeUnmount(() => {
+  claudeEmptyDisposed = true
+  if (activeClaudeEmptyOperation) activeClaudeEmptyOperation.cancelled = true
 })
 
 function basename(path: string): string {
@@ -201,6 +553,19 @@ useTauriDrop((paths, position) => {
   // Sidebar closed: the right 20% and top 20% zones belong to the sidebar-open drop.
   if (!store.sidebarOpen && isInSidebarDropZone(position, terminalRef.value)) return
   if (!store.sidebarOpen && isInTopSidebarDropZone(position, terminalRef.value)) return
+  if (!paths.length) return
+
+  // If a Claude conversation pane is visible, send files there as attachments.
+  const activeConvPane = conversationPaneRef.value ?? conversationEmptyPaneRef.value
+  if (isActiveClaudeSession.value && activeClaudeView.value === 'conversation' && activeConvPane) {
+    activeConvPane.appendDroppedFiles(paths)
+    return
+  }
+  if (showClaudeEmptyComposer.value && conversationEmptyPaneRef.value) {
+    conversationEmptyPaneRef.value.appendDroppedFiles(paths)
+    return
+  }
+
   const path = paths[0]
   if (!path) return
   handleDroppedFile(path)
@@ -286,5 +651,50 @@ useTauriDrop((paths, position) => {
   min-width: 88px;
   max-width: 128px;
   padding-inline: 12px;
+}
+
+.claude-view-switch {
+  --claude-switch-bg: var(--card);
+  --claude-switch-border: var(--separator);
+  --claude-switch-hover: var(--bg);
+  position: absolute;
+  z-index: 10;
+  top: 6px;
+  right: 10px;
+  display: flex;
+  align-items: center;
+  padding: 2px;
+  border: 1px solid var(--claude-switch-border);
+  border-radius: 7px;
+  background: var(--claude-switch-bg);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
+[data-theme="dark"] .claude-view-switch {
+  --claude-switch-bg: #161a20;
+  --claude-switch-border: #2b323b;
+  --claude-switch-hover: #20262e;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.5);
+}
+
+.claude-view-switch button {
+  min-width: 44px;
+  padding: 4px 9px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text-secondary);
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.claude-view-switch button:hover {
+  color: var(--text-primary);
+  background: var(--claude-switch-hover);
+}
+
+.claude-view-switch button.active {
+  color: #fff;
+  background: var(--primary);
 }
 </style>

@@ -82,9 +82,11 @@ pub async fn install_dependency_via_winget(
             _ => return Err("不支持安装此依赖。".to_string()),
         };
 
-        tokio::task::spawn_blocking(move || run_winget_install(&dependency, package_id, display_name))
-            .await
-            .map_err(|error| format!("安装任务异常结束: {error}"))?
+        tokio::task::spawn_blocking(move || {
+            run_winget_install(&dependency, package_id, display_name)
+        })
+        .await
+        .map_err(|error| format!("安装任务异常结束: {error}"))?
     }
     #[cfg(not(windows))]
     {

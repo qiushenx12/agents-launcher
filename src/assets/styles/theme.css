@@ -34,27 +34,27 @@
 /* Dark theme */
 [data-theme="dark"] {
   color-scheme: dark;
-  --bg: #1C1C1E;
-  --card: #2C2C2E;
-  --text-primary: #F5F5F7;
-  --text-secondary: #8E8E93;
+  --bg: #080A0D;
+  --card: #101318;
+  --text-primary: #F4F7FB;
+  --text-secondary: #98A2AE;
   --primary: #0A84FF;
   --primary-hover: #419CFF;
   --success: #30D158;
   --success-hover: #248A3D;
   --danger: #FF453A;
   --danger-hover: #FF6961;
-  --separator: #38383A;
-  --input-bg: #3A3A3C;
-  --input-border: #48484A;
+  --separator: #252B33;
+  --input-bg: #141920;
+  --input-border: #36404C;
   --input-focus-border: #0A84FF;
-  --tab-inactive: #48484A;
-  --tab-active: #3A3A3C;
-  --tab-bg: #2C2C2E;
+  --tab-inactive: #20262E;
+  --tab-active: #1A2028;
+  --tab-bg: #11161C;
   --dot-running: #FF9F0A;
   --dot-idle: #30D158;
-  --terminal-bg: #1E1E1E;
-  --terminal-fg: #F0F0F0;
+  --terminal-bg: #080A0D;
+  --terminal-fg: #F4F7FB;
 }
 
 /* Global reset */
@@ -109,9 +109,9 @@ body {
 }
 
 [data-theme="dark"] ::-webkit-scrollbar-thumb {
-  background-color: #48484A;
+  background-color: #343D48;
 }
 
 [data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
-  background-color: #636366;
+  background-color: #4B5765;
 }

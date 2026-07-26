@@ -539,6 +539,74 @@ fn is_supported_text_path(path: &Path) -> bool {
 }
 
 #[tauri::command]
+pub fn read_image_base64(path: String) -> Result<String, String> {
+    use std::io::Read;
+    let path_buf = std::path::PathBuf::from(&path);
+    let ext = path_buf
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        _ => "application/octet-stream",
+    };
+    let mut file = std::fs::File::open(&path_buf).map_err(|e| format!("无法打开文件：{e}"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| format!("无法读取文件：{e}"))?;
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+const MAX_PASTED_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+fn pasted_image_extension(extension: &str) -> Result<&'static str, String> {
+    match extension.to_lowercase().as_str() {
+        "png" => Ok("png"),
+        "jpg" | "jpeg" => Ok("jpg"),
+        "gif" => Ok("gif"),
+        "webp" => Ok("webp"),
+        "bmp" => Ok("bmp"),
+        _ => Err(format!("不支持的粘贴图片格式：{extension}")),
+    }
+}
+
+fn save_pasted_image_to(dir: &Path, data_base64: &str, extension: &str) -> Result<String, String> {
+    use base64::Engine as _;
+
+    let ext = pasted_image_extension(extension)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|e| format!("粘贴图片数据解码失败：{e}"))?;
+    if bytes.len() > MAX_PASTED_IMAGE_BYTES {
+        return Err(format!(
+            "粘贴图片过大（{} 字节），超过 {} 字节上限",
+            bytes.len(),
+            MAX_PASTED_IMAGE_BYTES
+        ));
+    }
+
+    fs::create_dir_all(dir).map_err(|e| format!("创建粘贴图片目录失败：{e}"))?;
+    let file_path = dir.join(format!("{}.{}", uuid::Uuid::new_v4(), ext));
+    fs::write(&file_path, &bytes).map_err(|e| format!("写入粘贴图片失败：{e}"))?;
+    Ok(file_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn save_pasted_image(data_base64: String, extension: String) -> Result<String, String> {
+    let dir = app_data_dir()?.join("pasted_images");
+    save_pasted_image_to(&dir, &data_base64, &extension)
+}
+
+#[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
     let path_buf = PathBuf::from(&path);
     if !is_supported_text_path(&path_buf) {
@@ -567,6 +635,47 @@ pub fn save_text_file(path: String, content: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use uuid::Uuid;
+
+    fn temp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("cc-launcher-pasted-images-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn save_pasted_image_writes_file_and_returns_existing_path() {
+        let dir = temp_dir();
+        let data = base64::engine::general_purpose::STANDARD.encode(b"fake-png-bytes");
+
+        let path = save_pasted_image_to(&dir, &data, "png").expect("should save image");
+
+        assert!(Path::new(&path).exists());
+        assert!(path.ends_with(".png"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_pasted_image_rejects_unsupported_extension() {
+        let dir = temp_dir();
+        let data = base64::engine::general_purpose::STANDARD.encode(b"fake-bytes");
+
+        let error = save_pasted_image_to(&dir, &data, "exe").expect_err("must reject extension");
+
+        assert!(error.contains("不支持的粘贴图片格式"));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn save_pasted_image_rejects_oversized_payload() {
+        let dir = temp_dir();
+        let oversized = vec![0u8; MAX_PASTED_IMAGE_BYTES + 1];
+        let data = base64::engine::general_purpose::STANDARD.encode(&oversized);
+
+        let error = save_pasted_image_to(&dir, &data, "png").expect_err("must reject size");
+
+        assert!(error.contains("超过"));
+        assert!(!dir.exists());
+    }
 
     #[cfg(not(windows))]
     #[test]

@@ -115,15 +115,18 @@ impl PtyManager {
 
 #[tauri::command]
 pub fn pty_create(
-    cmd: Vec<String>,
-    env: HashMap<String, String>,
+    mut cmd: Vec<String>,
+    mut env: HashMap<String, String>,
     cwd: Option<String>,
     cols: u16,
     rows: u16,
     session_id: Option<String>,
     cli_kind: Option<CliKind>,
+    observe_claude: Option<bool>,
+    project_session_id: Option<String>,
     app: AppHandle,
     state: State<'_, Mutex<PtyManager>>,
+    observer: State<'_, Arc<crate::claude_observer::ClaudeObserverManager>>,
 ) -> Result<u32, String> {
     if cmd.is_empty() {
         return Err("cmd must not be empty".into());
@@ -139,6 +142,27 @@ pub fn pty_create(
             pixel_height: 0,
         })
         .map_err(|e| format!("openpty failed: {e}"))?;
+
+    let mut observer_error = None;
+    let prepared_capture = if cli_kind == CliKind::Claude && observe_claude.unwrap_or(false) {
+        match observer.prepare_capture(cols, rows, project_session_id, &env) {
+            Ok(capture) => {
+                cmd.insert(1, capture.plugin_dir.to_string_lossy().to_string());
+                cmd.insert(1, "--plugin-dir".to_string());
+                env.insert(
+                    "AGENTS_LAUNCHER_HOOK_TOKEN".to_string(),
+                    capture.token.clone(),
+                );
+                Some(capture)
+            }
+            Err(error) => {
+                observer_error = Some(error);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     #[cfg(windows)]
     let exe = if cmd[0].eq_ignore_ascii_case("cmd.exe") || cmd[0].eq_ignore_ascii_case("cmd") {
@@ -179,19 +203,30 @@ pub fn pty_create(
         cmd_builder.cwd(dir);
     }
 
-    let child = pair
-        .slave
-        .spawn_command(cmd_builder)
-        .map_err(|e| format!("spawn failed: {e}"))?;
+    let child = match pair.slave.spawn_command(cmd_builder) {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(capture) = prepared_capture.as_ref() {
+                observer.abort_capture(&capture.capture_id);
+            }
+            return Err(format!("spawn failed: {error}"));
+        }
+    };
     let child_pid = child.process_id();
 
     let master = pair.master;
-    let writer = master
-        .take_writer()
-        .map_err(|e| format!("take_writer failed: {e}"))?;
-    let mut reader = master
-        .try_clone_reader()
-        .map_err(|e| format!("clone reader failed: {e}"))?;
+    let writer = master.take_writer().map_err(|e| {
+        if let Some(capture) = prepared_capture.as_ref() {
+            observer.abort_capture(&capture.capture_id);
+        }
+        format!("take_writer failed: {e}")
+    })?;
+    let mut reader = master.try_clone_reader().map_err(|e| {
+        if let Some(capture) = prepared_capture.as_ref() {
+            observer.abort_capture(&capture.capture_id);
+        }
+        format!("clone reader failed: {e}")
+    })?;
 
     let output_lines: Arc<std::sync::Mutex<VecDeque<String>>> =
         Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(501)));
@@ -216,19 +251,33 @@ pub fn pty_create(
                 permission: TabPermission::default(),
                 title,
                 session_id,
+                capture_id: prepared_capture
+                    .as_ref()
+                    .map(|capture| capture.capture_id.clone()),
             },
         );
         mgr.line_buffers.insert(id, Vec::new());
         id
     };
 
+    if let Some(capture) = prepared_capture.as_ref() {
+        observer.bind_capture(&capture.capture_id, tab_id);
+    } else if let Some(error) = observer_error {
+        observer.emit_degraded(tab_id, error);
+    }
+
     let app_clone = app.clone();
+    let observer = Arc::clone(observer.inner());
+    let capture_id = prepared_capture.map(|capture| capture.capture_id);
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(capture_id) = capture_id.as_deref() {
+                        observer.record_pty(capture_id, &buf[..n]);
+                    }
                     if let Some(title_str) = extract_osc0_title(&buf[..n]) {
                         // Update session title for backend use (e.g. tab-list)
                         if let Ok(mut t) = reader_title.lock() {
@@ -273,6 +322,9 @@ pub fn pty_create(
                 Err(_) => break,
             }
         }
+        if let Some(capture_id) = capture_id.as_deref() {
+            observer.finish_capture(capture_id);
+        }
         let _ = app_clone.emit(
             "pty_status",
             PtyStatusPayload {
@@ -284,6 +336,21 @@ pub fn pty_create(
     });
 
     Ok(tab_id)
+}
+
+#[tauri::command]
+pub fn pty_set_session_id(
+    tab_id: u32,
+    session_id: String,
+    state: State<'_, Mutex<PtyManager>>,
+) -> Result<(), String> {
+    let mut mgr = state.lock().map_err(|error| error.to_string())?;
+    let session = mgr
+        .sessions
+        .get_mut(&tab_id)
+        .ok_or_else(|| format!("PTY tab {tab_id} not found"))?;
+    session.session_id = Some(session_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -449,6 +516,7 @@ pub fn pty_resize(
     cols: u16,
     rows: u16,
     state: State<'_, Mutex<PtyManager>>,
+    observer: State<'_, Arc<crate::claude_observer::ClaudeObserverManager>>,
 ) -> Result<(), String> {
     let mgr = state.lock().map_err(|e| e.to_string())?;
     let session = mgr
@@ -464,6 +532,9 @@ pub fn pty_resize(
             pixel_height: 0,
         })
         .map_err(|e| format!("resize failed: {e}"))?;
+    if let Some(capture_id) = session.capture_id.as_deref() {
+        observer.resize(capture_id, cols, rows);
+    }
     Ok(())
 }
 
@@ -530,13 +601,24 @@ fn kill_process_tree(pid: u32) {
 }
 
 #[tauri::command]
-pub fn pty_kill(tab_id: u32, state: State<'_, Mutex<PtyManager>>) -> Result<(), String> {
+pub fn pty_kill(
+    tab_id: u32,
+    state: State<'_, Mutex<PtyManager>>,
+    observer: State<'_, Arc<crate::claude_observer::ClaudeObserverManager>>,
+) -> Result<(), String> {
     let session = {
         let mut mgr = state.lock().map_err(|e| e.to_string())?;
         take_session(&mut mgr, tab_id)
     };
     if let Some(session) = session {
+        let capture_id = session.capture_id.clone();
+        if let Some(capture_id) = capture_id.as_deref() {
+            observer.finish_capture(capture_id);
+        }
         terminate_session(session);
+        if let Some(capture_id) = capture_id.as_deref() {
+            observer.release_capture(capture_id, tab_id);
+        }
     }
     Ok(())
 }
@@ -564,6 +646,7 @@ fn terminate_session(mut session: PtySession) {
 
 pub fn cleanup_all_sessions(app: &tauri::AppHandle) {
     let state = app.state::<Mutex<PtyManager>>();
+    let observer = app.state::<Arc<crate::claude_observer::ClaudeObserverManager>>();
     let Ok(mgr) = state.lock() else { return };
     let tab_ids: Vec<u32> = mgr.sessions.keys().copied().collect();
     drop(mgr);
@@ -573,7 +656,14 @@ pub fn cleanup_all_sessions(app: &tauri::AppHandle) {
             take_session(&mut mgr, tab_id)
         };
         if let Some(session) = session {
+            let capture_id = session.capture_id.clone();
+            if let Some(capture_id) = capture_id.as_deref() {
+                observer.finish_capture(capture_id);
+            }
             terminate_session(session);
+            if let Some(capture_id) = capture_id.as_deref() {
+                observer.release_capture(capture_id, tab_id);
+            }
         }
     }
 }
