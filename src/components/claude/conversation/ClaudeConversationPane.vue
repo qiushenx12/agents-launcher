@@ -18,18 +18,11 @@
       </div>
     </div>
 
-    <div class="claude-conversation__status" :class="`is-${state.runState}`">
-      <span class="claude-conversation__status-dot" />
-      <span>{{ statusLabel }}</span>
-      <span v-if="state.degradedReason" class="claude-conversation__warning">
-        {{ state.degradedReason }}
-      </span>
-    </div>
     <span class="claude-conversation__copy-status" aria-live="polite" aria-atomic="true">
       {{ copyAnnouncement }}
     </span>
     <span class="claude-conversation__activity-status" aria-live="polite" aria-atomic="true">
-      {{ activityAnnouncement }}
+      {{ activityAnnouncement || statusLabel }}
     </span>
 
     <div
@@ -101,16 +94,19 @@
             <path d="M20 17H7l3 3" />
             <path d="m4 17 3 3" />
           </svg>
+          <span v-else-if="planApprovalPrompt">✓</span>
           <span v-else>+</span>
         </div>
         <div class="workspace-trust-dialog__content">
           <h2 :id="`plugin-install-title-${composerDomId}`">
-            {{ modelSwitchConfirmPrompt ? '确认切换模型' : '是否安装此插件？' }}
+            {{ planApprovalPrompt ? '确认计划下一步' : modelSwitchConfirmPrompt ? '确认切换模型' : '是否安装此插件？' }}
           </h2>
           <p :id="`plugin-install-description-${composerDomId}`">
-            {{ modelSwitchConfirmPrompt
-              ? 'Claude Code 需要确认是否在当前会话中切换模型。'
-              : 'Claude Code 请求安装以下插件，请选择一个选项继续。' }}
+            {{ planApprovalPrompt
+              ? 'Claude 已完成计划，请选择下一步。'
+              : modelSwitchConfirmPrompt
+                ? 'Claude Code 需要确认是否在当前会话中切换模型。'
+                : 'Claude Code 请求安装以下插件，请选择一个选项继续。' }}
           </p>
           <code v-if="pluginInstallPrompt">{{ pluginInstallPrompt.pluginName }}</code>
           <p class="plugin-install-dialog__prompt">{{ selectionPrompt.prompt }}</p>
@@ -123,7 +119,7 @@
             v-for="(option, index) in selectionPrompt.options"
             :key="`${index}-${option}`"
             class="btn"
-            :class="index === (modelSwitchKeyboardIndex ?? modelSwitchConfirmPrompt?.selectedIndex ?? 0) ? 'btn-primary' : 'btn-secondary'"
+            :class="index === (modelSwitchKeyboardIndex ?? modelSwitchConfirmPrompt?.selectedIndex ?? planApprovalPrompt?.selectedIndex ?? 0) ? 'btn-primary' : 'btn-secondary'"
             type="button"
             :title="option"
             :disabled="pluginInstallPending"
@@ -150,21 +146,30 @@
         <div class="claude-conversation__empty-prompt">{{ emptyConversationPrompt }}</div>
       </div>
 
+      <template v-for="item in state.items" :key="item.id">
       <div
-        v-for="item in state.items"
-        :key="item.id"
+        v-if="shouldRenderConversationRow(item)"
         class="conversation-row"
         :class="`conversation-row--${item.kind}`"
       >
+        <template v-if="isProcessGroupHeader(item)">
+          <button
+            class="conversation-process__summary"
+            type="button"
+            :aria-expanded="isProcessGroupOpen(item)"
+            @click="toggleProcessGroup(item)"
+          >
+            <span>已处理 {{ processGroupDuration(item) }}</span>
+            <span class="conversation-process__chevron" aria-hidden="true">&gt;</span>
+          </button>
+          <div class="conversation-process__divider" aria-hidden="true" />
+        </template>
         <article
+          v-if="shouldShowConversationItemContent(item)"
           class="conversation-item"
           :class="`conversation-item--${item.kind}`"
         >
         <template v-if="item.kind === 'user' || item.kind === 'assistant'">
-          <header v-if="item.kind === 'assistant'" class="conversation-item__header">
-            <span>Claude</span>
-            <time>{{ formatTime(item.timestamp) }}</time>
-          </header>
           <div
             v-if="item.text"
             class="conversation-item__markdown"
@@ -177,14 +182,37 @@
             <div class="question-card__header">
               <div>
                 <strong>Claude 问题</strong>
-                <span v-if="item.state === 'waiting'">请选择后提交</span>
+                <span v-if="item.state === 'waiting' && !questionSubmitted[item.id]">请逐题选择</span>
               </div>
               <span class="question-card__state">
                 {{ questionCardStateLabel(item) }}
               </span>
             </div>
+            <div class="question-card__steps" aria-label="问题进度">
+              <span
+                v-for="(question, questionIndex) in askUserQuestions(item)"
+                :key="`${item.id}-step-${questionIndex}`"
+                class="question-card__step"
+                :class="{
+                  'is-active': questionIndex === activeQuestionIndex(item) && !questionSubmitted[item.id],
+                  'is-complete': questionStepComplete(item, questionIndex),
+                }"
+              >
+                <span aria-hidden="true">
+                  {{ questionStepComplete(item, questionIndex) ? '✓' : questionIndex + 1 }}
+                </span>
+                {{ question.header || `问题 ${questionIndex + 1}` }}
+              </span>
+              <span
+                class="question-card__step"
+                :class="{ 'is-active': !!questionSubmitted[item.id], 'is-complete': item.state !== 'waiting' }"
+              >
+                <span aria-hidden="true">{{ item.state !== 'waiting' ? '✓' : '→' }}</span>
+                提交
+              </span>
+            </div>
             <div
-              v-for="(question, questionIndex) in askUserQuestions(item)"
+              v-for="{ question, questionIndex } in activeAskUserQuestions(item)"
               :key="`${item.id}-${questionIndex}`"
               class="question-card__question"
             >
@@ -213,6 +241,25 @@
                   </span>
                 </button>
               </div>
+              <label class="question-card__custom-answer">
+                <span>其他回答</span>
+                <textarea
+                  :value="questionCustomAnswer(item, questionIndex)"
+                  :disabled="!questionCanAnswer(item)"
+                  rows="2"
+                  placeholder="输入你的回答"
+                  @input="setQuestionCustomAnswer(item, questionIndex, ($event.target as HTMLTextAreaElement).value)"
+                  @keydown.shift.tab.stop
+                />
+              </label>
+            </div>
+            <div
+              v-if="item.state !== 'waiting' || questionSubmitted[item.id]"
+              class="question-card__complete-summary"
+            >
+              {{ item.state === 'failed' ? '问题回复失败' : questionSubmitted[item.id] && item.state === 'waiting'
+                ? '回答已发送，正在等待 Claude 继续'
+                : `已完成 ${askUserQuestions(item).length} 个问题` }}
             </div>
             <div v-if="item.state === 'waiting'" class="question-card__footer">
               <span v-if="questionErrors[item.id]" class="question-card__error" role="alert">
@@ -227,14 +274,14 @@
                 :disabled="!questionAnswerReady(item) || !!questionSubmitting[item.id] || !!questionSubmitted[item.id]"
                 @click="submitQuestionAnswers(item)"
               >
-                {{ questionSubmitting[item.id] ? '正在提交…' : '提交选择' }}
+                {{ questionSubmitLabel(item) }}
               </button>
             </div>
           </div>
         </template>
 
         <template v-else-if="item.kind === 'tool'">
-          <details class="tool-card" :open="item.state === 'running' || item.state === 'failed'">
+          <details class="tool-card" :open="isToolCardOpen(item)">
             <summary>
               <span class="tool-card__state" :class="`is-${item.state}`" />
               <span class="tool-card__heading">
@@ -274,6 +321,30 @@
           <div class="status-card">{{ item.text }}</div>
         </template>
         </article>
+        <div
+          v-if="item.kind === 'assistant' && item.text && isFinalAssistantMessage(item)"
+          class="assistant-message-actions"
+        >
+          <time>{{ formatTime(item.timestamp) }}</time>
+          <button
+            class="assistant-message-actions__copy"
+            type="button"
+            aria-label="复制回复"
+            title="复制回复"
+            @click="copyAssistantMessage(item.text, $event)"
+          >
+            <svg class="assistant-message-actions__copy-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <rect x="8" y="8" width="13" height="13" rx="2.5" />
+              <path d="M16 8V5.5A2.5 2.5 0 0 0 13.5 3h-8A2.5 2.5 0 0 0 3 5.5v8A2.5 2.5 0 0 0 5.5 16H8" />
+            </svg>
+            <svg class="assistant-message-actions__check-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m5 12.5 4.2 4.2L19 7" />
+            </svg>
+            <svg class="assistant-message-actions__error-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M7 7l10 10M17 7 7 17" />
+            </svg>
+          </button>
+        </div>
         <div v-if="item.kind === 'user' && item.text" class="user-message-actions">
           <time>{{ formatTime(item.timestamp) }}</time>
           <button
@@ -296,6 +367,7 @@
           </button>
         </div>
       </div>
+      </template>
 
     </div>
 
@@ -318,8 +390,16 @@
             <span>*</span>
           </span>
           <span class="claude-activity__label">{{ workingActivity.label }}…</span>
-          <span v-if="activityDetails.length" class="claude-activity__details">
-            ({{ activityDetails.join(' · ') }})
+          <span v-if="hasActivityDetails" class="claude-activity__details">
+            (<template v-if="activityElapsed">{{ activityElapsed }}</template>
+            <template v-if="activityElapsed && activityTokenCount"> · </template>
+            <template v-if="activityTokenCount">
+              {{ activityTokenDirection }}
+              <span class="claude-activity__token-count">{{ displayedTokenCount }}</span>
+              tokens
+            </template>
+            <template v-if="(activityElapsed || activityTokenCount) && activityPhase"> · </template>
+            <template v-if="activityPhase">{{ activityPhase }}</template>)
           </span>
         </div>
         <button
@@ -396,6 +476,7 @@
         </Transition>
         <div
           v-if="slashCommandMenuOpen"
+          ref="slashCommandMenuRef"
           :id="`${composerDomId}-slash-command-menu`"
           class="claude-composer__command-menu"
           role="listbox"
@@ -412,6 +493,8 @@
             role="option"
             :aria-selected="index === slashCommandIndex"
             @mousedown.prevent
+            @mouseenter="slashCommandIndex = index"
+            @focus="slashCommandIndex = index"
             @click="selectSlashCommand(command.command)"
           >
             <code>{{ command.command }}</code>
@@ -457,6 +540,14 @@
               <line x1="5" y1="12" x2="19" y2="12" />
             </svg>
           </button>
+          <span
+            class="claude-composer__permission-mode"
+            :class="`is-${permissionModeTone}`"
+            title="Shift + Tab 切换权限模式"
+            aria-live="polite"
+          >
+            {{ permissionModeLabel }}
+          </span>
           <span class="claude-composer__actions-spacer" />
           <div
             class="claude-composer__model-picker-shell"
@@ -619,6 +710,21 @@
           </div>
           </div>
           <button
+            v-if="isWorking"
+            class="claude-composer__send is-ready is-stop"
+            :class="{ 'is-pending': stopPending }"
+            type="button"
+            :disabled="stopPending"
+            aria-label="停止生成"
+            title="停止生成"
+            @click="stopRun"
+          >
+            <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+              <rect x="7" y="7" width="10" height="10" rx="1" fill="currentColor" stroke="none" />
+            </svg>
+          </button>
+          <button
+            v-else
             class="claude-composer__send"
             :class="{ 'is-ready': canSubmit && !!(prompt.trim() || attachments.length) }"
             type="submit"
@@ -666,6 +772,7 @@ import { getClaudeComposerTextareaMetrics } from '@/utils/claudeComposerSizing'
 import { CLAUDE_PROMPT_QUEUE_LIMIT } from '@/utils/claudePromptQueue'
 import {
   filterClaudeSlashCommands,
+  setClaudeSkillCommands,
   validateClaudeSlashCommand,
 } from '@/utils/claudeSlashCommands'
 import {
@@ -698,6 +805,7 @@ const props = defineProps<{
   sessionId: string
   startupMode?: boolean
   startupPending?: boolean
+  initialPermissionMode?: ClaudeDefaultPermissionMode
   externalError?: string
   sessionDraft?: string
   sessionAttachmentPaths?: string[]
@@ -707,6 +815,7 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{
   showTerminal: []
+  'update:initialPermissionMode': [mode: ClaudeDefaultPermissionMode]
   'update:sessionDraft': [prompt: string]
   'update:sessionAttachmentPaths': [paths: string[]]
 }>()
@@ -715,6 +824,7 @@ const claudeStore = useClaudeStore()
 const projectStore = useProjectStore()
 const historyRef = ref<HTMLElement | null>(null)
 const inputRef = ref<HTMLTextAreaElement | null>(null)
+const slashCommandMenuRef = ref<HTMLElement | null>(null)
 const modelPickerRef = ref<HTMLDetailsElement | null>(null)
 const modelPickerPopoverRef = ref<HTMLElement | null>(null)
 const workspaceTrustOverlayRef = ref<HTMLElement | null>(null)
@@ -723,6 +833,11 @@ const workspaceTrustConfirmRef = ref<HTMLButtonElement | null>(null)
 const pluginInstallOverlayRef = ref<HTMLElement | null>(null)
 const prompt = ref(props.sessionDraft ?? '')
 const submitError = ref('')
+const stopPending = ref(false)
+type ClaudeDefaultPermissionMode = 'bypassPermissions' | 'auto' | 'default' | 'acceptEdits' | 'plan'
+const startupPermissionMode = ref<ClaudeDefaultPermissionMode>('auto')
+let startupPermissionModeWrite: Promise<void> = Promise.resolve()
+let startupPermissionModeRevision = 0
 const followLatest = ref(true)
 const copyAnnouncement = ref('')
 const workspaceTrustPending = ref(false)
@@ -734,11 +849,14 @@ const pluginInstallError = ref('')
 const modelSwitchKeyboardIndex = ref<number | null>(null)
 let terminalModelActionQueue: Promise<void> = Promise.resolve()
 const slashCommandIndex = ref(0)
+const slashCommandMenuDismissed = ref(false)
 const commandNotice = ref('')
 let commandNoticeTimer: number | undefined
 const isDragOver = ref(false)
 const attachments = ref<FileAttachment[]>([])
 const questionSelections = ref<Record<string, number[]>>({})
+const questionCustomAnswers = ref<Record<string, string>>({})
+const questionActiveIndexes = ref<Record<string, number>>({})
 const questionSubmitting = ref<Record<string, boolean>>({})
 const questionSubmitted = ref<Record<string, boolean>>({})
 const questionErrors = ref<Record<string, string>>({})
@@ -751,6 +869,28 @@ const activeProject = computed(() =>
   projectStore.projects.find((p) => p.id === props.projectId) ?? null,
 )
 const projectPath = computed(() => activeProject.value?.path ?? null)
+interface ClaudeSkillEntry {
+  name: string
+  description: string
+}
+const slashCommandCatalogRevision = ref(0)
+let skillLoadSequence = 0
+
+async function refreshClaudeSlashCommands() {
+  const sequence = ++skillLoadSequence
+  try {
+    const skills = await invoke<ClaudeSkillEntry[]>('list_claude_skills', {
+      projectPath: projectPath.value,
+    })
+    if (sequence !== skillLoadSequence) return
+    setClaudeSkillCommands(skills)
+  } catch {
+    if (sequence !== skillLoadSequence) return
+    setClaudeSkillCommands([])
+  } finally {
+    if (sequence === skillLoadSequence) slashCommandCatalogRevision.value += 1
+  }
+}
 const dropPathMode = computed(() => claudeStore.projectDropPathMode ?? 'relative')
 
 function buildAttachment(path: string): FileAttachment {
@@ -901,6 +1041,7 @@ const state = computed<ClaudeConversationState>(() => {
       terminalLog: '',
       loading: false,
       activityStatus: undefined,
+      compactCompletionRevision: 0,
       queuedPrompts: [],
       queueActionPending: false,
     }
@@ -917,10 +1058,129 @@ const state = computed<ClaudeConversationState>(() => {
     terminalLog: '',
     loading: true,
     activityStatus: undefined,
+    compactCompletionRevision: 0,
     queuedPrompts: [],
     queueActionPending: false,
   }
 })
+
+type ConversationProcessGroup = {
+  id: string
+  itemIds: Set<string>
+  firstItemId: string
+  startedAt: string
+  endedAt: string
+  turn: number
+}
+
+const processGroups = computed<ConversationProcessGroup[]>(() => {
+  const groups: ConversationProcessGroup[] = []
+  let activeGroup: ConversationProcessGroup | null = null
+  let turn = 0
+  let turnStartedAt: string | null = null
+
+  for (let index = 0; index < state.value.items.length; index++) {
+    const item = state.value.items[index]
+    if (item.kind === 'user') {
+      turn += 1
+      turnStartedAt = item.timestamp
+      activeGroup = null
+      continue
+    }
+    if (item.kind !== 'tool' || isAskUserQuestionItem(item)) {
+      activeGroup = null
+      continue
+    }
+    if (!activeGroup || activeGroup.turn !== turn) {
+      activeGroup = {
+        id: `process-${item.id}`,
+        itemIds: new Set(),
+        firstItemId: item.id,
+        startedAt: turnStartedAt ?? item.timestamp,
+        endedAt: item.timestamp,
+        turn,
+      }
+      groups.push(activeGroup)
+    }
+    activeGroup.itemIds.add(item.id)
+    activeGroup.endedAt = item.timestamp
+  }
+
+  for (const group of groups) {
+    const groupItemIds = [...group.itemIds]
+    const lastItemId = groupItemIds[groupItemIds.length - 1]
+    const lastItemIndex = state.value.items.findIndex(item => item.id === lastItemId)
+    const nextAssistant = state.value.items.slice(lastItemIndex + 1)
+      .find(item => item.kind === 'assistant')
+    if (nextAssistant) group.endedAt = nextAssistant.timestamp
+  }
+  return groups
+})
+const expandedProcessGroupIds = ref<Set<string>>(new Set())
+
+function processGroupForItem(item: ClaudeConversationItem) {
+  return processGroups.value.find(group => group.itemIds.has(item.id))
+}
+
+function isActiveProcessGroup(group: ConversationProcessGroup) {
+  const latestUserIndex = state.value.items.map(item => item.kind).lastIndexOf('user')
+  const latestTurn = state.value.items
+    .slice(0, latestUserIndex + 1)
+    .filter(item => item.kind === 'user')
+    .length
+  return group.turn === latestTurn && (
+    state.value.runState === 'working' || state.value.runState === 'permission'
+  )
+}
+
+function isProcessGroupOpen(item: ClaudeConversationItem) {
+  const group = processGroupForItem(item)
+  return !!group && (
+    isActiveProcessGroup(group) || expandedProcessGroupIds.value.has(group.id)
+  )
+}
+
+function isProcessGroupHeader(item: ClaudeConversationItem) {
+  const group = processGroupForItem(item)
+  return !!group && !isActiveProcessGroup(group) && item.id === group.firstItemId
+}
+
+function shouldRenderConversationRow(item: ClaudeConversationItem) {
+  const group = processGroupForItem(item)
+  return !group || isProcessGroupOpen(item) || item.id === group.firstItemId
+}
+
+function shouldShowConversationItemContent(item: ClaudeConversationItem) {
+  const group = processGroupForItem(item)
+  return !group || isProcessGroupOpen(item)
+}
+
+function isToolCardOpen(item: ClaudeConversationItem) {
+  return isProcessGroupOpen(item) || item.state === 'running' || item.state === 'failed'
+}
+
+function toggleProcessGroup(item: ClaudeConversationItem) {
+  const group = processGroupForItem(item)
+  if (!group || isActiveProcessGroup(group)) return
+  const next = new Set(expandedProcessGroupIds.value)
+  if (next.has(group.id)) next.delete(group.id)
+  else next.add(group.id)
+  expandedProcessGroupIds.value = next
+}
+
+function processGroupDuration(item: ClaudeConversationItem) {
+  const group = processGroupForItem(item)
+  if (!group) return ''
+  const startedAt = new Date(group.startedAt).getTime()
+  const endedAt = new Date(group.endedAt).getTime()
+  const durationSeconds = Number.isFinite(startedAt) && Number.isFinite(endedAt)
+    ? Math.max(1, Math.round((endedAt - startedAt) / 1_000))
+    : 1
+  const minutes = Math.floor(durationSeconds / 60)
+  const seconds = durationSeconds % 60
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`
+}
+
 const workspaceTrustPrompt = computed(() => (
   state.value.terminalPrompt?.kind === 'workspaceTrust'
     ? state.value.terminalPrompt
@@ -936,7 +1196,14 @@ const modelSwitchConfirmPrompt = computed(() => (
     ? state.value.terminalPrompt
     : null
 ))
-const selectionPrompt = computed(() => pluginInstallPrompt.value ?? modelSwitchConfirmPrompt.value)
+const planApprovalPrompt = computed(() => (
+  state.value.terminalPrompt?.kind === 'planApproval'
+    ? state.value.terminalPrompt
+    : null
+))
+const selectionPrompt = computed(() => (
+  pluginInstallPrompt.value ?? modelSwitchConfirmPrompt.value ?? planApprovalPrompt.value
+))
 const terminalPrompt = computed(() => !!state.value.terminalPrompt)
 
 const pendingQuestion = computed(() => state.value.items.some(item => (
@@ -958,8 +1225,9 @@ const workingActivity = computed(() => {
   if (state.value.runState !== 'working') return null
   const activity = state.value.activityStatus
   if (!activity) return { label: 'Thinking' }
+  const label = activity.label.replace(/[….]+$/u, '')
   return {
-    label: activity.label.replace(/[….]+$/u, '') || 'Thinking',
+    label: /^compacting conversation$/i.test(label) ? '正在压缩上下文' : label || 'Thinking',
     elapsed: activity.elapsed,
     tokenDirection: activity.tokenDirection,
     tokenCount: activity.tokenCount,
@@ -967,25 +1235,98 @@ const workingActivity = computed(() => {
   }
 })
 
-const activityDetails = computed(() => {
-  const activity = workingActivity.value
-  if (!activity) return []
-  const details: string[] = []
-  if ('elapsed' in activity && activity.elapsed) details.push(activity.elapsed)
-  if (
-    'tokenDirection' in activity
-    && 'tokenCount' in activity
-    && activity.tokenDirection
-    && activity.tokenCount
-  ) {
-    details.push(`${activity.tokenDirection} ${activity.tokenCount} tokens`)
+const activityElapsed = computed(() => workingActivity.value?.elapsed ?? '')
+const activityTokenDirection = computed(() => workingActivity.value?.tokenDirection ?? '')
+const activityTokenCount = computed(() => workingActivity.value?.tokenCount ?? '')
+const activityPhase = computed(() => workingActivity.value?.phase ?? '')
+const hasActivityDetails = computed(() => !!(
+  activityElapsed.value || activityTokenCount.value || activityPhase.value
+))
+
+type TokenCountFormat = {
+  multiplier: number
+  fractionDigits: number
+  suffix: string
+  useGrouping: boolean
+}
+
+function parseTokenCount(value: string): { value: number, format: TokenCountFormat } | null {
+  const match = value.trim().match(/^([\d,]+(?:\.\d+)?)([kKmM]?)$/)
+  if (!match) return null
+  const numeric = Number(match[1].replaceAll(',', ''))
+  if (!Number.isFinite(numeric)) return null
+  const suffix = match[2]
+  const multiplier = suffix.toLowerCase() === 'k' ? 1_000 : suffix.toLowerCase() === 'm' ? 1_000_000 : 1
+  return {
+    value: numeric * multiplier,
+    format: {
+      multiplier,
+      fractionDigits: match[1].split('.')[1]?.length ?? 0,
+      suffix,
+      useGrouping: match[1].includes(','),
+    },
   }
-  if ('phase' in activity && activity.phase) details.push(activity.phase)
-  return details
+}
+
+function formatTokenCount(value: number, format: TokenCountFormat) {
+  const scaled = value / format.multiplier
+  if (format.suffix) return `${scaled.toFixed(format.fractionDigits)}${format.suffix}`
+  if (format.fractionDigits > 0) return scaled.toFixed(format.fractionDigits)
+  const rounded = Math.round(scaled)
+  return format.useGrouping ? rounded.toLocaleString('en-US') : String(rounded)
+}
+
+const animatedTokenValue = ref<number | null>(null)
+const animatedTokenFormat = ref<TokenCountFormat | null>(null)
+const displayedTokenCount = computed(() => {
+  const tokenCount = activityTokenCount.value
+  if (!tokenCount || animatedTokenValue.value === null || !animatedTokenFormat.value) return tokenCount
+  return formatTokenCount(animatedTokenValue.value, animatedTokenFormat.value)
 })
+let tokenAnimationFrame: number | undefined
+
+function stopTokenAnimation() {
+  if (tokenAnimationFrame === undefined) return
+  window.cancelAnimationFrame(tokenAnimationFrame)
+  tokenAnimationFrame = undefined
+}
+
+function animateTokenCount(nextTokenCount: string) {
+  const parsed = parseTokenCount(nextTokenCount)
+  stopTokenAnimation()
+  if (!parsed) {
+    animatedTokenValue.value = null
+    animatedTokenFormat.value = null
+    return
+  }
+
+  const start = animatedTokenValue.value
+  animatedTokenFormat.value = parsed.format
+  if (
+    start === null
+    || window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    || start === parsed.value
+  ) {
+    animatedTokenValue.value = parsed.value
+    return
+  }
+
+  const startedAt = performance.now()
+  const duration = 420
+  const tick = (now: number) => {
+    const progress = Math.min(1, (now - startedAt) / duration)
+    const easedProgress = 1 - (1 - progress) ** 3
+    animatedTokenValue.value = start + (parsed.value - start) * easedProgress
+    if (progress < 1) tokenAnimationFrame = window.requestAnimationFrame(tick)
+    else tokenAnimationFrame = undefined
+  }
+  tokenAnimationFrame = window.requestAnimationFrame(tick)
+}
 
 const activityAnnouncement = computed(() => (
-  state.value.runState === 'working' ? 'Claude 正在处理' : ''
+  workingActivity.value?.label === '正在压缩上下文'
+    ? 'Claude 正在压缩上下文'
+    : state.value.runState === 'working' ? 'Claude 正在处理' : ''
 ))
 
 const canEditInput = computed(() =>
@@ -1005,10 +1346,66 @@ const canSubmit = computed(() => (
   )
 ))
 
-const filteredSlashCommands = computed(() => filterClaudeSlashCommands(prompt.value))
+const filteredSlashCommands = computed(() => {
+  slashCommandCatalogRevision.value
+  return filterClaudeSlashCommands(prompt.value)
+})
 const slashCommandMenuOpen = computed(() => (
-  canEditInput.value && filteredSlashCommands.value.length > 0
+  canEditInput.value
+  && !slashCommandMenuDismissed.value
+  && filteredSlashCommands.value.length > 0
 ))
+const isWorking = computed(() => state.value.runState === 'working')
+const STARTUP_PERMISSION_MODE_LABELS: Record<ClaudeDefaultPermissionMode, string> = {
+  bypassPermissions: '⏵⏵ bypass permissions',
+  auto: '⏵⏵ auto mode',
+  default: '⏸ manual mode',
+  acceptEdits: '⏵⏵ accept edits',
+  plan: '⏸ plan mode',
+}
+const STARTUP_PERMISSION_MODE_CYCLE: ClaudeDefaultPermissionMode[] = [
+  'bypassPermissions',
+  'auto',
+  'default',
+  'acceptEdits',
+  'plan',
+]
+function permissionModeFromLabel(label: string | undefined | null): ClaudeDefaultPermissionMode | null {
+  const normalized = label?.toLowerCase() ?? ''
+  if (normalized.includes('bypass permissions')) return 'bypassPermissions'
+  if (normalized.includes('auto mode')) return 'auto'
+  if (normalized.includes('manual mode') || normalized.includes('default mode')) return 'default'
+  if (normalized.includes('auto-accept edits') || normalized.includes('accept edits')) return 'acceptEdits'
+  if (normalized.includes('plan mode')) return 'plan'
+  return null
+}
+const permissionModeLabel = computed(() => {
+  if (props.startupMode) {
+    return STARTUP_PERMISSION_MODE_LABELS[startupPermissionMode.value] ?? STARTUP_PERMISSION_MODE_LABELS.auto
+  }
+  const observedLabel = state.value.permissionMode?.trim()
+  const observedMode = permissionModeFromLabel(observedLabel)
+  if (state.value.pendingPermissionMode) {
+    return STARTUP_PERMISSION_MODE_LABELS[state.value.pendingPermissionMode]
+  }
+  if (observedMode) return observedLabel!
+  return STARTUP_PERMISSION_MODE_LABELS[props.initialPermissionMode ?? 'auto']
+})
+const permissionModeTone = computed(() => {
+  const mode = permissionModeLabel.value.toLowerCase()
+  if (mode.includes('bypass permissions')) return 'bypass'
+  if (mode.includes('auto mode')) return 'auto'
+  if (mode.includes('accept edits')) return 'accept-edits'
+  if (mode.includes('plan mode')) return 'plan'
+  return 'manual'
+})
+
+function handleSlashCommandMenuOutsidePointerDown(event: PointerEvent) {
+  if (!slashCommandMenuOpen.value) return
+  const target = event.target
+  if (!(target instanceof Node) || slashCommandMenuRef.value?.contains(target)) return
+  slashCommandMenuDismissed.value = true
+}
 
 function showCommandNotice(message: string) {
   commandNotice.value = message
@@ -1027,8 +1424,30 @@ async function selectSlashCommand(command: string) {
   await submit()
 }
 
+function scrollSelectedSlashCommandIntoView() {
+  void nextTick(() => {
+    const selected = slashCommandMenuRef.value
+      ?.querySelector<HTMLElement>('.claude-composer__command-option.is-selected')
+    selected?.scrollIntoView({ block: 'nearest' })
+  })
+}
+
 function handleComposerKeydown(event: KeyboardEvent) {
   if (event.isComposing) return
+
+  if (
+    event.key === 'Tab'
+    && event.shiftKey
+    && !event.altKey
+    && !event.ctrlKey
+    && !event.metaKey
+  ) {
+    event.preventDefault()
+    if (canEditInput.value && (props.startupMode || (props.tabId !== null && props.tabId !== undefined))) {
+      void cyclePermissionMode()
+    }
+    return
+  }
 
   if (
     slashCommandMenuOpen.value
@@ -1042,6 +1461,7 @@ function handleComposerKeydown(event: KeyboardEvent) {
       const count = filteredSlashCommands.value.length
       const step = event.key === 'ArrowUp' ? -1 : 1
       slashCommandIndex.value = (slashCommandIndex.value + step + count) % count
+      scrollSelectedSlashCommandIntoView()
       return
     }
     if (event.key === 'Enter') {
@@ -1247,6 +1667,64 @@ const MESSAGE_COPY_FEEDBACK: CopyFeedbackMessages = {
   failedAnnouncement: '消息复制失败',
 }
 
+async function cyclePermissionMode() {
+  if (!canEditInput.value) return
+  submitError.value = ''
+  try {
+    if (props.startupMode) {
+      const currentIndex = STARTUP_PERMISSION_MODE_CYCLE.indexOf(startupPermissionMode.value)
+      const nextMode = STARTUP_PERMISSION_MODE_CYCLE[
+        (currentIndex + 1) % STARTUP_PERMISSION_MODE_CYCLE.length
+      ] ?? 'auto'
+      startupPermissionModeRevision += 1
+      startupPermissionMode.value = nextMode
+      emit('update:initialPermissionMode', nextMode)
+      startupPermissionModeWrite = startupPermissionModeWrite
+        .catch(() => {})
+        .then(() => observerStore.saveDefaultPermissionMode(nextMode))
+      void startupPermissionModeWrite.catch((error) => {
+        if (!disposed) {
+          submitError.value = error instanceof Error ? error.message : String(error)
+        }
+      })
+      return
+    }
+    if (props.tabId === null || props.tabId === undefined) return
+    const currentMode = state.value.pendingPermissionMode
+      ?? permissionModeFromLabel(state.value.permissionMode)
+      ?? props.initialPermissionMode
+      ?? 'auto'
+    const currentIndex = STARTUP_PERMISSION_MODE_CYCLE.indexOf(currentMode)
+    const nextMode = STARTUP_PERMISSION_MODE_CYCLE[
+      (currentIndex + 1) % STARTUP_PERMISSION_MODE_CYCLE.length
+    ] ?? 'auto'
+    await observerStore.cyclePermissionMode(props.tabId, nextMode)
+  } catch (error) {
+    submitError.value = error instanceof Error ? error.message : String(error)
+  }
+}
+
+async function loadStartupPermissionMode() {
+  if (!props.startupMode) return
+  const revision = startupPermissionModeRevision
+  try {
+    const mode = await observerStore.loadDefaultPermissionMode()
+    // 配置读取可能在用户第一次 Shift + Tab 之后才返回；此时不能覆盖用户的新选择。
+    if (revision === startupPermissionModeRevision) {
+      startupPermissionMode.value = mode
+      emit('update:initialPermissionMode', mode)
+    }
+  } catch (error) {
+    submitError.value = error instanceof Error ? error.message : String(error)
+  }
+}
+
+const ASSISTANT_COPY_FEEDBACK: CopyFeedbackMessages = {
+  defaultLabel: '复制回复',
+  copiedAnnouncement: '回复已复制到剪贴板',
+  failedAnnouncement: '回复复制失败',
+}
+
 function showCopyFeedback(
   button: HTMLButtonElement,
   state: 'copied' | 'failed',
@@ -1313,17 +1791,29 @@ async function handleHistoryClick(event: MouseEvent) {
 }
 
 async function copyUserMessage(text: string, event: MouseEvent) {
+  await copyConversationMessage(text, event, MESSAGE_COPY_FEEDBACK)
+}
+
+async function copyAssistantMessage(text: string, event: MouseEvent) {
+  await copyConversationMessage(text, event, ASSISTANT_COPY_FEEDBACK)
+}
+
+async function copyConversationMessage(
+  text: string,
+  event: MouseEvent,
+  messages: CopyFeedbackMessages,
+) {
   if (!(event.currentTarget instanceof HTMLButtonElement)) return
   const button = event.currentTarget
   button.setAttribute('aria-busy', 'true')
   try {
     await copyTextToClipboard(text)
     if (!disposed && button.isConnected) {
-      showCopyFeedback(button, 'copied', MESSAGE_COPY_FEEDBACK)
+      showCopyFeedback(button, 'copied', messages)
     }
   } catch {
     if (!disposed && button.isConnected) {
-      showCopyFeedback(button, 'failed', MESSAGE_COPY_FEEDBACK)
+      showCopyFeedback(button, 'failed', messages)
     }
   } finally {
     button.removeAttribute('aria-busy')
@@ -1346,8 +1836,45 @@ function isAskUserQuestionItem(item: ClaudeConversationItem) {
   return askUserQuestions(item).length > 0
 }
 
+function activeQuestionIndex(item: ClaudeConversationItem) {
+  const questions = askUserQuestions(item)
+  const requested = questionActiveIndexes.value[item.id] ?? 0
+  return Math.min(Math.max(requested, 0), questions.length)
+}
+
+function activeAskUserQuestions(item: ClaudeConversationItem) {
+  if (item.state !== 'waiting' || questionSubmitted.value[item.id]) return []
+  const questionIndex = activeQuestionIndex(item)
+  const question = askUserQuestions(item)[questionIndex]
+  return question ? [{ question, questionIndex }] : []
+}
+
+function questionStepComplete(item: ClaudeConversationItem, questionIndex: number) {
+  return item.state !== 'waiting'
+    || !!questionSubmitted.value[item.id]
+    || questionIndex < activeQuestionIndex(item)
+}
+
 function questionSelectionKey(item: ClaudeConversationItem, questionIndex: number) {
   return `${item.id}:${questionIndex}`
+}
+
+function questionCustomAnswer(item: ClaudeConversationItem, questionIndex: number) {
+  return questionCustomAnswers.value[questionSelectionKey(item, questionIndex)] ?? ''
+}
+
+function setQuestionCustomAnswer(
+  item: ClaudeConversationItem,
+  questionIndex: number,
+  value: string,
+) {
+  if (!questionCanAnswer(item) || questionIndex !== activeQuestionIndex(item)) return
+  const key = questionSelectionKey(item, questionIndex)
+  questionCustomAnswers.value = { ...questionCustomAnswers.value, [key]: value }
+  if (value.trim()) {
+    questionSelections.value = { ...questionSelections.value, [key]: [] }
+  }
+  questionErrors.value = { ...questionErrors.value, [item.id]: '' }
 }
 
 function selectedQuestionOptions(item: ClaudeConversationItem, questionIndex: number) {
@@ -1378,7 +1905,7 @@ function toggleQuestionOption(
   questionIndex: number,
   optionIndex: number,
 ) {
-  if (!questionCanAnswer(item)) return
+  if (!questionCanAnswer(item) || questionIndex !== activeQuestionIndex(item)) return
   const question = askUserQuestions(item)[questionIndex]
   if (!question) return
   const key = questionSelectionKey(item, questionIndex)
@@ -1389,20 +1916,33 @@ function toggleQuestionOption(
       : [...current, optionIndex].sort((left, right) => left - right)
     : [optionIndex]
   questionSelections.value = { ...questionSelections.value, [key]: next }
+  questionCustomAnswers.value = { ...questionCustomAnswers.value, [key]: '' }
   questionErrors.value = { ...questionErrors.value, [item.id]: '' }
 }
 
 function questionAnswerReady(item: ClaudeConversationItem) {
-  const questions = askUserQuestions(item)
-  return questions.length > 0 && questions.every((_, questionIndex) => (
+  const questionIndex = activeQuestionIndex(item)
+  return !!askUserQuestions(item)[questionIndex] && (
     selectedQuestionOptions(item, questionIndex).length > 0
-  ))
+    || !!questionCustomAnswer(item, questionIndex).trim()
+  )
 }
 
 function questionCardStateLabel(item: ClaudeConversationItem) {
   if (questionSubmitting.value[item.id]) return '正在提交'
-  if (questionSubmitted.value[item.id]) return '已发送'
+  if (questionSubmitted.value[item.id] && item.state === 'waiting') return '等待 Claude'
+  if (item.state !== 'waiting') return toolStateLabel(item.state)
+  const questions = askUserQuestions(item)
+  if (questions.length > 0) {
+    return `第 ${Math.min(activeQuestionIndex(item) + 1, questions.length)} / ${questions.length} 题`
+  }
   return toolStateLabel(item.state)
+}
+
+function questionSubmitLabel(item: ClaudeConversationItem) {
+  if (questionSubmitting.value[item.id]) return '正在提交…'
+  const questions = askUserQuestions(item)
+  return activeQuestionIndex(item) < questions.length - 1 ? '下一题' : '提交回答'
 }
 
 async function submitQuestionAnswers(item: ClaudeConversationItem) {
@@ -1414,14 +1954,25 @@ async function submitQuestionAnswers(item: ClaudeConversationItem) {
   ) return
 
   const questions = askUserQuestions(item)
-  const selections = questions.map((_, questionIndex) => [
-    ...selectedQuestionOptions(item, questionIndex),
-  ])
+  const questionIndex = activeQuestionIndex(item)
+  const question = questions[questionIndex]
+  if (!question) return
+  const answer = {
+    selectedOptions: [...selectedQuestionOptions(item, questionIndex)],
+    customText: questionCustomAnswer(item, questionIndex),
+  }
   questionSubmitting.value = { ...questionSubmitting.value, [item.id]: true }
   questionErrors.value = { ...questionErrors.value, [item.id]: '' }
   try {
-    await observerStore.respondToAskUserQuestion(props.tabId, questions, selections)
-    questionSubmitted.value = { ...questionSubmitted.value, [item.id]: true }
+    await observerStore.respondToAskUserQuestion(props.tabId, question, answer)
+    const nextQuestionIndex = questionIndex + 1
+    questionActiveIndexes.value = {
+      ...questionActiveIndexes.value,
+      [item.id]: nextQuestionIndex,
+    }
+    if (nextQuestionIndex >= questions.length) {
+      questionSubmitted.value = { ...questionSubmitted.value, [item.id]: true }
+    }
   } catch (error) {
     questionErrors.value = {
       ...questionErrors.value,
@@ -1498,6 +2049,20 @@ function handleHistoryScroll() {
   followLatest.value = element.scrollHeight - element.scrollTop - element.clientHeight < 80
 }
 
+function isFinalAssistantMessage(item: ClaudeConversationItem) {
+  const itemIndex = state.value.items.findIndex(candidate => candidate.id === item.id)
+  if (itemIndex < 0) return false
+  for (const laterItem of state.value.items.slice(itemIndex + 1)) {
+    if (laterItem.kind === 'user') return true
+    if (laterItem.kind === 'assistant') return false
+  }
+  return true
+}
+
+function refreshSlashCommandsOnWindowFocus() {
+  void refreshClaudeSlashCommands()
+}
+
 async function scrollToLatest() {
   await nextTick()
   const element = historyRef.value
@@ -1568,6 +2133,8 @@ async function submit() {
     if (!submitStartupPrompt) return
     submitError.value = ''
     try {
+      // 确保新会话读取到刚通过 Shift + Tab 选定的默认权限模式。
+      await startupPermissionModeWrite
       await submitStartupPrompt(submitted)
       attachments.value = []
     } catch (error) {
@@ -1611,6 +2178,26 @@ async function submit() {
       }
     }
     submitError.value = String(error)
+  }
+}
+
+async function stopRun() {
+  if (stopPending.value || !isWorking.value || props.tabId === null || props.tabId === undefined) return
+
+  stopPending.value = true
+  submitError.value = ''
+  try {
+    const restoredPrompt = await observerStore.interruptRun(props.tabId)
+    if (restoredPrompt !== undefined) {
+      prompt.value = restoredPrompt + prompt.value
+      await nextTick()
+      resizeComposerToContent()
+      inputRef.value?.focus({ preventScroll: true })
+    }
+  } catch (error) {
+    submitError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    stopPending.value = false
   }
 }
 
@@ -1850,6 +2437,29 @@ watch(() => !!workingActivity.value, () => {
   if (scrollInitialized && followLatest.value) void scrollToLatest()
 })
 
+watch(() => state.value.runState, (nextState, previousState) => {
+  if (
+    (previousState === 'working' || previousState === 'permission')
+    && nextState !== 'working'
+    && nextState !== 'permission'
+  ) {
+    expandedProcessGroupIds.value = new Set()
+  }
+})
+
+watch(activityTokenCount, (tokenCount) => {
+  if (tokenCount) animateTokenCount(tokenCount)
+  else {
+    stopTokenAnimation()
+    animatedTokenValue.value = null
+    animatedTokenFormat.value = null
+  }
+}, { immediate: true })
+
+watch(() => state.value.compactCompletionRevision, (revision, previousRevision) => {
+  if (revision > previousRevision) showCommandNotice('已完成上下文压缩')
+})
+
 watch(() => state.value.queuedPrompts.length, () => {
   if (scrollInitialized && followLatest.value) void scrollToLatest()
 })
@@ -1868,6 +2478,7 @@ watch(() => props.sessionAttachmentPaths, (paths) => {
 })
 
 watch(prompt, (draft) => {
+  slashCommandMenuDismissed.value = false
   if (draft !== (props.sessionDraft ?? '')) emit('update:sessionDraft', draft)
   void nextTick(resizeComposerToContent)
 })
@@ -1953,6 +2564,7 @@ watch(() => [props.tabId, props.sessionId, props.startupMode] as const, ([tabId,
   if (startupMode) {
     scrollInitialized = true
     submitError.value = ''
+    void loadStartupPermissionMode()
     void nextTick(() => inputRef.value?.focus())
     return
   }
@@ -1966,11 +2578,18 @@ watch(() => [props.tabId, props.sessionId, props.startupMode] as const, ([tabId,
   void initializeHistory(tabId, sessionId)
 })
 
+watch(projectPath, () => {
+  void refreshClaudeSlashCommands()
+}, { immediate: true })
+
 onMounted(() => {
   document.addEventListener('pointerdown', handleModelPickerOutsidePointerDown)
+  document.addEventListener('pointerdown', handleSlashCommandMenuOutsidePointerDown)
   document.addEventListener('keydown', handleGlobalModelSwitchKeydown, true)
+  window.addEventListener('focus', refreshSlashCommandsOnWindowFocus)
   if (props.startupMode) {
     scrollInitialized = true
+    void loadStartupPermissionMode()
     void nextTick(() => inputRef.value?.focus())
   } else if (props.tabId !== null && props.tabId !== undefined) {
     void initializeHistory(props.tabId, props.sessionId)
@@ -1983,10 +2602,13 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', handleModelPickerOutsidePointerDown)
+  document.removeEventListener('pointerdown', handleSlashCommandMenuOutsidePointerDown)
   document.removeEventListener('keydown', handleGlobalModelSwitchKeydown, true)
+  window.removeEventListener('focus', refreshSlashCommandsOnWindowFocus)
   if (!props.startupMode) saveCurrentScroll(props.sessionId)
   disposed = true
   if (copyAnnouncementTimer !== undefined) window.clearTimeout(copyAnnouncementTimer)
+  stopTokenAnimation()
   if (commandNoticeTimer !== undefined) window.clearTimeout(commandNoticeTimer)
   for (const timer of copyFeedbackTimerIds) window.clearTimeout(timer)
   copyFeedbackTimerIds.clear()
@@ -2094,18 +2716,6 @@ defineExpose({ appendDroppedFiles })
   --claude-queue-hover-bg: #252b32;
 }
 
-.claude-conversation__status {
-  min-height: 36px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 170px 0 18px;
-  border-bottom: 1px solid var(--claude-border-color);
-  color: var(--text-secondary);
-  font-size: var(--claude-meta-font-size);
-}
-
-.claude-conversation__status-dot,
 .tool-card__state {
   width: 8px;
   height: 8px;
@@ -2114,21 +2724,10 @@ defineExpose({ appendDroppedFiles })
   flex: 0 0 auto;
 }
 
-.claude-conversation__status.is-idle .claude-conversation__status-dot,
 .tool-card__state.is-success { background: #3fb950; }
-.claude-conversation__status.is-working .claude-conversation__status-dot,
 .tool-card__state.is-running { background: #d29922; }
-.claude-conversation__status.is-permission .claude-conversation__status-dot,
 .tool-card__state.is-waiting { background: #58a6ff; }
 .tool-card__state.is-failed { background: #f85149; }
-
-.claude-conversation__warning {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: #d29922;
-}
-
 .claude-conversation__copy-status,
 .claude-conversation__activity-status {
   position: absolute;
@@ -2286,6 +2885,7 @@ defineExpose({ appendDroppedFiles })
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   padding: 24px clamp(18px, 6vw, 84px);
   scroll-behavior: auto;
 }
@@ -2318,12 +2918,53 @@ defineExpose({ appendDroppedFiles })
   margin: 0 auto var(--claude-item-gap);
 }
 
+.conversation-process__summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 0;
+  border: 0;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--claude-meta-font-size);
+  line-height: 1.5;
+}
+
+.conversation-process__summary:hover {
+  color: var(--text-primary);
+}
+
+.conversation-process__summary:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
+}
+
+.conversation-process__chevron {
+  display: inline-block;
+  font-size: 15px;
+  line-height: 1;
+  transition: transform 140ms ease;
+}
+
+.conversation-process__summary[aria-expanded="true"] .conversation-process__chevron {
+  transform: rotate(90deg);
+}
+
+.conversation-process__divider {
+  height: 1px;
+  margin: 6px 0 12px;
+  background: var(--claude-border-color);
+}
+
 .conversation-item {
   width: 100%;
 }
 
 .conversation-item--user {
-  width: 70%;
+  width: fit-content;
+  max-width: 70%;
   margin-left: auto;
   padding: var(--claude-block-padding) 16px;
   border: 1px solid var(--claude-field-border);
@@ -2332,7 +2973,8 @@ defineExpose({ appendDroppedFiles })
 }
 
 .user-message-actions {
-  width: 70%;
+  width: fit-content;
+  max-width: 70%;
   min-height: 24px;
   margin: 5px 0 0 auto;
   display: flex;
@@ -2416,7 +3058,8 @@ defineExpose({ appendDroppedFiles })
 }
 
 @media (hover: none) {
-  .user-message-actions {
+  .user-message-actions,
+  .assistant-message-actions {
     opacity: 1;
     pointer-events: auto;
   }
@@ -2426,18 +3069,84 @@ defineExpose({ appendDroppedFiles })
   padding: 0;
 }
 
-.conversation-item__header {
+.assistant-message-actions {
+  min-height: 20px;
+  margin-top: 5px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
+  gap: 8px;
   color: var(--text-secondary);
   font-size: var(--claude-meta-font-size);
-  line-height: 1.5;
-  font-weight: 600;
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
 }
 
-.conversation-item__header time { font-weight: 400; }
+.conversation-row--assistant:hover .assistant-message-actions,
+.conversation-row--assistant:focus-within .assistant-message-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.assistant-message-actions__copy {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+}
+
+.assistant-message-actions__copy:hover {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--claude-field-bg) 82%, var(--primary) 18%);
+}
+
+.assistant-message-actions__copy:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+
+.assistant-message-actions__copy svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.assistant-message-actions__check-icon,
+.assistant-message-actions__error-icon {
+  display: none;
+}
+
+.assistant-message-actions__copy.is-copied {
+  color: var(--success);
+}
+
+.assistant-message-actions__copy.is-copied .assistant-message-actions__copy-icon {
+  display: none;
+}
+
+.assistant-message-actions__copy.is-copied .assistant-message-actions__check-icon,
+.assistant-message-actions__copy.is-failed .assistant-message-actions__error-icon {
+  display: block;
+}
+
+.assistant-message-actions__copy.is-failed {
+  color: var(--danger);
+}
+
+.assistant-message-actions__copy.is-failed .assistant-message-actions__copy-icon {
+  display: none;
+}
 
 .conversation-item__markdown {
   font-size: var(--claude-content-font-size);
@@ -2686,6 +3395,38 @@ defineExpose({ appendDroppedFiles })
   font-size: var(--claude-meta-font-size);
 }
 
+.question-card__steps {
+  display: flex;
+  gap: 7px;
+  margin-top: 12px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.question-card__step {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 5px;
+  align-items: center;
+  padding: 4px 8px;
+  border: 1px solid var(--claude-field-border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: var(--claude-meta-font-size);
+  white-space: nowrap;
+}
+
+.question-card__step.is-active {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+}
+
+.question-card__step.is-complete {
+  border-color: color-mix(in srgb, var(--success, #3fb950) 45%, var(--claude-field-border));
+  color: var(--success, #3fb950);
+}
+
 .question-card__question {
   margin-top: 16px;
 }
@@ -2769,6 +3510,44 @@ defineExpose({ appendDroppedFiles })
   color: var(--text-secondary);
   font-size: var(--claude-meta-font-size);
   line-height: 1.45;
+}
+
+.question-card__custom-answer {
+  display: grid;
+  gap: 6px;
+  margin-top: 9px;
+  color: var(--text-secondary);
+  font-size: var(--claude-meta-font-size);
+}
+
+.question-card__custom-answer textarea {
+  width: 100%;
+  min-height: 56px;
+  padding: 8px 10px;
+  resize: vertical;
+  border: 1px solid var(--claude-field-border);
+  border-radius: 8px;
+  color: var(--text-primary);
+  background: var(--claude-field-bg);
+  font: inherit;
+  line-height: 1.45;
+}
+
+.question-card__custom-answer textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 22%, transparent);
+}
+
+.question-card__custom-answer textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+
+.question-card__complete-summary {
+  margin-top: 16px;
+  color: var(--text-secondary);
+  font-size: var(--claude-content-font-size);
 }
 
 .question-card__footer {
@@ -2934,6 +3713,11 @@ defineExpose({ appendDroppedFiles })
   overflow: hidden;
   color: var(--text-secondary);
   text-overflow: ellipsis;
+}
+
+.claude-activity__token-count {
+  display: inline-block;
+  font-variant-numeric: tabular-nums;
 }
 
 .claude-prompt-queue {
@@ -3235,6 +4019,43 @@ defineExpose({ appendDroppedFiles })
 .claude-composer__actions-spacer {
   flex: 1;
 }
+
+.claude-composer__permission-mode {
+  display: inline-flex;
+  min-width: 0;
+  max-width: min(150px, 25vw);
+  height: 32px;
+  align-items: center;
+  margin-left: 8px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--claude-composer-border) 72%, transparent);
+  border-radius: 8px;
+  color: #747b84;
+  background: color-mix(in srgb, var(--claude-field-bg) 64%, transparent);
+  font-size: var(--claude-meta-font-size);
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.claude-composer__permission-mode.is-bypass {
+  max-width: min(178px, 32vw);
+  padding-right: 14px;
+  color: #c51d71;
+}
+
+.claude-composer__permission-mode.is-auto { color: #a57500; }
+.claude-composer__permission-mode.is-manual { color: #747b84; }
+.claude-composer__permission-mode.is-accept-edits { color: #8250b8; }
+.claude-composer__permission-mode.is-plan { color: #087f83; }
+
+[data-theme="dark"] .claude-composer__permission-mode.is-bypass { color: #ff73ad; }
+[data-theme="dark"] .claude-composer__permission-mode.is-auto { color: #f0c85a; }
+[data-theme="dark"] .claude-composer__permission-mode.is-manual { color: #aab1ba; }
+[data-theme="dark"] .claude-composer__permission-mode.is-accept-edits { color: #c792ea; }
+[data-theme="dark"] .claude-composer__permission-mode.is-plan { color: #55d3ca; }
 
 .claude-composer__model-picker-shell {
   position: relative;
@@ -3614,6 +4435,11 @@ defineExpose({ appendDroppedFiles })
 
 .claude-composer__send.is-ready:active {
   transform: translateY(0);
+}
+
+.claude-composer__send.is-stop.is-pending {
+  cursor: wait;
+  opacity: 0.82;
 }
 
 .claude-composer__send:focus-visible {

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  encodeClaudeQuestionAnswerWrites,
   encodeClaudeQuestionResponseWrites,
   parseClaudeAskUserQuestions,
 } from '../src/utils/claudeQuestion.ts'
@@ -38,7 +39,9 @@ test('single-select answers move from the default option and submit with Enter',
     }],
   })!
 
-  assert.deepEqual(encodeClaudeQuestionResponseWrites(questions, [[2]]), [
+  assert.deepEqual(encodeClaudeQuestionResponseWrites(questions, [{
+    selectedOptions: [2],
+  }]), [
     '\x1b[B\x1b[B\r',
   ])
 })
@@ -52,9 +55,44 @@ test('multi-select answers toggle each option before submitting', () => {
     }],
   })!
 
-  assert.deepEqual(encodeClaudeQuestionResponseWrites(questions, [[0, 2]]), [
+  assert.deepEqual(encodeClaudeQuestionResponseWrites(questions, [{
+    selectedOptions: [0, 2],
+  }]), [
     ' \x1b[B\x1b[B \r',
   ])
+})
+
+test('custom answers select Type something before writing text', () => {
+  const question = parseClaudeAskUserQuestions('AskUserQuestion', {
+    questions: [{
+      question: 'Choose one',
+      options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }],
+    }],
+  })![0]
+
+  assert.deepEqual(encodeClaudeQuestionAnswerWrites(question, {
+    selectedOptions: [],
+    customText: 'A different answer',
+  }), [
+    '\x1b[B\x1b[B\x1b[B\r',
+    'A different answer\r',
+  ])
+})
+
+test('each question can be encoded independently for sequential submission', () => {
+  const questions = parseClaudeAskUserQuestions('AskUserQuestion', {
+    questions: [
+      { question: 'First?', options: [{ label: 'A' }, { label: 'B' }] },
+      { question: 'Second?', options: [{ label: 'C' }, { label: 'D' }] },
+    ],
+  })!
+
+  assert.deepEqual(encodeClaudeQuestionAnswerWrites(questions[0], {
+    selectedOptions: [1],
+  }), ['\x1b[B\r'])
+  assert.deepEqual(encodeClaudeQuestionAnswerWrites(questions[1], {
+    selectedOptions: [0],
+  }), ['\r'])
 })
 
 test('malformed or unrelated tool input is not rendered as a question', () => {
@@ -65,8 +103,8 @@ test('malformed or unrelated tool input is not rendered as a question', () => {
       parseClaudeAskUserQuestions('AskUserQuestion', {
         questions: [{ question: 'Choose', options: [{ label: 'A' }] }],
       })!,
-      [[]],
+      [{ selectedOptions: [] }],
     ),
-    [],
+    null,
   )
 })

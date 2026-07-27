@@ -1,5 +1,5 @@
 <template>
-  <div class="project-panel">
+  <div ref="panelRef" class="project-panel">
     <Transition name="top-pane">
       <div
         v-if="store.sidebarOpen && store.sidebarPlacement === 'top'"
@@ -28,14 +28,21 @@
           />
           <div
             class="project-panel__divider"
-            :class="{ 'project-panel__divider--dragging': leftDivider.isDragging.value }"
-            @mousedown="leftDivider.start"
+            :class="{ 'project-panel__divider--dragging': sharedLeftSidebarDragging }"
+            @mousedown="startSharedLeftSidebarResize"
           />
         </div>
       </Transition>
 
       <section class="project-panel__main">
-        <ModuleToolbar />
+        <ModuleToolbar
+          :show-claude-controls="showClaudeToolbarControls"
+          :claude-view="activeClaudeView"
+          :claude-status="claudeStatusLabel"
+          :claude-status-state="claudeStatusState"
+          :claude-status-detail="claudeStatusDetail"
+          @select-claude-view="selectClaudeView"
+        />
         <div ref="contentRef" class="project-panel__content">
         <div v-if="sidebarDropHint === 'right'" class="project-panel__drop-hint">
           <span>松开以在侧边栏打开</span>
@@ -43,7 +50,10 @@
         <div v-if="sidebarDropHint === 'top'" class="project-panel__drop-hint project-panel__drop-hint--top">
           <span>松开以在上侧边栏打开</span>
         </div>
-          <ProjectTerminalArea />
+          <ProjectTerminalArea
+            :claude-view="activeClaudeView"
+            @select-claude-view="selectClaudeView"
+          />
           <Transition name="right-pane">
             <div
               v-if="store.sidebarOpen && store.sidebarPlacement === 'right'"
@@ -84,10 +94,12 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useProjectStore } from '@/stores/project'
+import { useClaudeObserverStore } from '@/stores/claudeObserver'
 import { useResizableDivider } from '@/composables/useResizableDivider'
+import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
 import { useTauriDrop } from '@/composables/useTauriDrop'
 import { isInSidebarDropZone, isInTopSidebarDropZone } from '@/composables/useSidebarDropZone'
 import ProjectSidebar from './ProjectSidebar.vue'
@@ -98,55 +110,114 @@ import BottomSidebar from './BottomSidebar.vue'
 import type { CliKind } from '@/types/cli'
 
 const store = useProjectStore()
+const claudeObserverStore = useClaudeObserverStore()
 const props = defineProps<{
   cliKind: CliKind
 }>()
 const emit = defineEmits<{
   (event: 'open-settings'): void
+  (event: 'left-width-change', width: number): void
 }>()
 
-const LEFT_KEY = 'project-left-sidebar'
 const RIGHT_KEY = 'project-right-sidebar'
+const RIGHT_RATIO_KEY = 'project-right-sidebar-ratio'
 const TOP_KEY = 'project-top-sidebar'
+const TOP_RATIO_KEY = 'project-top-sidebar-ratio'
 const BOTTOM_KEY = 'project-bottom-sidebar'
+const BOTTOM_RATIO_KEY = 'project-bottom-sidebar-ratio'
 
-const MIN_LEFT = 160
 const MIN_RIGHT = 200
+const MIN_MAIN_CONTENT = 400
 const MIN_TOP = 160
 const MIN_BOTTOM = 160
+const contentRef = ref<HTMLElement | null>(null)
+const panelRef = ref<HTMLElement | null>(null)
 
-function clampLeft(value: number) {
-  const max = Math.max(MIN_LEFT, window.innerWidth - 400)
-  return Math.max(MIN_LEFT, Math.min(max, value))
+type ClaudeView = 'conversation' | 'terminal' | 'log'
+
+const claudeViews = ref<Record<number, ClaudeView>>({})
+const activeTerminalId = computed(() => {
+  const sessionId = store.activeSessionId
+  return sessionId ? store.sessionTerminalIds[sessionId] : undefined
+})
+const showClaudeToolbarControls = computed(() => (
+  !!activeTerminalId.value && store.activeSession?.cliKind === 'claude'
+))
+const activeClaudeView = computed<ClaudeView>(() => {
+  const tabId = activeTerminalId.value
+  return tabId ? (claudeViews.value[tabId] ?? 'conversation') : 'conversation'
+})
+const activeClaudeState = computed(() => {
+  const tabId = activeTerminalId.value
+  return tabId ? claudeObserverStore.states[tabId] : undefined
+})
+const claudeStatusState = computed(() => activeClaudeState.value?.runState ?? 'starting')
+const claudeStatusDetail = computed(() => activeClaudeState.value?.degradedReason ?? '')
+const claudeStatusLabel = computed(() => {
+  switch (claudeStatusState.value) {
+    case 'idle': return '等待输入'
+    case 'working': return 'Claude 正在处理'
+    case 'permission': return '等待终端确认'
+    case 'stopped': return '会话已结束'
+    default: return '正在连接 Claude'
+  }
+})
+
+async function selectClaudeView(view: ClaudeView) {
+  const tabId = activeTerminalId.value
+  if (!tabId || view === activeClaudeView.value) return
+  const previousView = activeClaudeView.value
+
+  if (view === 'terminal') {
+    try {
+      await claudeObserverStore.pausePromptQueueForRawTerminal(tabId)
+    } catch (error) {
+      store.statusMessage = `切换终端前无法安全暂停等待队列：${String(error)}`
+    }
+  }
+
+  claudeViews.value[tabId] = view
+  if (previousView === 'terminal' && view !== 'terminal') {
+    claudeObserverStore.resumePromptQueueFromRawTerminal(tabId)
+  }
+}
+
+function availableRightSidebarWidth() {
+  return contentRef.value?.clientWidth || window.innerWidth
+}
+
+function availableVerticalSidebarHeight() {
+  return panelRef.value?.clientHeight || window.innerHeight
 }
 
 function clampRight(value: number) {
-  const max = Math.max(MIN_RIGHT, window.innerWidth - 400)
+  const max = Math.max(MIN_RIGHT, availableRightSidebarWidth() - MIN_MAIN_CONTENT)
   return Math.max(MIN_RIGHT, Math.min(max, value))
 }
 
 function clampTop(value: number) {
-  const max = Math.max(MIN_TOP, window.innerHeight - 320)
+  const max = Math.max(MIN_TOP, availableVerticalSidebarHeight() - 320)
   return Math.max(MIN_TOP, Math.min(max, value))
 }
 
 function clampBottom(value: number) {
-  const max = Math.max(MIN_BOTTOM, window.innerHeight - 320)
+  const max = Math.max(MIN_BOTTOM, availableVerticalSidebarHeight() - 320)
   return Math.max(MIN_BOTTOM, Math.min(max, value))
 }
 
-const leftDivider = useResizableDivider(210, {
-  min: MIN_LEFT,
-  onChange: (value) => {
-    leftWidth.value = clampLeft(value)
-  },
-})
+const {
+  leftWidth: sharedLeftSidebarWidth,
+  isDragging: sharedLeftSidebarDragging,
+  onMouseDown: startSharedLeftSidebarResize,
+  loadWidth: loadSharedLeftSidebarWidth,
+} = useSharedLeftSidebarWidth()
 
 const rightDivider = useResizableDivider(320, {
   min: MIN_RIGHT,
   invert: true,
   onChange: (value) => {
     rightWidth.value = clampRight(value)
+    rightWidthRatio.value = rightWidth.value / availableRightSidebarWidth()
   },
 })
 
@@ -155,6 +226,7 @@ const topDivider = useResizableDivider(240, {
   axis: 'y',
   onChange: (value) => {
     topHeight.value = clampTop(value)
+    topHeightRatio.value = topHeight.value / availableVerticalSidebarHeight()
   },
 })
 
@@ -164,19 +236,42 @@ const bottomDivider = useResizableDivider(240, {
   invert: true,
   onChange: (value) => {
     bottomHeight.value = clampBottom(value)
+    bottomHeightRatio.value = bottomHeight.value / availableVerticalSidebarHeight()
   },
 })
 
-const leftWidth = leftDivider.value
+const leftWidth = sharedLeftSidebarWidth
 const rightWidth = rightDivider.value
+const rightWidthRatio = ref(rightWidth.value / availableRightSidebarWidth())
 const topHeight = topDivider.value
+const topHeightRatio = ref(topHeight.value / availableVerticalSidebarHeight())
 const bottomHeight = bottomDivider.value
+const bottomHeightRatio = ref(bottomHeight.value / availableVerticalSidebarHeight())
+
+watch(leftWidth, (width) => {
+  emit('left-width-change', width)
+}, { immediate: true })
 
 // Right-edge drop zone: while the sidebar is closed, dropping a file on the
 // right 20% of the content area opens the sidebar with that file.
 // Top-edge drop zone: dropping on the top 20% opens the top sidebar instead.
-const contentRef = ref<HTMLElement | null>(null)
 const sidebarDropHint = ref<'right' | 'top' | null>(null)
+let rightSidebarResizeObserver: ResizeObserver | undefined
+let verticalSidebarResizeObserver: ResizeObserver | undefined
+
+function scaleRightSidebar() {
+  rightWidth.value = clampRight(availableRightSidebarWidth() * rightWidthRatio.value)
+}
+
+function scaleVerticalSidebars() {
+  topHeight.value = clampTop(availableVerticalSidebarHeight() * topHeightRatio.value)
+  bottomHeight.value = clampBottom(availableVerticalSidebarHeight() * bottomHeightRatio.value)
+}
+
+function scaleSidebars() {
+  scaleRightSidebar()
+  scaleVerticalSidebars()
+}
 
 useTauriDrop((paths, position) => {
   sidebarDropHint.value = null
@@ -205,18 +300,21 @@ useTauriDrop((paths, position) => {
 })
 
 async function loadWidths() {
+  await loadSharedLeftSidebarWidth()
   try {
-    const savedLeft = await invoke<number | null>('load_pane_width', { key: LEFT_KEY })
-    if (savedLeft !== null && savedLeft !== undefined) {
-      leftWidth.value = clampLeft(savedLeft)
+    const savedRight = await invoke<number | null>('load_pane_width', { key: RIGHT_KEY })
+    if (savedRight !== null && savedRight !== undefined) {
+      rightWidth.value = clampRight(savedRight)
+      rightWidthRatio.value = rightWidth.value / availableRightSidebarWidth()
     }
   } catch {
     // use default
   }
   try {
-    const savedRight = await invoke<number | null>('load_pane_width', { key: RIGHT_KEY })
-    if (savedRight !== null && savedRight !== undefined) {
-      rightWidth.value = clampRight(savedRight)
+    const savedRatio = await invoke<number | null>('load_pane_width', { key: RIGHT_RATIO_KEY })
+    if (savedRatio !== null && savedRatio !== undefined && Number.isFinite(savedRatio) && savedRatio > 0) {
+      rightWidthRatio.value = savedRatio
+      scaleRightSidebar()
     }
   } catch {
     // use default
@@ -225,6 +323,16 @@ async function loadWidths() {
     const savedTop = await invoke<number | null>('load_pane_width', { key: TOP_KEY })
     if (savedTop !== null && savedTop !== undefined) {
       topHeight.value = clampTop(savedTop)
+      topHeightRatio.value = topHeight.value / availableVerticalSidebarHeight()
+    }
+  } catch {
+    // use default
+  }
+  try {
+    const savedTopRatio = await invoke<number | null>('load_pane_width', { key: TOP_RATIO_KEY })
+    if (savedTopRatio !== null && savedTopRatio !== undefined && Number.isFinite(savedTopRatio) && savedTopRatio > 0) {
+      topHeightRatio.value = savedTopRatio
+      topHeight.value = clampTop(availableVerticalSidebarHeight() * topHeightRatio.value)
     }
   } catch {
     // use default
@@ -233,6 +341,16 @@ async function loadWidths() {
     const savedBottom = await invoke<number | null>('load_pane_width', { key: BOTTOM_KEY })
     if (savedBottom !== null && savedBottom !== undefined) {
       bottomHeight.value = clampBottom(savedBottom)
+      bottomHeightRatio.value = bottomHeight.value / availableVerticalSidebarHeight()
+    }
+  } catch {
+    // use default
+  }
+  try {
+    const savedBottomRatio = await invoke<number | null>('load_pane_width', { key: BOTTOM_RATIO_KEY })
+    if (savedBottomRatio !== null && savedBottomRatio !== undefined && Number.isFinite(savedBottomRatio) && savedBottomRatio > 0) {
+      bottomHeightRatio.value = savedBottomRatio
+      bottomHeight.value = clampBottom(availableVerticalSidebarHeight() * bottomHeightRatio.value)
     }
   } catch {
     // use default
@@ -247,24 +365,46 @@ async function saveWidth(key: string, value: number) {
   }
 }
 
-watch(leftDivider.isDragging, async (dragging) => {
-  if (!dragging) await saveWidth(LEFT_KEY, leftWidth.value)
-})
-
 watch(rightDivider.isDragging, async (dragging) => {
-  if (!dragging) await saveWidth(RIGHT_KEY, rightWidth.value)
+  if (!dragging) {
+    await Promise.all([
+      saveWidth(RIGHT_KEY, rightWidth.value),
+      saveWidth(RIGHT_RATIO_KEY, rightWidthRatio.value),
+    ])
+  }
 })
 
 watch(topDivider.isDragging, async (dragging) => {
-  if (!dragging) await saveWidth(TOP_KEY, topHeight.value)
+  if (!dragging) {
+    await Promise.all([
+      saveWidth(TOP_KEY, topHeight.value),
+      saveWidth(TOP_RATIO_KEY, topHeightRatio.value),
+    ])
+  }
 })
 
 watch(bottomDivider.isDragging, async (dragging) => {
-  if (!dragging) await saveWidth(BOTTOM_KEY, bottomHeight.value)
+  if (!dragging) {
+    await Promise.all([
+      saveWidth(BOTTOM_KEY, bottomHeight.value),
+      saveWidth(BOTTOM_RATIO_KEY, bottomHeightRatio.value),
+    ])
+  }
 })
 
 onMounted(async () => {
   await loadWidths()
+  window.addEventListener('resize', scaleSidebars)
+  rightSidebarResizeObserver = new ResizeObserver(scaleRightSidebar)
+  if (contentRef.value) rightSidebarResizeObserver.observe(contentRef.value)
+  verticalSidebarResizeObserver = new ResizeObserver(scaleVerticalSidebars)
+  if (panelRef.value) verticalSidebarResizeObserver.observe(panelRef.value)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', scaleSidebars)
+  rightSidebarResizeObserver?.disconnect()
+  verticalSidebarResizeObserver?.disconnect()
 })
 
 watch(() => props.cliKind, (kind) => {

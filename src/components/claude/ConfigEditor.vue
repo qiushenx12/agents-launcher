@@ -110,6 +110,30 @@
       />
     </div>
 
+    <div class="field-row">
+      <span class="field-label">会话权限</span>
+      <label class="check-label">
+        <input
+          v-model="store.skipPermissions"
+          type="checkbox"
+          @change="store.saveSettings()"
+        />
+        Bypass permissions（跳过权限检查）
+      </label>
+    </div>
+
+    <div class="field-row">
+      <span class="field-label">会话摘要</span>
+      <label class="check-label">
+        <input
+          v-model="store.awaySummaryDisabled"
+          type="checkbox"
+          @change="store.saveSettings()"
+        />
+        关闭 away summary
+      </label>
+    </div>
+
     <hr class="separator" style="margin: 12px 0 10px;" />
 
     <!-- Scope radio: Windows only -->
@@ -278,6 +302,15 @@ async function openClaudePath() {
   align-items: center;
   gap: 5px;
   font-size: var(--font-size-base);
+  color: var(--text-primary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.check-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   color: var(--text-primary);
   cursor: pointer;
   user-select: none;

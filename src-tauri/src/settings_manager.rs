@@ -19,6 +19,19 @@ use serde_json::{Map, Value};
 
 use crate::file_transaction::{restore_json_backup_if_missing, write_json_atomic};
 
+const DEFAULT_PERMISSION_MODE: &str = "auto";
+
+fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
+    match mode.trim() {
+        "bypassPermissions" => Some("bypassPermissions"),
+        "auto" => Some("auto"),
+        "default" | "manual" => Some("default"),
+        "acceptEdits" => Some("acceptEdits"),
+        "plan" => Some("plan"),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Path helper
 // ---------------------------------------------------------------------------
@@ -210,6 +223,62 @@ fn save_claude_settings_to(paths: &SettingsPaths, settings: &ClaudeSettings) -> 
     )
 }
 
+/// Read the permission mode used before a Claude session is started.
+/// Missing or unsupported values follow Claude Code's auto mode default.
+#[tauri::command]
+pub fn load_claude_default_permission_mode() -> Result<String, String> {
+    load_claude_default_permission_mode_from(&settings_paths()?)
+}
+
+fn load_claude_default_permission_mode_from(paths: &SettingsPaths) -> Result<String, String> {
+    restore_json_backup_if_missing(&paths.canonical, "Claude Code settings.json")?;
+    let Some((source_path, _)) = existing_settings_source(paths) else {
+        return Ok(DEFAULT_PERMISSION_MODE.to_string());
+    };
+    let settings = read_settings_object(&source_path)?;
+    Ok(settings
+        .get("permissions")
+        .and_then(|permissions| permissions.get("defaultMode"))
+        .and_then(Value::as_str)
+        .and_then(normalize_permission_mode)
+        .unwrap_or(DEFAULT_PERMISSION_MODE)
+        .to_string())
+}
+
+/// Persist the pre-session Shift+Tab selection without changing unrelated settings.
+#[tauri::command]
+pub fn save_claude_default_permission_mode(mode: String) -> Result<(), String> {
+    save_claude_default_permission_mode_to(&settings_paths()?, &mode)
+}
+
+fn save_claude_default_permission_mode_to(paths: &SettingsPaths, mode: &str) -> Result<(), String> {
+    let mode = normalize_permission_mode(mode)
+        .ok_or_else(|| format!("Unsupported Claude permission mode: {mode}"))?;
+    restore_json_backup_if_missing(&paths.canonical, "Claude Code settings.json")?;
+    let mut settings = match existing_settings_source(paths) {
+        Some((source_path, _)) => read_settings_object(&source_path)?,
+        None => Map::new(),
+    };
+    let permissions = settings
+        .entry("permissions")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "permissions field is not an object".to_string())?;
+    permissions.insert("defaultMode".to_string(), Value::String(mode.to_string()));
+
+    if let Some(parent) = paths.canonical.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create .claude directory: {error}"))?;
+    }
+    let json = serde_json::to_string_pretty(&Value::Object(settings))
+        .map_err(|error| format!("Failed to serialise settings: {error}"))?;
+    write_json_atomic(
+        &paths.canonical,
+        json.as_bytes(),
+        "Claude Code settings.json",
+    )
+}
+
 /// 读取 settings.json 中的 env 字段（忽略空值）。
 #[tauri::command]
 pub fn load_claude_env() -> Result<HashMap<String, String>, String> {
@@ -331,6 +400,35 @@ mod tests {
             paths.legacy[0].exists(),
             "legacy file must not be modified or removed"
         );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn default_permission_mode_uses_auto_and_preserves_unrelated_settings() {
+        let (directory, paths) = temp_paths();
+        fs::create_dir_all(&directory).expect("create temp directory");
+        assert_eq!(
+            load_claude_default_permission_mode_from(&paths).expect("load missing settings"),
+            "auto"
+        );
+
+        fs::write(
+            &paths.canonical,
+            br#"{"futureSetting":{"keep":true},"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .expect("write settings");
+        assert_eq!(
+            load_claude_default_permission_mode_from(&paths).expect("load configured mode"),
+            "bypassPermissions"
+        );
+
+        save_claude_default_permission_mode_to(&paths, "plan").expect("save plan mode");
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(&paths.canonical).expect("read settings"),
+        )
+        .expect("parse settings");
+        assert_eq!(saved["permissions"]["defaultMode"], "plan");
+        assert_eq!(saved["futureSetting"]["keep"], Value::Bool(true));
         let _ = fs::remove_dir_all(directory);
     }
 }

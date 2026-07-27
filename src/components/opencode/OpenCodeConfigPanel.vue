@@ -1,5 +1,11 @@
 <template>
   <div class="opencode-config-panel">
+    <Transition name="opencode-left-pane">
+    <div
+      v-if="!props.sidebarCollapsed"
+      class="opencode-config-panel__sidebar-shell"
+      :style="{ width: `${leftWidth + 9}px`, flexBasis: `${leftWidth + 9}px` }"
+    >
     <aside class="provider-sidebar" :style="{ width: `${leftWidth}px`, flexBasis: `${leftWidth}px` }">
       <button class="btn btn-primary provider-sidebar__new" type="button" @click="store.addProvider()">
         新建供应商
@@ -63,6 +69,8 @@
       :class="{ 'opencode-config-panel__divider--dragging': isDragging }"
       @mousedown="onMouseDown"
     />
+    </div>
+    </Transition>
 
     <main class="config-content">
       <section class="card global-options">
@@ -361,7 +369,7 @@ import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
 import ModelField from '@/components/config/ModelField.vue'
 import SecretField from '@/components/config/SecretField.vue'
 import { useDragReorder } from '@/composables/useDragReorder'
-import { useResizablePanes } from '@/composables/useResizablePanes'
+import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
 import { useSettingsPopover } from '@/composables/useSettingsPopover'
 
 const { toggleSettings } = useSettingsPopover()
@@ -369,6 +377,12 @@ import { usePlatform } from '@/composables/usePlatform'
 
 const store = useOpencodeConfigStore()
 const workspaceStore = useConfigWorkspaceStore()
+const props = defineProps<{
+  sidebarCollapsed?: boolean
+}>()
+const emit = defineEmits<{
+  (event: 'left-width-change', width: number): void
+}>()
 const { isWindows } = usePlatform()
 const { draggingIndex, overIndex, justDragged, onPointerDown } = useDragReorder(
   () => store.orderedProviders.map(item => store.providerKey(item)),
@@ -445,18 +459,17 @@ async function openConfigDirectory() {
   }
 }
 
-const { leftWidth, isDragging, onMouseDown, loadSizes, saveSizes } = useResizablePanes(280, 200, 400)
-const PANE_KEY = 'opencode-config-panel'
+const { leftWidth, isDragging, onMouseDown, loadWidth } = useSharedLeftSidebarWidth()
 
 onMounted(() => {
-  loadSizes(PANE_KEY).catch(() => {})
+  loadWidth().catch(() => {})
   store.checkPermissions().catch(() => {})
   store.loadConfig(true).catch(() => {})
 })
 
-watch(isDragging, (dragging) => {
-  if (!dragging) saveSizes(PANE_KEY).catch(() => {})
-})
+watch(leftWidth, (width) => {
+  emit('left-width-change', width)
+}, { immediate: true })
 </script>
 
 <style scoped>
@@ -465,6 +478,26 @@ watch(isDragging, (dragging) => {
   min-height: 0;
   display: flex;
   background: var(--bg);
+}
+
+.opencode-config-panel__sidebar-shell {
+  flex: 0 0 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+.opencode-left-pane-enter-active,
+.opencode-left-pane-leave-active {
+  transition: width 0.22s ease, flex-basis 0.22s ease, opacity 0.16s ease;
+}
+
+.opencode-left-pane-enter-from,
+.opencode-left-pane-leave-to {
+  width: 0 !important;
+  flex-basis: 0 !important;
+  opacity: 0;
 }
 
 .provider-sidebar {

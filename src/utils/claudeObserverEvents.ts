@@ -18,6 +18,10 @@ export interface ClaudeModelCommandResult {
   context?: ClaudeModelContext
 }
 
+interface ClaudeCompactCommandResult {
+  text: string
+}
+
 function record(payload: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
   const value = payload[key]
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -75,6 +79,24 @@ function isModelCommandText(text: string): boolean {
   const commandName = taggedContent(text, 'command-name')
   if (commandName?.trim().toLowerCase() === '/model') return true
   return /^\/model(?:\s|$)/i.test(text.trim())
+}
+
+function isCompactCommandText(text: string): boolean {
+  const commandName = taggedContent(text, 'command-name')
+  if (commandName?.trim().toLowerCase() === '/compact') return true
+  return /^\/compact(?:\s|$)/i.test(text.trim())
+}
+
+function parseClaudeCompactCommandResult(text: string): ClaudeCompactCommandResult | undefined {
+  const stdout = taggedContent(text, 'local-command-stdout') ?? text
+  const plain = stripAnsi(stdout).replace(/\r/g, '')
+  if (/\b(?:conversation\s+)?compacted\s+\(ctrl\+o (?:to see full summary|for history)\)/i.test(plain)) {
+    return { text: '已完成上下文压缩' }
+  }
+  if (/\bnot enough messages to compact\b/i.test(plain)) {
+    return { text: '当前消息不足，无需压缩' }
+  }
+  return undefined
 }
 
 export function parseClaudeModelCommandResult(text: string): ClaudeModelCommandResult | undefined {
@@ -176,7 +198,9 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
 
     switch (eventName) {
       case 'HistoricalUserMessage':
-      case 'HistoricalAssistantMessage': {
+      case 'HistoricalAssistantMessage':
+      case 'HistoricalLocalCommand': {
+        const isLocalCommand = eventName === 'HistoricalLocalCommand'
         const kind = eventName === 'HistoricalUserMessage' ? 'user' : 'assistant'
         const text = stringValue(payload, 'text')
         if (!text) break
@@ -192,7 +216,19 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
           })
           break
         }
-        if (isModelCommandText(text) || isNoResponsePlaceholder(text)) break
+        const compactResult = parseClaudeCompactCommandResult(text)
+        if (compactResult) {
+          items.push({
+            id: `status-${event.id}`,
+            eventId: event.id,
+            kind: 'status',
+            eventName,
+            timestamp: event.receivedAt,
+            text: compactResult.text,
+          })
+          break
+        }
+        if (isLocalCommand || isModelCommandText(text) || isCompactCommandText(text) || isNoResponsePlaceholder(text)) break
         items.push({
           id: `history-${event.id}`,
           eventId: event.id,
@@ -230,7 +266,20 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
       case 'UserPromptSubmit': {
         runState = 'working'
         const text = stringValue(payload, 'prompt', 'text', 'message') ?? '已提交用户消息'
-        if (isModelCommandText(text)) break
+        const compactResult = parseClaudeCompactCommandResult(text)
+        if (compactResult) {
+          runState = 'idle'
+          items.push({
+            id: `status-${event.id}`,
+            eventId: event.id,
+            kind: 'status',
+            eventName,
+            timestamp: event.receivedAt,
+            text: compactResult.text,
+          })
+          break
+        }
+        if (isModelCommandText(text) || isCompactCommandText(text)) break
         items.push({
           id: `user-${event.id}`,
           eventId: event.id,
@@ -252,6 +301,19 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
         }
         const incoming = assistantText(payload)
         if (isNoResponsePlaceholder(incoming)) break
+        const compactResult = parseClaudeCompactCommandResult(incoming)
+        if (compactResult) {
+          items.push({
+            id: `status-${event.id}`,
+            eventId: event.id,
+            kind: 'status',
+            eventName,
+            timestamp: event.receivedAt,
+            text: compactResult.text,
+          })
+          runState = 'idle'
+          break
+        }
         const existing = assistantItems.get(key)
         if (existing) {
           existing.text = mergeAssistantText(
@@ -335,6 +397,15 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
       }
       case 'PermissionRequest':
         runState = 'permission'
+        if (parseClaudeAskUserQuestions(
+          toolName(payload),
+          payload.tool_input ?? payload.input,
+        ) !== null) {
+          // PreToolUse already rendered the interactive question card. Claude
+          // emits PermissionRequest with the same questions immediately after
+          // it, so a second generic terminal-only card would be misleading.
+          break
+        }
         items.push({
           id: `permission-${event.id}`,
           eventId: event.id,

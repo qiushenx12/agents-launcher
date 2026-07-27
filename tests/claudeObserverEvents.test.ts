@@ -123,6 +123,29 @@ test('permission request locks structured input until terminal confirmation', ()
   assert.equal(reduced.items[0].kind, 'permission')
 })
 
+test('AskUserQuestion permission request does not duplicate its inline question card', () => {
+  const questions = [{
+    question: 'Which layout should be used?',
+    options: [{ label: 'Thumbnail strip' }, { label: 'Inline file icon' }],
+  }]
+  const reduced = reduceClaudeAgentEvents([
+    event('1', 'PreToolUse', {
+      tool_use_id: 'question-1',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions },
+    }),
+    event('2', 'PermissionRequest', {
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions },
+    }),
+  ])
+
+  assert.equal(reduced.runState, 'permission')
+  assert.equal(reduced.items.length, 1)
+  assert.equal(reduced.items[0].kind, 'tool')
+  assert.equal(reduced.items[0].state, 'waiting')
+})
+
 test('out-of-order snapshot and live events reduce by backend sequence', () => {
   const prompt = event('1', 'UserPromptSubmit', { prompt: 'hello' })
   const answer = event('2', 'MessageDisplay', {
@@ -211,6 +234,42 @@ test('model command transcript becomes one concise status item', () => {
   assert.equal(reduced.items.length, 1)
   assert.equal(reduced.items[0].kind, 'status')
   assert.equal(reduced.items[0].text, '模型已切换为 Sonnet 5')
+})
+
+test('compact command transcript becomes one centered status item', () => {
+  const reduced = reduceClaudeAgentEvents([
+    event('1', 'HistoricalUserMessage', {
+      text: '<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>',
+      historical: true,
+    }),
+    event('2', 'HistoricalLocalCommand', {
+      text: '<local-command-stdout>\u001b[2mCompacted (ctrl+o to see full summary)\u001b[22m</local-command-stdout>',
+      historical: true,
+    }),
+    event('3', 'HistoricalAssistantMessage', {
+      text: 'No response requested.',
+      historical: true,
+    }),
+  ])
+
+  assert.deepEqual(reduced.items.map(item => ({ kind: item.kind, text: item.text })), [{
+    kind: 'status',
+    text: '已完成上下文压缩',
+  }])
+})
+
+test('compact no-op terminal echo becomes a centered status item', () => {
+  const reduced = reduceClaudeAgentEvents([
+    event('1', 'UserPromptSubmit', {
+      prompt: '❯ /compact\n  ⎿  Not enough messages to compact.',
+    }),
+  ])
+
+  assert.deepEqual(reduced.items.map(item => ({ kind: item.kind, text: item.text })), [{
+    kind: 'status',
+    text: '当前消息不足，无需压缩',
+  }])
+  assert.equal(reduced.runState, 'idle')
 })
 
 test('live model command and no-response placeholder stay out of conversation history', () => {

@@ -92,42 +92,46 @@
           <button class="danger" @click="removeProject(project.id)">⌫ 删除项目</button>
         </div>
 
-        <div v-if="isExpanded(project.id)" class="session-list">
-          <div
-            v-for="session in sessionsForProject(project.id)"
-            :key="session.id"
-            class="session-row"
-            :class="{
-              active: session.id === store.activeSessionId,
-              'session-row--closeable': sessionIsCloseable(session.id),
-            }"
-            @click="store.activateSession(session.id)"
-            @contextmenu.prevent="renameSession(session.id)"
-          >
-            <span class="session-row__status" :class="sessionStatus(session.id)" />
-            <span class="session-row__name">{{ displaySessionName(session.name) }}</span>
-            <span class="session-row__meta">
-              <span class="session-row__time">{{ formatRelativeTime(session.updatedAt) }}</span>
-              <button
-                v-if="sessionIsCloseable(session.id)"
-                type="button"
-                class="session-row__close"
-                title="关闭终端"
-                @click.stop="store.closeSessionTerminal(session.id)"
+        <Transition name="session-list">
+          <div v-if="isExpanded(project.id)" class="session-list">
+            <div class="session-list__content">
+              <div
+                v-for="session in sessionsForProject(project.id)"
+                :key="session.id"
+                class="session-row"
+                :class="{
+                  active: session.id === store.activeSessionId,
+                  'session-row--closeable': sessionIsCloseable(session.id),
+                }"
+                @click="store.activateSession(session.id)"
+                @contextmenu.prevent="renameSession(session.id)"
               >
-                ×
+                <span class="session-row__status" :class="sessionStatus(session.id)" />
+                <span class="session-row__name">{{ displaySessionName(session.name) }}</span>
+                <span class="session-row__meta">
+                  <span class="session-row__time">{{ formatRelativeTime(session.updatedAt) }}</span>
+                  <button
+                    v-if="sessionIsCloseable(session.id)"
+                    type="button"
+                    class="session-row__close"
+                    title="关闭终端"
+                    @click.stop="store.closeSessionTerminal(session.id)"
+                  >
+                    ×
+                  </button>
+                </span>
+              </div>
+              <button
+                v-if="showSessionToggle(project.id)"
+                type="button"
+                class="session-list__more"
+                @click.stop.prevent="toggleSessionDisplay(project.id)"
+              >
+                {{ sessionToggleLabel(project.id) }}
               </button>
-            </span>
+            </div>
           </div>
-          <button
-            v-if="showSessionToggle(project.id)"
-            type="button"
-            class="session-list__more"
-            @click.stop.prevent="toggleSessionDisplay(project.id)"
-          >
-            {{ sessionToggleLabel(project.id) }}
-          </button>
-        </div>
+        </Transition>
       </div>
 
       <button
@@ -483,7 +487,6 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   flex-direction: column;
   min-height: 0;
   background: var(--bg);
-  border-right: 1px solid var(--separator);
   position: relative;
 }
 
@@ -494,8 +497,7 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   justify-content: space-between;
   gap: 6px;
   padding: 8px;
-  border-bottom: 1px solid var(--separator);
-  background: var(--card);
+  background: var(--bg);
   position: relative;
 }
 
@@ -629,6 +631,7 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  scrollbar-gutter: stable;
   padding: 8px;
 }
 
@@ -666,6 +669,11 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
 
 .project-row {
   padding: 5px 4px 5px 6px;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.project-row:hover {
+  background: color-mix(in srgb, var(--primary) 16%, transparent);
 }
 
 .project-row--sortable {
@@ -746,7 +754,21 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
 }
 
 .session-list {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.18s ease, opacity 0.15s ease;
+}
+
+.session-list__content {
+  min-height: 0;
+  overflow: hidden;
   padding: 2px 0 6px 20px;
+}
+
+.session-list-enter-from,
+.session-list-leave-to {
+  grid-template-rows: 0fr;
+  opacity: 0;
 }
 
 .session-row {

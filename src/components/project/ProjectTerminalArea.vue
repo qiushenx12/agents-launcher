@@ -34,6 +34,7 @@
       :session-id="claudeEmptyPaneSessionId"
       :startup-mode="true"
       :startup-pending="claudeEmptyPending"
+      v-model:initial-permission-mode="claudeStartupPermissionMode"
       :external-error="claudeEmptyError"
       :submit-startup-prompt="submitClaudeEmptyPrompt"
       :clear-session-draft="clearClaudeSessionDraft"
@@ -81,28 +82,18 @@
           :project-name="store.activeProject!.name"
           :session-id="store.activeSession!.id"
           :startup-pending="activeClaudeStartupPending"
+          :initial-permission-mode="claudeStartupPermissionMode"
           :clear-session-draft="clearClaudeSessionDraft"
           :restore-session-draft="restoreClaudeSessionDraft"
           v-model:session-draft="activeClaudeSessionDraft"
           v-model:session-attachment-paths="activeClaudeSessionAttachmentPaths"
-          @show-terminal="selectClaudeView('terminal')"
+          @show-terminal="emit('select-claude-view', 'terminal')"
         />
         <ClaudeTerminalLogPane
           v-else-if="activeClaudeView === 'log'"
           :key="`log-${activeTerminalId}`"
           :tab-id="activeTerminalId"
         />
-        <nav class="claude-view-switch" aria-label="Claude 会话视图">
-          <button
-            v-for="option in claudeViewOptions"
-            :key="option.value"
-            type="button"
-            :class="{ active: activeClaudeView === option.value }"
-            @click="selectClaudeView(option.value)"
-          >
-            {{ option.label }}
-          </button>
-        </nav>
       </template>
       <div v-if="!activeTerminalId" class="project-terminal__empty">
         <div class="project-terminal__project-name">{{ store.activeProject?.name }}</div>
@@ -167,6 +158,7 @@ import {
 } from '@/utils/claudeStartupPrompt'
 
 type ClaudeView = 'conversation' | 'terminal' | 'log'
+type ClaudeDefaultPermissionMode = 'bypassPermissions' | 'auto' | 'default' | 'acceptEdits' | 'plan'
 
 const store = useProjectStore()
 const claudeStore = useClaudeStore()
@@ -177,6 +169,7 @@ const conversationEmptyPaneRef = ref<InstanceType<typeof ClaudeConversationPane>
 const dragOver = ref(false)
 const claudeEmptyError = ref('')
 const claudeEmptyPending = ref(false)
+const claudeStartupPermissionMode = ref<ClaudeDefaultPermissionMode>('auto')
 const claudeEmptyDrafts = ref<Record<string, string>>({})
 const claudeEmptyAttachmentPaths = ref<Record<string, string[]>>({})
 const claudeEmptyPrompt = computed({
@@ -189,12 +182,14 @@ const claudeEmptyPrompt = computed({
     setClaudeEmptyDraft(key, prompt)
   },
 })
-const claudeViews = ref<Record<number, ClaudeView>>({})
-const claudeViewOptions: Array<{ value: ClaudeView; label: string }> = [
-  { value: 'conversation', label: '对话' },
-  { value: 'terminal', label: '终端' },
-  { value: 'log', label: '日志' },
-]
+const props = withDefaults(defineProps<{
+  claudeView?: ClaudeView
+}>(), {
+  claudeView: 'conversation',
+})
+const emit = defineEmits<{
+  (event: 'select-claude-view', view: ClaudeView): void
+}>()
 
 interface ClaudeEmptyOperation {
   id: number
@@ -270,35 +265,7 @@ const activeClaudeSessionAttachmentPaths = computed({
   },
 })
 
-const activeClaudeView = computed<ClaudeView>({
-  get() {
-    const tabId = activeTerminalId.value
-    return tabId ? (claudeViews.value[tabId] ?? 'conversation') : 'conversation'
-  },
-  set(view) {
-    const tabId = activeTerminalId.value
-    if (tabId) claudeViews.value[tabId] = view
-  },
-})
-
-async function selectClaudeView(view: ClaudeView) {
-  const tabId = activeTerminalId.value
-  if (!tabId || view === activeClaudeView.value) return
-  const previousView = activeClaudeView.value
-
-  if (view === 'terminal') {
-    try {
-      await claudeObserverStore.pausePromptQueueForRawTerminal(tabId)
-    } catch (error) {
-      store.statusMessage = `切换终端前无法安全暂停等待队列：${errorMessage(error)}`
-    }
-  }
-
-  activeClaudeView.value = view
-  if (previousView === 'terminal' && view !== 'terminal') {
-    claudeObserverStore.resumePromptQueueFromRawTerminal(tabId)
-  }
-}
+const activeClaudeView = computed<ClaudeView>(() => props.claudeView)
 
 const isFreshProject = computed(() => {
   const session = store.activeSession
@@ -653,48 +620,4 @@ useTauriDrop((paths, position) => {
   padding-inline: 12px;
 }
 
-.claude-view-switch {
-  --claude-switch-bg: var(--card);
-  --claude-switch-border: var(--separator);
-  --claude-switch-hover: var(--bg);
-  position: absolute;
-  z-index: 10;
-  top: 6px;
-  right: 10px;
-  display: flex;
-  align-items: center;
-  padding: 2px;
-  border: 1px solid var(--claude-switch-border);
-  border-radius: 7px;
-  background: var(--claude-switch-bg);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
-}
-
-[data-theme="dark"] .claude-view-switch {
-  --claude-switch-bg: #161a20;
-  --claude-switch-border: #2b323b;
-  --claude-switch-hover: #20262e;
-  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.5);
-}
-
-.claude-view-switch button {
-  min-width: 44px;
-  padding: 4px 9px;
-  border: 0;
-  border-radius: 5px;
-  color: var(--text-secondary);
-  background: transparent;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.claude-view-switch button:hover {
-  color: var(--text-primary);
-  background: var(--claude-switch-hover);
-}
-
-.claude-view-switch button.active {
-  color: #fff;
-  background: var(--primary);
-}
 </style>

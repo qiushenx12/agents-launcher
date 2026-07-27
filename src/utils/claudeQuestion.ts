@@ -10,6 +10,11 @@ export interface ClaudeAskUserQuestion {
   multiSelect: boolean
 }
 
+export interface ClaudeQuestionAnswer {
+  selectedOptions: number[]
+  customText?: string
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -67,28 +72,53 @@ function validSelection(
   return unique
 }
 
+function validCustomText(value: string | undefined): string | undefined {
+  const text = value?.trim()
+  return text ? text : undefined
+}
+
 /**
- * Claude Code's question picker starts on the first option. These are the
- * equivalent PTY key sequences for answering each question in order.
+ * Claude Code's active question starts on its first option. Return only the
+ * writes for that question so the caller can advance in lockstep with the TUI.
  */
+export function encodeClaudeQuestionAnswerWrites(
+  question: ClaudeAskUserQuestion,
+  answer: ClaudeQuestionAnswer,
+): string[] | null {
+  const customText = validCustomText(answer.customText)
+  if (customText) {
+    // Claude Code appends "Type something" after the supplied options.
+    // Confirm it first, then enter the text in the dedicated input field.
+    return ['\x1b[B'.repeat(question.options.length) + '\r', customText + '\r']
+  }
+
+  const selected = validSelection(question, answer.selectedOptions)
+  if (!selected) return null
+
+  let cursor = 0
+  let input = ''
+  for (const optionIndex of selected) {
+    input += '\x1b[B'.repeat(optionIndex - cursor)
+    if (question.multiSelect) input += ' '
+    cursor = optionIndex
+  }
+  input += '\r'
+  return [input]
+}
+
 export function encodeClaudeQuestionResponseWrites(
   questions: ClaudeAskUserQuestion[],
-  selections: number[][],
-): string[] {
-  if (questions.length === 0 || questions.length !== selections.length) return []
+  answers: ClaudeQuestionAnswer[],
+): string[] | null {
+  if (questions.length === 0 || questions.length !== answers.length) return null
 
-  return questions.flatMap((question, questionIndex) => {
-    const selected = validSelection(question, selections[questionIndex])
-    if (!selected) return []
-
-    let cursor = 0
-    let input = ''
-    for (const optionIndex of selected) {
-      input += '\x1b[B'.repeat(optionIndex - cursor)
-      if (question.multiSelect) input += ' '
-      cursor = optionIndex
-    }
-    input += '\r'
-    return [input]
-  })
+  const writes: string[] = []
+  for (const [questionIndex, question] of questions.entries()) {
+    const answer = answers[questionIndex]
+    if (!answer) return null
+    const questionWrites = encodeClaudeQuestionAnswerWrites(question, answer)
+    if (!questionWrites) return null
+    writes.push(...questionWrites)
+  }
+  return writes
 }

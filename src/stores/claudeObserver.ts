@@ -17,11 +17,13 @@ import {
   createClaudeQueuedPrompt,
   findMatchingClaudeNativePrompt,
   normalizeClaudeBusyInputMode,
+  normalizeClaudePromptForMatch,
   takeMatchingClaudePromptReceipt,
 } from '@/utils/claudePromptQueue'
 import {
-  encodeClaudeQuestionResponseWrites,
+  encodeClaudeQuestionAnswerWrites,
   type ClaudeAskUserQuestion,
+  type ClaudeQuestionAnswer,
 } from '@/utils/claudeQuestion'
 import { ClaudeObserverSnapshotGate } from '@/utils/claudeObserverSnapshotGate'
 import type { PtyStatus, PtyTitle } from '@/types/terminal'
@@ -36,6 +38,38 @@ import type {
   ClaudeQueuedPrompt,
   ClaudeTerminalPrompt,
 } from '@/types/claudeObserver'
+
+export type ClaudeDefaultPermissionMode =
+  | 'bypassPermissions'
+  | 'auto'
+  | 'default'
+  | 'acceptEdits'
+  | 'plan'
+
+function normalizeDefaultPermissionMode(mode: string | null | undefined): ClaudeDefaultPermissionMode {
+  switch (mode) {
+    case 'bypassPermissions':
+    case 'auto':
+    case 'default':
+    case 'acceptEdits':
+    case 'plan':
+      return mode
+    case 'manual':
+      return 'default'
+    default:
+      return 'auto'
+  }
+}
+
+function permissionModeFromTerminalLabel(label: string | null | undefined): ClaudeDefaultPermissionMode | null {
+  const normalized = label?.toLowerCase() ?? ''
+  if (normalized.includes('bypass permissions')) return 'bypassPermissions'
+  if (normalized.includes('auto mode')) return 'auto'
+  if (normalized.includes('manual mode') || normalized.includes('default mode')) return 'default'
+  if (normalized.includes('auto-accept edits') || normalized.includes('accept edits')) return 'acceptEdits'
+  if (normalized.includes('plan mode')) return 'plan'
+  return null
+}
 
 function normalizeClaudeTerminalPrompt(
   prompt: ClaudeTerminalPrompt | null | undefined,
@@ -63,6 +97,17 @@ function normalizeClaudeTerminalPrompt(
     return { ...prompt, selectedIndex }
   }
 
+  if (prompt.kind === 'planApproval') {
+    const legacy = prompt as unknown as { selected_index?: unknown }
+    const selectedIndex = Number.isInteger(prompt.selectedIndex)
+      ? prompt.selectedIndex
+      : Number.isInteger(legacy.selected_index)
+        ? legacy.selected_index as number
+        : -1
+    if (selectedIndex < 0 || selectedIndex >= prompt.options.length) return undefined
+    return { ...prompt, selectedIndex }
+  }
+
   return prompt
 }
 
@@ -79,6 +124,8 @@ function createState(tabId: number): ClaudeConversationState {
     loading: true,
     terminalPrompt: undefined,
     activityStatus: undefined,
+    compactCompletionRevision: 0,
+    permissionMode: '? for shortcuts',
     queuedPrompts: [],
     queueActionPending: false,
   }
@@ -97,12 +144,17 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
   const nativeQueueWriteTabs = new Set<number>()
   const promptQueuePausedTabs = new Set<number>()
   const interruptRequestedTabs = new Set<number>()
+  const pendingDirectPrompts = new Map<number, string>()
+  const interruptedInputDrafts = new Map<number, string>()
+  const retractedPromptEventIds = new Set<string>()
+  const retractedPromptTexts = new Map<number, string>()
   const questionResponseTabs = new Set<number>()
   const pendingModelSwitchByTab = new Map<number, {
     model: string
     context?: ClaudeModelContext
     previousModel?: string
   }>()
+  const compactCompletionWatchBaselines = new Map<number, string>()
   const busyInputMode = ref<ClaudeBusyInputMode>('native')
   let listenerPromise: Promise<void> | null = null
   let queuedPromptSequence = 0
@@ -115,6 +167,8 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
   const CLAUDE_MODEL_CONFIRMATION_TIMEOUT_MS = 4_000
   const CLAUDE_MODEL_CONFIRMATION_POLL_MS = 120
   const CLAUDE_MODEL_SELECTION_TIMEOUT_MS = 3_000
+  const CLAUDE_COMPACT_COMPLETION_TIMEOUT_MS = 5 * 60_000
+  const CLAUDE_COMPACT_COMPLETION_POLL_MS = 500
 
   function waitForClaudeInputFrame(delayMs: number) {
     return new Promise<void>((resolve) => window.setTimeout(resolve, delayMs))
@@ -282,6 +336,97 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     if (index >= 0) receipts.splice(index, 1)
   }
 
+  function retractUnansweredPrompt(tabId: number, prompt: string) {
+    const normalizedPrompt = normalizeClaudePromptForMatch(prompt)
+    const existingEvents = eventsByTab.get(tabId) ?? []
+    let matchedEvent = false
+    for (let index = existingEvents.length - 1; index >= 0; index--) {
+      const event = existingEvents[index]
+      if (
+        event.eventName === 'UserPromptSubmit'
+        && normalizeClaudePromptForMatch(eventPrompt(event) ?? '') === normalizedPrompt
+      ) {
+        retractedPromptEventIds.add(event.id)
+        matchedEvent = true
+        break
+      }
+    }
+    if (!matchedEvent) retractedPromptTexts.set(tabId, normalizedPrompt)
+
+    const remainingEvents = existingEvents.filter(event => !retractedPromptEventIds.has(event.id))
+    eventsByTab.set(tabId, remainingEvents)
+    stateFor(tabId).items = reduceClaudeAgentEvents(remainingEvents).items
+  }
+
+  function isCompactCommand(prompt: string) {
+    return /^\/compact(?:\s|$)/i.test(prompt.trimStart())
+  }
+
+  function isContextCompactionActivity(tabId: number) {
+    const label = stateFor(tabId).activityStatus?.label.trim() ?? ''
+    return label.replace(/[….]+$/u, '').toLowerCase() === 'compacting conversation'
+  }
+
+  function compactCommandResult(
+    tabId: number,
+    receipt: ClaudePromptReceipt,
+  ): 'inProgress' | 'completed' | 'notNeeded' | undefined {
+    if (!isCompactCommand(receipt.text)) return undefined
+    const output = terminalLogDelta(receipt.terminalLogBaseline ?? '', stateFor(tabId).terminalLog)
+    if (/\b(?:conversation\s+)?compacted\s+\(ctrl\+o (?:to see full summary|for history)\)/i.test(output)) {
+      return 'completed'
+    }
+    if (/\bnot enough messages to compact\b/i.test(output)) return 'notNeeded'
+    if (isContextCompactionActivity(tabId)) return 'inProgress'
+    return undefined
+  }
+
+  function announceCompactCompletion(tabId: number) {
+    stateFor(tabId).compactCompletionRevision += 1
+  }
+
+  function watchCompactCompletion(tabId: number, terminalLogBaseline: string) {
+    if (compactCompletionWatchBaselines.has(tabId)) return
+    compactCompletionWatchBaselines.set(tabId, terminalLogBaseline)
+    void (async () => {
+      const deadline = Date.now() + CLAUDE_COMPACT_COMPLETION_TIMEOUT_MS
+      while (
+        compactCompletionWatchBaselines.get(tabId) === terminalLogBaseline
+        && Date.now() < deadline
+      ) {
+        const terminalLog = await refreshTerminalLog(tabId)
+        const output = terminalLog
+          ? terminalLogDelta(terminalLogBaseline, terminalLog)
+          : ''
+        if (/\b(?:conversation\s+)?compacted\s+\(ctrl\+o (?:to see full summary|for history)\)/i.test(output)) {
+          announceCompactCompletion(tabId)
+          break
+        }
+        if (closedTabs.has(tabId) || !stateFor(tabId).active) break
+        await waitForClaudeInputFrame(CLAUDE_COMPACT_COMPLETION_POLL_MS)
+      }
+      if (compactCompletionWatchBaselines.get(tabId) === terminalLogBaseline) {
+        compactCompletionWatchBaselines.delete(tabId)
+      }
+    })()
+  }
+
+  function confirmCompactCommandReceipt(tabId: number) {
+    for (const receipt of receiptsFor(tabId)) {
+      if (receipt.kind !== 'direct') continue
+      const result = compactCommandResult(tabId, receipt)
+      if (!result) continue
+      removePromptReceiptByIdentity(tabId, receipt)
+      if (result === 'inProgress') {
+        watchCompactCompletion(tabId, receipt.terminalLogBaseline ?? stateFor(tabId).terminalLog)
+      } else if (result === 'completed') {
+        announceCompactCompletion(tabId)
+      }
+      return true
+    }
+    return false
+  }
+
   function removeQueuedPrompt(tabId: number, queuedPromptId: string) {
     const state = stateFor(tabId)
     const index = state.queuedPrompts.findIndex(item => item.id === queuedPromptId)
@@ -388,10 +533,30 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     if (closedTabs.has(tabId)) return
     const existingEvents = eventsByTab.get(tabId) ?? []
     const existingIds = new Set(existingEvents.map(event => event.id))
+    const acceptedEvents: ClaudeAgentEvent[] = []
     let queueMayAdvance = false
     let completedTurn = false
     for (const event of events) {
+      if (retractedPromptEventIds.has(event.id)) continue
+      if (
+        event.eventName === 'UserPromptSubmit'
+        && retractedPromptTexts.get(tabId) === normalizeClaudePromptForMatch(eventPrompt(event) ?? '')
+      ) {
+        retractedPromptTexts.delete(tabId)
+        retractedPromptEventIds.add(event.id)
+        continue
+      }
       if (existingIds.has(event.id)) continue
+      acceptedEvents.push(event)
+      if (
+        event.eventName === 'PreToolUse'
+        || event.eventName === 'MessageDisplay'
+        || event.eventName === 'PermissionRequest'
+      ) {
+        // Once Claude starts replying, Esc leaves no editable prompt in the
+        // terminal. Do not restore the already-processed user message.
+        pendingDirectPrompts.delete(tabId)
+      }
       if (event.eventName === 'UserPromptSubmit') {
         const prompt = eventPrompt(event)
         const receipt = prompt
@@ -454,7 +619,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     }
     const unique = new Map<string, ClaudeAgentEvent>()
     for (const event of existingEvents) unique.set(event.id, event)
-    for (const event of events) unique.set(event.id, event)
+    for (const event of acceptedEvents) unique.set(event.id, event)
     const merged = Array.from(unique.values())
       .sort((left, right) => left.sequence - right.sequence || left.receivedAt.localeCompare(right.receivedAt))
       .slice(-500)
@@ -466,7 +631,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     state.runState = reduced.runState === 'working' && ptyRunStateByTab.get(tabId) === 'idle'
       ? 'idle'
       : reduced.runState
-    if (events.length > 0) {
+    if (acceptedEvents.length > 0) {
       state.available = !unconfirmedTerminalInputTabs.has(tabId)
       if (
         state.available
@@ -493,11 +658,19 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     state.logDir = status.logDir ?? undefined
     const observedCurrentModel = status.currentModel?.trim()
     if (observedCurrentModel) state.currentModel = observedCurrentModel
+    if (status.permissionMode) {
+      const observedPermissionMode = permissionModeFromTerminalLabel(status.permissionMode)
+      if (!state.pendingPermissionMode || observedPermissionMode === state.pendingPermissionMode) {
+        state.permissionMode = status.permissionMode
+        state.pendingPermissionMode = undefined
+      }
+    }
     const nextTerminalPrompt = state.active
       ? normalizeClaudeTerminalPrompt(status.terminalPrompt)
       : undefined
     state.terminalPrompt = nextTerminalPrompt
     state.activityStatus = state.active ? status.activityStatus : undefined
+    confirmCompactCommandReceipt(status.tabId)
     state.loading = false
     if (
       interruptRequestedTabs.has(status.tabId)
@@ -813,6 +986,53 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     throw new Error('等待 Claude 停止当前处理超时')
   }
 
+  async function interruptRun(tabId: number): Promise<string | undefined> {
+    const state = stateFor(tabId)
+    if (state.runState !== 'working') return
+    if (!state.available || !state.active) throw new Error('Claude 会话当前不可停止')
+
+    interruptRequestedTabs.add(tabId)
+    try {
+      await invoke('pty_write', { tabId, data: '\u001b' })
+      await waitForClaudeIdle(tabId)
+      const restoredPrompt = pendingDirectPrompts.get(tabId)
+      if (restoredPrompt !== undefined) {
+        pendingDirectPrompts.delete(tabId)
+        // Esc returns an unanswered prompt to Claude's native input. Clear
+        // that native draft before the next structured submission so the
+        // restored text is not appended a second time.
+        interruptedInputDrafts.set(tabId, restoredPrompt)
+        retractUnansweredPrompt(tabId, restoredPrompt)
+      }
+      return restoredPrompt
+    } finally {
+      interruptRequestedTabs.delete(tabId)
+    }
+  }
+
+  async function cyclePermissionMode(tabId: number, expectedMode?: ClaudeDefaultPermissionMode) {
+    const state = stateFor(tabId)
+    if (!state.available || !state.active || !!state.terminalPrompt) {
+      throw new Error('当前 Claude 会话无法切换权限模式')
+    }
+    if (expectedMode) state.pendingPermissionMode = expectedMode
+    try {
+      await invoke('pty_write', { tabId, data: '\u001b[Z' })
+    } catch (error) {
+      if (state.pendingPermissionMode === expectedMode) state.pendingPermissionMode = undefined
+      throw error
+    }
+  }
+
+  async function loadDefaultPermissionMode(): Promise<ClaudeDefaultPermissionMode> {
+    const mode = await invoke<string>('load_claude_default_permission_mode')
+    return normalizeDefaultPermissionMode(mode)
+  }
+
+  async function saveDefaultPermissionMode(mode: ClaudeDefaultPermissionMode) {
+    await invoke('save_claude_default_permission_mode', { mode })
+  }
+
   async function insertQueuedPromptNow(tabId: number, queuedPromptId: string) {
     const state = stateFor(tabId)
     const item = state.queuedPrompts.find(queued => queued.id === queuedPromptId)
@@ -894,6 +1114,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
 
   function resumePromptQueueFromRawTerminal(tabId: number) {
     promptQueuePausedTabs.delete(tabId)
+    compactCompletionWatchBaselines.delete(tabId)
     const state = stateFor(tabId)
     void pumpPromptQueue(tabId, state.runState === 'idle')
   }
@@ -916,12 +1137,17 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     ) {
       throw new Error('当前状态需要在原始终端中继续')
     }
+    const terminalLogBaseline = await refreshTerminalLog(tabId) ?? state.terminalLog
     ptyRunStateByTab.set(tabId, 'working')
     state.runState = 'working'
     state.activityStatus = undefined
     let contentWritten = false
     let promptReceipt: ClaudePromptReceipt | undefined
     try {
+      if (interruptedInputDrafts.has(tabId)) {
+        await invoke('pty_write', { tabId, data: '\x15' })
+        interruptedInputDrafts.delete(tabId)
+      }
       await invoke('pty_write', { tabId, data: writes[0] })
       contentWritten = true
       await waitForClaudeInputFrame(CLAUDE_SUBMIT_KEY_DELAY_MS)
@@ -938,13 +1164,17 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
       if (closedTabs.has(tabId) || !state.active) {
         throw new Error('Claude 会话已在发送过程中结束')
       }
-      promptReceipt = { text: prompt, kind: 'direct' }
+      promptReceipt = { text: prompt, kind: 'direct', terminalLogBaseline }
       receiptsFor(tabId).push(promptReceipt)
+      // Start tracking before Enter is written: hook events can arrive as
+      // soon as the terminal accepts the submission.
+      pendingDirectPrompts.set(tabId, prompt)
       await invoke('pty_write', { tabId, data: writes[1] })
     } catch (error) {
       if (promptReceipt) {
         removePromptReceiptByIdentity(tabId, promptReceipt)
       }
+      pendingDirectPrompts.delete(tabId)
       ptyRunStateByTab.set(tabId, 'idle')
       if (state.active && state.sessionReady) {
         state.runState = 'idle'
@@ -965,6 +1195,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
         return
       }
       await loadSnapshot(tabId)
+      if (confirmCompactCommandReceipt(tabId)) return
       if (receiptsFor(tabId).includes(promptReceipt) && current.active) {
         removePromptReceiptByIdentity(tabId, promptReceipt)
         unconfirmedTerminalInputTabs.add(tabId)
@@ -1073,6 +1304,28 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
       pendingModelSwitchByTab.delete(tabId)
       return
     }
+    if (state.terminalPrompt?.kind === 'planApproval') {
+      if (action === -1 || action === 'cancel') {
+        await invoke('pty_write', { tabId, data: '\u001b' })
+        return
+      }
+      if (
+        typeof action !== 'number'
+        || !Number.isInteger(action)
+        || action < 0
+        || action >= state.terminalPrompt.options.length
+      ) {
+        throw new Error('Invalid plan approval choice')
+      }
+      const delta = action - state.terminalPrompt.selectedIndex
+      const direction = delta >= 0 ? '\u001b[B' : '\u001b[A'
+      for (let index = 0; index < Math.abs(delta); index += 1) {
+        await invoke('pty_write', { tabId, data: direction })
+        await waitForClaudeInputFrame(CLAUDE_QUEUE_KEY_DELAY_MS)
+      }
+      await invoke('pty_write', { tabId, data: '\r' })
+      return
+    }
     if (state.terminalPrompt?.kind === 'pluginInstall') {
       if (action === -1) {
         await invoke('pty_write', { tabId, data: '\u001b' })
@@ -1110,12 +1363,12 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
 
   async function respondToAskUserQuestion(
     tabId: number,
-    questions: ClaudeAskUserQuestion[],
-    selections: number[][],
+    question: ClaudeAskUserQuestion,
+    answer: ClaudeQuestionAnswer,
   ) {
     const state = stateFor(tabId)
-    const writes = encodeClaudeQuestionResponseWrites(questions, selections)
-    if (writes.length !== questions.length) {
+    const writes = encodeClaudeQuestionAnswerWrites(question, answer)
+    if (!writes?.length) {
       throw new Error('璇疯涓烘瘡涓€涓棶棰樻彁渚涘悎娉曠殑閫夐」')
     }
     if (
@@ -1155,6 +1408,9 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     nativeQueueWriteTabs.delete(tabId)
     promptQueuePausedTabs.delete(tabId)
     interruptRequestedTabs.delete(tabId)
+    pendingDirectPrompts.delete(tabId)
+    interruptedInputDrafts.delete(tabId)
+    retractedPromptTexts.delete(tabId)
     questionResponseTabs.delete(tabId)
     pendingModelSwitchByTab.delete(tabId)
   }
@@ -1169,6 +1425,10 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     setBusyInputMode,
     submitPrompt,
     changeModel,
+    cyclePermissionMode,
+    loadDefaultPermissionMode,
+    saveDefaultPermissionMode,
+    interruptRun,
     queuePrompt,
     withdrawQueuedPrompt,
     insertQueuedPromptNow,

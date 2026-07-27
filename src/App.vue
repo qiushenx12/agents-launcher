@@ -1,34 +1,72 @@
 <template>
   <div class="app-layout">
     <!-- Custom title bar -->
-    <header class="title-bar" data-tauri-drag-region @dblclick="toggleMaximize">
-      <div class="title-bar__left">
-        <button
-          class="title-bar__icon-btn"
-          :class="{ active: leftSidebarOpen }"
-          :title="leftSidebarToggleTitle"
-          :aria-label="leftSidebarToggleTitle"
-          :aria-pressed="leftSidebarOpen"
-          :disabled="!appReady"
-          data-tauri-drag-region="false"
-          @click="toggleActiveLeftSidebar"
-          @dblclick.stop
-        >
-          <span class="sidebar-toggle-icon sidebar-toggle-icon--left" aria-hidden="true"></span>
-        </button>
+    <header
+      class="title-bar"
+      :style="{
+        '--project-nav-width': `${leftSidebarOpen ? sharedSidebarHeaderWidth : 45}px`,
+      }"
+      data-tauri-drag-region
+      @dblclick="toggleMaximize"
+    >
+      <div
+        class="title-bar__workspace-section"
+        :class="{ 'title-bar__workspace-section--collapsed': !leftSidebarOpen }"
+        @dblclick.stop
+      >
+        <span class="title-bar__sidebar-slot">
+          <button
+            class="title-bar__icon-btn"
+            :class="{ active: leftSidebarOpen }"
+            :title="leftSidebarToggleTitle"
+            :aria-label="leftSidebarToggleTitle"
+            :aria-pressed="leftSidebarOpen"
+            :disabled="!appReady"
+            data-tauri-drag-region="false"
+            @click="toggleActiveLeftSidebar"
+          >
+            <span class="sidebar-toggle-icon sidebar-toggle-icon--left" aria-hidden="true"></span>
+          </button>
+        </span>
+        <nav v-if="leftSidebarOpen" class="title-bar__mode-tabs" aria-label="工作区">
+          <button
+            class="title-bar__mode-tab"
+            :class="{ active: workspaceMode === 'config' }"
+            :disabled="!appReady"
+            data-tauri-drag-region="false"
+            @click="openConfigTab"
+          >
+            配置
+            <span
+              v-if="configWorkspaceStore.activeHasUnsavedChanges"
+              class="title-bar__dirty"
+              title="当前配置有未保存的修改"
+              aria-label="当前配置有未保存的修改"
+            ></span>
+          </button>
+          <button
+            class="title-bar__mode-tab"
+            :class="{ active: workspaceMode === 'project' }"
+            :disabled="!appReady"
+            data-tauri-drag-region="false"
+            @click="openProjectTab"
+          >
+            项目
+          </button>
+        </nav>
       </div>
 
-      <nav class="title-bar__tabs" @dblclick.stop>
+      <nav class="title-bar__tabs" aria-label="前端" @dblclick.stop>
         <button
-          v-for="item in topBarStore.visibleOrder"
-          :key="item"
+          v-for="kind in topBarStore.cliOrder"
+          :key="kind"
           class="title-bar__tab"
-          :class="{ active: mainTab === item }"
+          :class="{ active: activeCliKind === kind }"
           :disabled="!appReady"
           data-tauri-drag-region="false"
-          @click="openTopBarItem(item)"
+          @click="selectCliKind(kind)"
         >
-          {{ topBarItemLabel(item) }}
+          {{ CLI_DESCRIPTORS[kind].label }}
         </button>
       </nav>
 
@@ -70,8 +108,11 @@
     <!-- Content area -->
     <main v-if="appReady" class="app-content">
       <!-- Config panels -->
-      <div v-show="mainTab === 'config'" class="app-panel">
-        <ConfigWorkspace />
+      <div v-show="workspaceMode === 'config'" class="app-panel">
+        <ConfigWorkspace
+          :sidebar-collapsed="!leftSidebarOpen"
+          @left-width-change="sharedSidebarHeaderWidth = $event + 5"
+        />
       </div>
 
       <!-- Terminal panel — always mounted to preserve state -->
@@ -83,12 +124,13 @@
            xterm instances (scrollback, mouse modes) survive tab switches. -->
       <div
         v-if="workspaceCliKind && workspaceCliStatus?.state === 'ready'"
-        v-show="activeCliKind === mainTab"
+        v-show="workspaceMode === 'project'"
         class="app-panel"
       >
         <ProjectPanel
           :cli-kind="workspaceCliKind"
           @open-settings="showSettings = !showSettings"
+          @left-width-change="sharedSidebarHeaderWidth = $event + 5"
         />
       </div>
 
@@ -97,9 +139,6 @@
         <OrchestrationManager />
       </div>
     </main>
-
-    <!-- Status bar -->
-    <StatusBar v-if="appReady" :items="statusItems" />
 
     <div
       v-if="dependencyState !== 'ready'"
@@ -209,123 +248,59 @@
     </div>
 
     <div v-if="appReady && showSettings" class="settings-popover">
-      <div class="settings-dropdown__section">主题</div>
-      <button
-        class="settings-dropdown__item"
-        :class="{ active: theme === 'light' }"
-        @click="setTheme('light')"
-      >
-        <span class="settings-dropdown__check" v-if="theme === 'light'">✓</span>
-        <span class="settings-dropdown__check" v-else></span>
-        浅色
-      </button>
-      <button
-        class="settings-dropdown__item"
-        :class="{ active: theme === 'dark' }"
-        @click="setTheme('dark')"
-      >
-        <span class="settings-dropdown__check" v-if="theme === 'dark'">✓</span>
-        <span class="settings-dropdown__check" v-else></span>
-        深色
-      </button>
-
-      <div class="settings-dropdown__section">项目终端拖入文件</div>
-      <button
-        class="settings-dropdown__item"
-        :class="{ active: claudeStore.projectDropPathMode === 'relative' }"
-        @click="setProjectDropPathMode('relative')"
-      >
-        <span class="settings-dropdown__check" v-if="claudeStore.projectDropPathMode === 'relative'">✓</span>
-        <span class="settings-dropdown__check" v-else></span>
-        相对路径
-      </button>
-      <button
-        class="settings-dropdown__item"
-        :class="{ active: claudeStore.projectDropPathMode === 'filename' }"
-        @click="setProjectDropPathMode('filename')"
-      >
-        <span class="settings-dropdown__check" v-if="claudeStore.projectDropPathMode === 'filename'">✓</span>
-        <span class="settings-dropdown__check" v-else></span>
-        仅文件名
-      </button>
-
-      <div class="settings-dropdown__section">Claude 运行中消息</div>
-      <button
-        class="settings-dropdown__item settings-dropdown__item--described"
-        :class="{ active: claudeObserverStore.busyInputMode === 'native' }"
-        @click="setClaudeBusyInputMode('native')"
-      >
-        <span class="settings-dropdown__check" v-if="claudeObserverStore.busyInputMode === 'native'">✓</span>
-        <span class="settings-dropdown__check" v-else></span>
-        <span class="settings-dropdown__item-copy">
-          <span>执行间隙插入</span>
-          <small>交给 Claude Code 原生等待队列</small>
-        </span>
-      </button>
-      <button
-        class="settings-dropdown__item settings-dropdown__item--described"
-        :class="{ active: claudeObserverStore.busyInputMode === 'after-stop' }"
-        @click="setClaudeBusyInputMode('after-stop')"
-      >
-        <span class="settings-dropdown__check" v-if="claudeObserverStore.busyInputMode === 'after-stop'">✓</span>
-        <span class="settings-dropdown__check" v-else></span>
-        <span class="settings-dropdown__item-copy">
-          <span>完全停止后发送</span>
-          <small>当前轮次结束后再提交</small>
-        </span>
-      </button>
-
-      <div class="settings-dropdown__section">终端字体大小</div>
-      <div class="settings-dropdown__item font-size-row">
-        <button
-          class="font-size-btn"
-          :disabled="terminalStore.fontSize <= 6"
-          @click="terminalStore.setFontSize(terminalStore.fontSize - 1)"
-        >−</button>
-        <span class="font-size-value">{{ terminalStore.fontSize }}</span>
-        <button
-          class="font-size-btn"
-          :disabled="terminalStore.fontSize >= 28"
-          @click="terminalStore.setFontSize(terminalStore.fontSize + 1)"
-        >+</button>
+      <div ref="settingsMenuRef" class="settings-dropdown__menu">
+        <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'theme' }" type="button" :aria-expanded="activeSettingsSubmenu === 'theme'" @click="toggleSettingsSubmenu('theme', $event)">
+          <span>主题</span>
+          <span class="settings-dropdown__group-value">{{ theme === 'light' ? '浅色' : '深色' }}</span>
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
+        </button>
+        <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'project-drop-path' }" type="button" :aria-expanded="activeSettingsSubmenu === 'project-drop-path'" @click="toggleSettingsSubmenu('project-drop-path', $event)">
+          <span>项目终端拖入文件</span>
+          <span class="settings-dropdown__group-value">{{ claudeStore.projectDropPathMode === 'relative' ? '相对路径' : '仅文件名' }}</span>
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
+        </button>
+        <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'busy-input' }" type="button" :aria-expanded="activeSettingsSubmenu === 'busy-input'" @click="toggleSettingsSubmenu('busy-input', $event)">
+          <span>Claude 运行中消息</span>
+          <span class="settings-dropdown__group-value">{{ claudeObserverStore.busyInputMode === 'native' ? '执行间隙插入' : '完全停止后发送' }}</span>
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
+        </button>
+        <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'font-size' }" type="button" :aria-expanded="activeSettingsSubmenu === 'font-size'" @click="toggleSettingsSubmenu('font-size', $event)">
+          <span>字体大小</span>
+          <span class="settings-dropdown__group-value">终端 {{ terminalStore.fontSize }} · APP {{ appFontSize }}px</span>
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
+        </button>
+        <button class="settings-dropdown__group-trigger" type="button" @click="openTopBarOrderModal">
+          <span>前端入口排序</span>
+          <span class="settings-dropdown__group-value">界面布局</span>
+          <span class="settings-dropdown__chevron">›</span>
+        </button>
       </div>
 
-      <div class="settings-dropdown__section">APP 字体大小</div>
-      <div class="settings-dropdown__item font-size-row">
-        <button
-          class="font-size-btn"
-          :disabled="appFontSize <= APP_FONT_MIN"
-          @click="setAppFontSize(-1)"
-        >−</button>
-        <span class="font-size-value">{{ appFontSize }}px</span>
-        <button
-          class="font-size-btn"
-          :disabled="appFontSize >= APP_FONT_MAX"
-          @click="setAppFontSize(1)"
-        >+</button>
+      <div
+        v-if="activeSettingsSubmenu"
+        class="settings-dropdown__submenu"
+        :style="activeSettingsSubmenu === 'font-size'
+          ? { bottom: `${settingsSubmenuBottom}px` }
+          : { top: `${settingsSubmenuTop}px` }"
+      >
+        <div v-if="activeSettingsSubmenu === 'theme'" class="settings-dropdown__options" role="listbox" aria-label="主题">
+          <button class="settings-dropdown__item" :class="{ active: theme === 'light' }" type="button" role="option" :aria-selected="theme === 'light'" @click="setTheme('light')"><span class="settings-dropdown__check">{{ theme === 'light' ? '✓' : '' }}</span>浅色</button>
+          <button class="settings-dropdown__item" :class="{ active: theme === 'dark' }" type="button" role="option" :aria-selected="theme === 'dark'" @click="setTheme('dark')"><span class="settings-dropdown__check">{{ theme === 'dark' ? '✓' : '' }}</span>深色</button>
+        </div>
+        <div v-else-if="activeSettingsSubmenu === 'project-drop-path'" class="settings-dropdown__options" role="listbox" aria-label="项目终端拖入文件">
+          <button class="settings-dropdown__item" :class="{ active: claudeStore.projectDropPathMode === 'relative' }" type="button" role="option" :aria-selected="claudeStore.projectDropPathMode === 'relative'" @click="setProjectDropPathMode('relative')"><span class="settings-dropdown__check">{{ claudeStore.projectDropPathMode === 'relative' ? '✓' : '' }}</span>相对路径</button>
+          <button class="settings-dropdown__item" :class="{ active: claudeStore.projectDropPathMode === 'filename' }" type="button" role="option" :aria-selected="claudeStore.projectDropPathMode === 'filename'" @click="setProjectDropPathMode('filename')"><span class="settings-dropdown__check">{{ claudeStore.projectDropPathMode === 'filename' ? '✓' : '' }}</span>仅文件名</button>
+        </div>
+        <div v-else-if="activeSettingsSubmenu === 'busy-input'" class="settings-dropdown__options" role="listbox" aria-label="Claude 运行中消息">
+          <button class="settings-dropdown__item settings-dropdown__item--described" :class="{ active: claudeObserverStore.busyInputMode === 'native' }" type="button" role="option" :aria-selected="claudeObserverStore.busyInputMode === 'native'" @click="setClaudeBusyInputMode('native')"><span class="settings-dropdown__check">{{ claudeObserverStore.busyInputMode === 'native' ? '✓' : '' }}</span><span class="settings-dropdown__item-copy"><span>执行间隙插入</span><small>交给 Claude Code 原生等待队列</small></span></button>
+          <button class="settings-dropdown__item settings-dropdown__item--described" :class="{ active: claudeObserverStore.busyInputMode === 'after-stop' }" type="button" role="option" :aria-selected="claudeObserverStore.busyInputMode === 'after-stop'" @click="setClaudeBusyInputMode('after-stop')"><span class="settings-dropdown__check">{{ claudeObserverStore.busyInputMode === 'after-stop' ? '✓' : '' }}</span><span class="settings-dropdown__item-copy"><span>完全停止后发送</span><small>当前轮次结束后再提交</small></span></button>
+        </div>
+        <div v-else class="settings-dropdown__options settings-dropdown__options--font" aria-label="字体大小">
+          <div class="settings-dropdown__font-row"><span>终端字体</span><div class="font-size-row"><button class="font-size-btn" type="button" :disabled="terminalStore.fontSize <= 6" aria-label="减小终端字体" @click="terminalStore.setFontSize(terminalStore.fontSize - 1)">−</button><span class="font-size-value">{{ terminalStore.fontSize }}</span><button class="font-size-btn" type="button" :disabled="terminalStore.fontSize >= 28" aria-label="增大终端字体" @click="terminalStore.setFontSize(terminalStore.fontSize + 1)">+</button></div></div>
+          <div class="settings-dropdown__font-row"><span>APP 字体</span><div class="font-size-row"><button class="font-size-btn" type="button" :disabled="appFontSize <= APP_FONT_MIN" aria-label="减小 APP 字体" @click="setAppFontSize(-1)">−</button><span class="font-size-value">{{ appFontSize }}px</span><button class="font-size-btn" type="button" :disabled="appFontSize >= APP_FONT_MAX" aria-label="增大 APP 字体" @click="setAppFontSize(1)">+</button></div></div>
+          <div class="settings-dropdown__font-row"><span>Markdown 字体</span><div class="font-size-row"><button class="font-size-btn" type="button" :disabled="mdFontSize <= MD_FONT_MIN" aria-label="减小 Markdown 字体" @click="setMdFontSize(mdFontSize - 1)">−</button><span class="font-size-value">{{ mdFontSize }}px</span><button class="font-size-btn" type="button" :disabled="mdFontSize >= MD_FONT_MAX" aria-label="增大 Markdown 字体" @click="setMdFontSize(mdFontSize + 1)">+</button></div></div>
+        </div>
       </div>
-
-      <div class="settings-dropdown__section">Markdown 字体大小</div>
-      <div class="settings-dropdown__item font-size-row">
-        <button
-          class="font-size-btn"
-          :disabled="mdFontSize <= MD_FONT_MIN"
-          @click="setMdFontSize(mdFontSize - 1)"
-        >−</button>
-        <span class="font-size-value">{{ mdFontSize }}px</span>
-        <button
-          class="font-size-btn"
-          :disabled="mdFontSize >= MD_FONT_MAX"
-          @click="setMdFontSize(mdFontSize + 1)"
-        >+</button>
-      </div>
-
-      <div class="settings-dropdown__section">界面布局</div>
-      <button class="settings-dropdown__item" @click="openTopBarOrderModal">
-        <span class="settings-dropdown__check">↕</span>
-        <span class="settings-dropdown__item-label">顶栏排序</span>
-        <span class="settings-dropdown__chevron">›</span>
-      </button>
     </div>
 
     <TopBarOrderModal
@@ -345,7 +320,6 @@ import ConfigWorkspace from './components/config/ConfigWorkspace.vue'
 import TerminalManager from './components/terminal/TerminalManager.vue'
 import ProjectPanel from './components/project/ProjectPanel.vue'
 import OrchestrationManager from './components/orchestration/OrchestrationManager.vue'
-import StatusBar from './components/common/StatusBar.vue'
 import TopBarOrderModal from './components/common/TopBarOrderModal.vue'
 import { useClaudeStore } from './stores/claude'
 import { useClaudeObserverStore } from './stores/claudeObserver'
@@ -355,7 +329,7 @@ import { useSettingsPopover } from './composables/useSettingsPopover'
 import { useProjectStore } from './stores/project'
 import { useCliRuntimeStore } from './stores/cliRuntime'
 import { useConfigWorkspaceStore } from './stores/configWorkspace'
-import { topBarItemLabel, useTopBarStore, type TopBarItem } from './stores/topBar'
+import { useTopBarStore } from './stores/topBar'
 import { usePlatform } from './composables/usePlatform'
 import {
   CLI_DESCRIPTORS,
@@ -395,6 +369,7 @@ const topBarStore = useTopBarStore()
 const { isWindows, isMacOS } = usePlatform()
 const terminalManagerRef = ref<InstanceType<typeof TerminalManager> | null>(null)
 const topBarOrderModalOpen = ref(false)
+const sharedSidebarHeaderWidth = ref(285)
 const dependencyState = ref<DependencyGateState>('checking')
 const dependencyResult = ref<DependencyCheckResult | null>(null)
 const dependencyActionMessage = ref('')
@@ -405,21 +380,21 @@ let cliOpenRequestId = 0
 const MIN_CLI_WORKSPACE_GATE_MS = 320
 
 const appReady = computed(() => dependencyState.value === 'ready')
-const activeCliKind = computed<CliKind | null>(() => isCliKind(mainTab.value) ? mainTab.value : null)
-const activeCliStatus = computed(() => activeCliKind.value
-  ? cliRuntimeStore.statuses[activeCliKind.value]
-  : null)
-// The workspace panel must stay mounted on non-CLI tabs (e.g. config);
-// fall back to the kind persisted in the project store.
-const workspaceCliKind = computed<CliKind>(() => activeCliKind.value ?? projectStore.activeCliKind)
+const workspaceMode = computed<'config' | 'project' | 'other'>(() => {
+  if (mainTab.value === 'config') return 'config'
+  return isCliKind(mainTab.value) ? 'project' : 'other'
+})
+const activeCliKind = computed<CliKind>(() => configWorkspaceStore.activeKind)
+const activeCliStatus = computed(() => cliRuntimeStore.statuses[activeCliKind.value] ?? null)
+// Keep the selected frontend stable while configuration replaces the project
+// workspace. This lets both modes show the same CLI without a second switcher.
+const workspaceCliKind = computed<CliKind>(() => activeCliKind.value)
 const workspaceCliStatus = computed(() => cliRuntimeStore.statuses[workspaceCliKind.value] ?? null)
-const activeCliLabel = computed(() => activeCliKind.value
-  ? CLI_DESCRIPTORS[activeCliKind.value].label
-  : '')
-const cliWorkspacePreparing = computed(() => !!activeCliKind.value
+const activeCliLabel = computed(() => CLI_DESCRIPTORS[activeCliKind.value].label)
+const cliWorkspacePreparing = computed(() => workspaceMode.value === 'project'
   && cliWorkspacePreparation.value?.kind === activeCliKind.value)
 const cliGateVisible = computed(() => appReady.value
-  && !!activeCliKind.value
+  && workspaceMode.value === 'project'
   && (cliWorkspacePreparing.value || activeCliStatus.value?.state !== 'ready'))
 const cliGateChecking = computed(() => cliWorkspacePreparing.value
   || !activeCliStatus.value
@@ -495,14 +470,22 @@ function openConfigTab() {
   mainTab.value = 'config'
 }
 
-async function openTopBarItem(item: TopBarItem) {
-  if (mainTab.value === item) return
+async function openProjectTab() {
+  if (workspaceMode.value === 'project') return
+  await openCliTab(activeCliKind.value)
+}
 
-  if (item === 'config') {
-    openConfigTab()
+async function selectCliKind(kind: CliKind) {
+  if (kind === activeCliKind.value && workspaceMode.value !== 'other') return
+
+  if (workspaceMode.value === 'config') {
+    if (!(await configWorkspaceStore.selectKind(kind))) return
+    projectStore.setActiveCliKind(kind)
+    await cliRuntimeStore.check(kind)
     return
   }
-  await openCliTab(item)
+
+  await openCliTab(kind)
 }
 
 // ── Window controls ────────────────────────────────────────────────────────
@@ -628,6 +611,35 @@ function requestRestartAfterManualInstall() {
 // ── Theme ──────────────────────────────────────────────────────────────────
 const { showSettings } = useSettingsPopover()
 const theme = ref<'light' | 'dark'>('light')
+type SettingsSubmenu = 'theme' | 'project-drop-path' | 'busy-input' | 'font-size'
+const activeSettingsSubmenu = ref<SettingsSubmenu | null>(null)
+const settingsMenuRef = ref<HTMLElement | null>(null)
+const settingsSubmenuTop = ref(0)
+const settingsSubmenuBottom = ref(0)
+
+function toggleSettingsSubmenu(submenu: SettingsSubmenu, event: MouseEvent) {
+  if (activeSettingsSubmenu.value === submenu) {
+    activeSettingsSubmenu.value = null
+    return
+  }
+
+  const trigger = event.currentTarget as HTMLElement
+  const menu = settingsMenuRef.value
+  if (menu) {
+    const menuBounds = menu.getBoundingClientRect()
+    const triggerBounds = trigger.getBoundingClientRect()
+    settingsSubmenuTop.value = triggerBounds.top - menuBounds.top
+    settingsSubmenuBottom.value = menuBounds.bottom - triggerBounds.bottom
+  } else {
+    settingsSubmenuTop.value = 0
+    settingsSubmenuBottom.value = 0
+  }
+  activeSettingsSubmenu.value = submenu
+}
+
+watch(showSettings, (visible) => {
+  if (!visible) activeSettingsSubmenu.value = null
+})
 
 function applyTheme(t: 'light' | 'dark') {
   theme.value = t
@@ -704,8 +716,15 @@ function onDocumentClick(e: MouseEvent) {
 
 async function openCliTab(kind: CliKind, forceCheck = false) {
   if (!appReady.value || cliRuntimeStore.checking[kind]) return
-  if (mainTab.value === 'config'
-    && !(await configWorkspaceStore.confirmDiscardActiveChanges(`进入 ${CLI_DESCRIPTORS[kind].label} 工作区`))) {
+  if (workspaceMode.value === 'config') {
+    if (kind === activeCliKind.value) {
+      if (!(await configWorkspaceStore.confirmDiscardActiveChanges(`进入 ${CLI_DESCRIPTORS[kind].label} 项目`))) {
+        return
+      }
+    } else if (!(await configWorkspaceStore.selectKind(kind))) {
+      return
+    }
+  } else if (kind !== activeCliKind.value && !(await configWorkspaceStore.selectKind(kind))) {
     return
   }
   const requestId = ++cliOpenRequestId
@@ -752,7 +771,6 @@ async function openClaudeTab() {
 }
 
 async function retryCliGateCheck() {
-  if (!activeCliKind.value) return
   await openCliTab(activeCliKind.value, true)
 }
 
@@ -814,40 +832,6 @@ watch(mainTab, (tab) => {
   invoke('save_last_active_main_tab', { tab }).catch(() => {})
 })
 
-// ── Status bar ─────────────────────────────────────────────────────────────
-const claudeConfigDir = ref<string>('')
-
-const statusItems = computed(() => {
-  if (mainTab.value === 'terminal') {
-    return [
-      { label: '模式', value: '终端' },
-      { label: '标签页', value: String(terminalStore.terminalTabs.length) },
-    ]
-  }
-  if (activeCliKind.value) {
-    return [
-      { label: '模式', value: CLI_DESCRIPTORS[activeCliKind.value].label },
-      { label: '项目', value: projectStore.activeProject?.name ?? '未选择' },
-      { label: '会话', value: projectStore.activeSession?.name ?? '未选择' },
-    ]
-  }
-  if (mainTab.value === 'orchestration') {
-    return [
-      { label: '模式', value: '编排' },
-      { label: '标签页', value: String(terminalStore.tabs.length) },
-    ]
-  }
-  return [
-    { label: '工具', value: CLI_DESCRIPTORS.claude.label },
-    ...(claudeStore.claudeExePath
-      ? [{ label: '路径', value: claudeStore.claudeExePath }]
-      : [{ label: '状态', value: '未安装' }]),
-    ...(claudeConfigDir.value
-      ? [{ label: '配置目录', value: claudeConfigDir.value }]
-      : []),
-  ]
-})
-
 // ── Window size persistence ────────────────────────────────────────────────
 interface WindowState {
   width?: number
@@ -896,11 +880,15 @@ async function loadLastMainTab() {
   try {
     const savedTab = await invoke<string>('load_last_active_main_tab')
     const tab = normalizePersistedMainTab(savedTab)
-    if (tab === 'claude' || tab === 'codex' || tab === 'opencode' || tab === 'config') {
+    if (isCliKind(tab)) {
+      await configWorkspaceStore.selectKind(tab)
       mainTab.value = tab
+    } else if (tab === 'config') {
+      mainTab.value = 'config'
     } else if (tab === 'terminal' || tab === 'orchestration') {
       mainTab.value = 'config'
     }
+    projectStore.setActiveCliKind(activeCliKind.value)
   } catch {
     // keep default
   }
@@ -984,14 +972,8 @@ async function initializeReadyApp() {
   if (readyAppInitialized) return
   readyAppInitialized = true
 
-  try {
-    claudeConfigDir.value = await invoke<string>('get_claude_config_dir')
-  } catch {
-    // status bar can omit the directory when the app-data location is unavailable
-  }
-
-  if (isCliKind(mainTab.value)) {
-    await openCliTab(mainTab.value)
+  if (workspaceMode.value === 'project') {
+    await openCliTab(activeCliKind.value)
   }
 }
 
@@ -1073,29 +1055,86 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: flex-start;
-  gap: 6px;
-  padding: 0 8px;
+  padding: 0 8px 0 0;
   background-color: var(--card);
-  border-bottom: 1px solid var(--separator);
   user-select: none;
 }
 
-.title-bar__left {
+.title-bar__workspace-section {
+  width: var(--project-nav-width, 219px);
+  flex: 0 0 var(--project-nav-width, 219px);
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border-right: 1px solid var(--separator);
+  background: var(--bg);
+}
+
+.title-bar__workspace-section--collapsed {
+  gap: 0;
+}
+
+.title-bar__sidebar-slot {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+}
+
+.title-bar__mode-tabs {
+  min-width: 0;
   flex: 0 0 auto;
   display: flex;
   align-items: center;
+  gap: 3px;
 }
 
-.title-bar__left:empty {
-  display: none;
+.title-bar__mode-tab {
+  position: relative;
+  height: 28px;
+  min-width: 44px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-base);
+  font-size: var(--font-size-base);
+  cursor: pointer;
+}
+
+.title-bar__mode-tab:hover {
+  background-color: var(--tab-bg);
+  color: var(--text-primary);
+}
+
+.title-bar__mode-tab.active {
+  background-color: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+
+.title-bar__dirty {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ff9500;
 }
 
 .title-bar__tabs {
-  flex: 0 0 auto;
+  min-width: 0;
+  flex: 1;
+  align-self: stretch;
   display: flex;
   align-items: center;
   justify-content: flex-start;
   gap: 4px;
+  padding-left: 8px;
+  border-bottom: 1px solid var(--separator);
 }
 
 .title-bar__tab {
@@ -1146,6 +1185,7 @@ onBeforeUnmount(() => {
 }
 
 .title-bar__icon-btn:disabled,
+.title-bar__mode-tab:disabled,
 .title-bar__tab:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -1153,11 +1193,13 @@ onBeforeUnmount(() => {
 
 .title-bar__controls {
   flex: 0 0 auto;
+  align-self: stretch;
   margin-left: auto;
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 4px;
+  border-bottom: 1px solid var(--separator);
 }
 
 .title-bar__control {
@@ -1254,17 +1296,43 @@ onBeforeUnmount(() => {
   position: absolute;
   left: 8px;
   bottom: 34px;
-  min-width: 250px;
-  background-color: var(--card);
-  border-radius: var(--radius);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15), 0 0 0 1px var(--separator);
-  padding: 6px;
   z-index: 1000;
   animation: dropdown-in 0.12s ease;
 }
 
-[data-theme="dark"] .settings-popover {
+.settings-dropdown__menu,
+.settings-dropdown__submenu {
+  background-color: var(--card);
+  border: 1px solid var(--input-border);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+}
+
+[data-theme="dark"] .settings-dropdown__menu,
+[data-theme="dark"] .settings-dropdown__submenu {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), 0 0 0 1px var(--separator);
+}
+
+.settings-dropdown__menu {
+  display: flex;
+  width: 270px;
+  max-height: calc(100vh - 44px);
+  flex-direction: column;
+  padding: 6px;
+  overflow-y: auto;
+}
+
+.settings-dropdown__submenu {
+  position: absolute;
+  left: calc(100% + 7px);
+  display: flex;
+  width: max-content;
+  min-width: 230px;
+  max-width: min(360px, calc(100vw - 301px));
+  max-height: min(420px, calc(100vh - 44px));
+  flex-direction: column;
+  padding: 5px;
+  overflow-y: auto;
 }
 
 @keyframes dropdown-in {
@@ -1303,6 +1371,52 @@ onBeforeUnmount(() => {
   text-align: left;
 }
 
+.settings-dropdown__group-trigger {
+  display: flex;
+  width: 100%;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  background: transparent;
+  font-family: var(--font-base);
+  font-size: var(--font-size-base);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+
+.settings-dropdown__group-trigger:hover,
+.settings-dropdown__group-trigger.is-open {
+  background-color: var(--tab-bg);
+}
+
+.settings-dropdown__group-value {
+  flex: 1;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--font-size-small);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-dropdown__options {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+}
+
+.settings-dropdown__options--font {
+  gap: 3px;
+}
+
 .settings-dropdown__item:hover {
   background-color: var(--tab-bg);
 }
@@ -1339,13 +1453,44 @@ onBeforeUnmount(() => {
 }
 
 .settings-dropdown__chevron {
+  flex: 0 0 auto;
   color: var(--text-secondary);
   font-size: 18px;
   line-height: 1;
 }
 
-.font-size-row {
+.settings-dropdown__group-trigger svg {
+  flex: 0 0 13px;
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+  transition: transform 140ms ease;
+}
+
+.settings-dropdown__group-trigger.is-open svg {
+  transform: rotate(180deg);
+}
+
+.settings-dropdown__font-row {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  padding: 4px 8px;
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+}
+
+.font-size-row {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
 }
 
 .font-size-btn {

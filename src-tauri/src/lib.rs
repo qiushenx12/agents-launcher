@@ -106,6 +106,8 @@ pub fn run() {
             // settings_manager commands
             settings_manager::load_claude_settings,
             settings_manager::save_claude_settings,
+            settings_manager::load_claude_default_permission_mode,
+            settings_manager::save_claude_default_permission_mode,
             settings_manager::load_claude_env,
             settings_manager::save_claude_env,
             // persistent_state commands
@@ -158,6 +160,7 @@ pub fn run() {
             // utils commands
             utils::get_claude_config_dir,
             utils::get_home_dir,
+            utils::list_claude_skills,
             utils::open_directory,
             utils::open_env_vars_dialog,
             utils::get_current_env_vars,

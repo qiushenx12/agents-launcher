@@ -14,8 +14,8 @@
       >
         <header class="top-bar-order-modal__header">
           <div>
-            <h2 id="top-bar-order-title">顶栏排序</h2>
-            <p>拖动或使用箭头排序；隐藏仅影响顶栏，配置页面中的三个 CLI 入口始终保留。</p>
+            <h2 id="top-bar-order-title">前端入口排序</h2>
+            <p>调整终端区域上方三个前端入口的顺序；配置和项目切换固定在左侧。</p>
           </div>
           <button
             type="button"
@@ -37,7 +37,6 @@
             :class="{
               'top-bar-order-modal__item--dragging': draggingIndex === index,
               'top-bar-order-modal__item--over': draggingIndex !== null && overIndex === index,
-              'top-bar-order-modal__item--hidden': isHidden(item),
             }"
           >
             <button
@@ -52,16 +51,6 @@
             </button>
             <span class="top-bar-order-modal__position">{{ index + 1 }}</span>
             <span class="top-bar-order-modal__label">{{ topBarItemLabel(item) }}</span>
-            <button
-              type="button"
-              class="top-bar-order-modal__visibility"
-              :class="{ active: isHidden(item) }"
-              :disabled="item === 'config'"
-              :title="item === 'config' ? '配置入口始终显示' : isHidden(item) ? '在顶栏显示' : '从顶栏隐藏'"
-              @click="toggleHidden(item)"
-            >
-              {{ item === 'config' ? '固定显示' : isHidden(item) ? '显示' : '隐藏' }}
-            </button>
             <div class="top-bar-order-modal__move-actions">
               <button
                 type="button"
@@ -105,12 +94,11 @@
 import { ref, watch } from 'vue'
 import { useDragReorder } from '@/composables/useDragReorder'
 import {
-  DEFAULT_TOP_BAR_ORDER,
   topBarItemLabel,
   useTopBarStore,
   type TopBarItem,
 } from '@/stores/topBar'
-import type { CliKind } from '@/types/cli'
+import { CLI_KINDS, type CliKind } from '@/types/cli'
 
 const props = defineProps<{
   visible: boolean
@@ -121,8 +109,7 @@ const emit = defineEmits<{
 }>()
 
 const store = useTopBarStore()
-const draftOrder = ref<TopBarItem[]>([...store.order])
-const draftHidden = ref<CliKind[]>([...store.hidden])
+const draftOrder = ref<CliKind[]>([...store.cliOrder])
 const saving = ref(false)
 const errorMessage = ref('')
 
@@ -143,27 +130,16 @@ function moveItem(index: number, offset: -1 | 1) {
 }
 
 function resetOrder() {
-  draftOrder.value = [...DEFAULT_TOP_BAR_ORDER]
-  draftHidden.value = []
+  draftOrder.value = [...CLI_KINDS]
   errorMessage.value = ''
-}
-
-function isHidden(item: TopBarItem) {
-  return item !== 'config' && draftHidden.value.includes(item)
-}
-
-function toggleHidden(item: TopBarItem) {
-  if (item === 'config') return
-  draftHidden.value = draftHidden.value.includes(item)
-    ? draftHidden.value.filter((kind) => kind !== item)
-    : [...draftHidden.value, item]
 }
 
 async function save() {
   saving.value = true
   errorMessage.value = ''
   try {
-    await store.saveLayout(draftOrder.value, draftHidden.value)
+    const nextOrder: TopBarItem[] = ['config', ...draftOrder.value]
+    await store.saveLayout(nextOrder, [])
     emit('close')
   } catch (error) {
     errorMessage.value = `保存失败：${error}`
@@ -174,8 +150,7 @@ async function save() {
 
 watch(() => props.visible, (visible) => {
   if (!visible) return
-  draftOrder.value = [...store.order]
-  draftHidden.value = [...store.hidden]
+  draftOrder.value = [...store.cliOrder]
   errorMessage.value = ''
 })
 </script>
@@ -266,11 +241,6 @@ watch(() => props.visible, (visible) => {
   border-color: var(--primary);
 }
 
-.top-bar-order-modal__item--hidden .top-bar-order-modal__label,
-.top-bar-order-modal__item--hidden .top-bar-order-modal__position {
-  opacity: 0.5;
-}
-
 .top-bar-order-modal__drag-handle {
   width: 28px;
   height: 28px;
@@ -314,34 +284,6 @@ watch(() => props.visible, (visible) => {
   min-width: 0;
   flex: 1;
   font-weight: 600;
-}
-
-.top-bar-order-modal__visibility {
-  min-width: 58px;
-  height: 28px;
-  padding: 0 9px;
-  border: 1px solid var(--separator);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  color: var(--text-secondary);
-  cursor: pointer;
-  font: inherit;
-  font-size: var(--font-size-small);
-}
-
-.top-bar-order-modal__visibility:hover:not(:disabled) {
-  color: var(--text-primary);
-  background: var(--tab-bg);
-}
-
-.top-bar-order-modal__visibility.active {
-  color: var(--primary);
-  border-color: var(--primary);
-}
-
-.top-bar-order-modal__visibility:disabled {
-  opacity: 0.55;
-  cursor: default;
 }
 
 .top-bar-order-modal__move-actions {

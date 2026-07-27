@@ -40,7 +40,7 @@
 <script setup lang="ts">
 import { onMounted, watch } from 'vue'
 import { useClaudeStore } from '@/stores/claude'
-import { useResizablePanes } from '@/composables/useResizablePanes'
+import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
 import ConfigList from './ConfigList.vue'
 import ConfigEditor from './ConfigEditor.vue'
 import { useSettingsPopover } from '@/composables/useSettingsPopover'
@@ -51,12 +51,13 @@ const store = useClaudeStore()
 const props = defineProps<{
   sidebarCollapsed?: boolean
 }>()
-const { leftWidth, isDragging, onMouseDown, loadSizes, saveSizes } = useResizablePanes(280, 200, 400)
-
-const PANE_KEY = 'claude-panel'
+const emit = defineEmits<{
+  (event: 'left-width-change', width: number): void
+}>()
+const { leftWidth, isDragging, onMouseDown, loadWidth } = useSharedLeftSidebarWidth()
 
 onMounted(async () => {
-  await loadSizes(PANE_KEY)
+  await loadWidth()
   await Promise.all([
     store.loadConfigs(),
     store.loadSettings(),
@@ -67,10 +68,9 @@ onMounted(async () => {
   await store.loadSessions()
 })
 
-// Save pane width when dragging ends — watch isDragging transition to false
-watch(isDragging, (val) => {
-  if (!val) saveSizes(PANE_KEY)
-})
+watch(leftWidth, (width) => {
+  emit('left-width-change', width)
+}, { immediate: true })
 </script>
 
 <style scoped>
@@ -105,7 +105,6 @@ watch(isDragging, (val) => {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--separator);
   background-color: var(--bg);
   padding: 12px;
   gap: 8px;

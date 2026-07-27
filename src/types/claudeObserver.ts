@@ -26,6 +26,7 @@ export interface ClaudePromptReceipt {
   text: string
   kind: 'direct' | 'native-queue'
   queuedPromptId?: string
+  terminalLogBaseline?: string
 }
 
 export interface ClaudeAgentEvent {
@@ -57,10 +58,18 @@ export interface ClaudeModelSwitchConfirmPrompt {
   selectedIndex: number
 }
 
+export interface ClaudePlanApprovalPrompt {
+  kind: 'planApproval'
+  prompt: string
+  options: string[]
+  selectedIndex: number
+}
+
 export type ClaudeTerminalPrompt =
   | ClaudeWorkspaceTrustPrompt
   | ClaudePluginInstallPrompt
   | ClaudeModelSwitchConfirmPrompt
+  | ClaudePlanApprovalPrompt
 
 export interface ClaudeActivityStatus {
   label: string
@@ -81,6 +90,7 @@ export interface ClaudeObserverStatus {
   terminalPrompt?: ClaudeTerminalPrompt | null
   activityStatus?: ClaudeActivityStatus | null
   currentModel?: string | null
+  permissionMode?: string | null
 }
 
 export interface ClaudeObserverSnapshot extends ClaudeObserverStatus {
@@ -117,7 +127,10 @@ export interface ClaudeConversationState {
   loading: boolean
   terminalPrompt?: ClaudeTerminalPrompt | null
   activityStatus?: ClaudeActivityStatus | null
+  compactCompletionRevision: number
   currentModel?: string
+  permissionMode?: string
+  pendingPermissionMode?: 'bypassPermissions' | 'auto' | 'default' | 'acceptEdits' | 'plan'
   currentContext?: ClaudeModelContext
   queuedPrompts: ClaudeQueuedPrompt[]
   queueActionPending: boolean

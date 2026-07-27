@@ -1,32 +1,21 @@
 <template>
   <div class="config-workspace">
-    <header class="config-workspace__header">
-      <nav class="config-workspace__tabs" role="tablist" aria-label="CLI 配置类型">
-        <button
-          v-for="kind in workspaceStore.availableKinds"
-          :key="kind"
-          type="button"
-          class="config-workspace__tab"
-          :class="{ 'config-workspace__tab--active': workspaceStore.activeKind === kind }"
-          :aria-selected="workspaceStore.activeKind === kind"
-          role="tab"
-          @click="selectKind(kind)"
-        >
-          {{ CLI_DESCRIPTORS[kind].label }}
-        </button>
-      </nav>
-      <span v-if="workspaceStore.activeHasUnsavedChanges" class="config-workspace__dirty">
-        ● 未保存
-      </span>
-    </header>
-
     <div class="config-workspace__body">
       <CliClaudePanel
         v-show="workspaceStore.activeKind === 'claude'"
         :sidebar-collapsed="sidebarCollapsed"
+        @left-width-change="emit('left-width-change', $event)"
       />
-      <CliCodexPanel v-show="workspaceStore.activeKind === 'codex'" />
-      <CliOpencodePanel v-show="workspaceStore.activeKind === 'opencode'" />
+      <CliCodexPanel
+        v-show="workspaceStore.activeKind === 'codex'"
+        :sidebar-collapsed="sidebarCollapsed"
+        @left-width-change="emit('left-width-change', $event)"
+      />
+      <CliOpencodePanel
+        v-show="workspaceStore.activeKind === 'opencode'"
+        :sidebar-collapsed="sidebarCollapsed"
+        @left-width-change="emit('left-width-change', $event)"
+      />
     </div>
 
     <Teleport to="body">
@@ -94,7 +83,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, watch } from 'vue'
-import { CLI_DESCRIPTORS, type CliKind } from '@/types/cli'
+import { CLI_DESCRIPTORS } from '@/types/cli'
 import { useClaudeStore } from '@/stores/claude'
 import { useCodexConfigStore } from '@/stores/codexConfig'
 import { useOpencodeConfigStore } from '@/stores/opencodeConfig'
@@ -109,6 +98,9 @@ import ConfigStatusBanner from './ConfigStatusBanner.vue'
 
 defineProps<{
   sidebarCollapsed?: boolean
+}>()
+const emit = defineEmits<{
+  (event: 'left-width-change', width: number): void
 }>()
 
 const workspaceStore = useConfigWorkspaceStore()
@@ -129,7 +121,6 @@ const unregisterOpencodeGuard = workspaceStore.registerDraftGuard('opencode', {
   isDirty: () => opencodeStore.isDirty,
   discard: () => opencodeStore.discardChanges(),
 })
-
 const activeDescriptor = computed(() => CLI_DESCRIPTORS[workspaceStore.activeKind])
 const activeStatus = computed(() => runtimeStore.statuses[workspaceStore.activeKind])
 const statusTone = computed<'info' | 'success' | 'warning' | 'error'>(() => {
@@ -231,11 +222,6 @@ async function checkActive(force = false) {
   }
 }
 
-async function selectKind(kind: CliKind) {
-  if (!(await workspaceStore.selectKind(kind))) return
-  await runtimeStore.check(kind)
-}
-
 watch(() => workspaceStore.preflightVisible, (visible) => {
   if (visible) checkActive(true).catch(() => {})
 })
@@ -255,57 +241,6 @@ onBeforeUnmount(() => {
   flex-direction: column;
   min-height: 0;
   background: var(--bg);
-}
-
-.config-workspace__header {
-  min-height: 46px;
-  padding: 8px 14px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex: 0 0 auto;
-  border-bottom: 1px solid var(--separator);
-  background: var(--card);
-}
-
-.config-workspace__tabs {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px;
-  border-radius: var(--radius);
-  background: var(--tab-bg);
-}
-
-.config-workspace__tab {
-  height: 28px;
-  padding: 0 14px;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  border: 0;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  background: transparent;
-  cursor: pointer;
-  font: inherit;
-  font-weight: 500;
-}
-
-.config-workspace__tab:hover {
-  color: var(--text-primary);
-}
-
-.config-workspace__tab--active {
-  color: var(--text-primary);
-  background: var(--tab-active);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-}
-
-.config-workspace__dirty {
-  color: #ff9500;
-  font-size: var(--font-size-small);
 }
 
 .config-workspace__body {

@@ -58,6 +58,7 @@ pub struct ClaudeObserverStatus {
     pub terminal_prompt: Option<ClaudeTerminalPrompt>,
     pub activity_status: Option<ClaudeActivityStatus>,
     pub current_model: Option<String>,
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -74,6 +75,11 @@ pub enum ClaudeTerminalPrompt {
         options: Vec<String>,
     },
     ModelSwitchConfirm {
+        prompt: String,
+        options: Vec<String>,
+        selected_index: usize,
+    },
+    PlanApproval {
         prompt: String,
         options: Vec<String>,
         selected_index: usize,
@@ -105,6 +111,7 @@ pub struct ClaudeObserverSnapshot {
     pub terminal_prompt: Option<ClaudeTerminalPrompt>,
     pub activity_status: Option<ClaudeActivityStatus>,
     pub current_model: Option<String>,
+    pub permission_mode: Option<String>,
 }
 
 pub struct PreparedCapture {
@@ -382,6 +389,7 @@ struct CaptureState {
     terminal_prompt: Option<ClaudeTerminalPrompt>,
     activity_status: Option<ClaudeActivityStatus>,
     current_model: Option<String>,
+    permission_mode: Option<String>,
     activity_expected: bool,
     last_screen_activity_signature: Option<String>,
     session_started: bool,
@@ -537,6 +545,7 @@ impl ClaudeObserverManager {
             terminal_prompt: None,
             activity_status: None,
             current_model: None,
+            permission_mode: Some("? for shortcuts".to_string()),
             activity_expected: false,
             last_screen_activity_signature: None,
             session_started: false,
@@ -591,6 +600,7 @@ impl ClaudeObserverManager {
                 terminal_prompt: None,
                 activity_status: None,
                 current_model: None,
+                permission_mode: Some("? for shortcuts".to_string()),
             },
         );
     }
@@ -959,6 +969,7 @@ impl ClaudeObserverManager {
         let detected_prompt = detect_terminal_prompt(&screen_update.latest_screen);
         let detected_activity = detect_claude_activity_status(&screen_update.latest_screen);
         let detected_current_model = detect_claude_current_model(&screen_update.latest_screen);
+        let detected_permission_mode = detect_claude_permission_mode(&screen_update.latest_screen);
         let detected_activity_row = detected_activity.as_ref().map(|detected| detected.row);
         let detected_activity_status = detected_activity.map(|detected| detected.status);
         let (observer_status, suppress_activity_diff_row) = self
@@ -972,7 +983,11 @@ impl ClaudeObserverManager {
                     detected_activity_row,
                     detected_activity_status.as_ref(),
                 );
-                let detected_activity_status = if capture.activity_expected {
+                let detected_activity_status = if capture.activity_expected
+                    || detected_activity_status
+                        .as_ref()
+                        .is_some_and(is_claude_compaction_activity)
+                {
                     detected_activity_status
                 } else {
                     None
@@ -983,6 +998,7 @@ impl ClaudeObserverManager {
                             prompt,
                             ClaudeTerminalPrompt::PluginInstall { .. }
                                 | ClaudeTerminalPrompt::ModelSwitchConfirm { .. }
+                                | ClaudeTerminalPrompt::PlanApproval { .. }
                         )
                     })
                 } else {
@@ -993,11 +1009,21 @@ impl ClaudeObserverManager {
                 let current_model_changed = detected_current_model
                     .as_ref()
                     .is_some_and(|model| capture.current_model.as_ref() != Some(model));
-                let observer_status = if prompt_changed || activity_changed || current_model_changed {
+                let permission_mode_changed = detected_permission_mode
+                    .as_ref()
+                    .is_some_and(|mode| capture.permission_mode.as_ref() != Some(mode));
+                let observer_status = if prompt_changed
+                    || activity_changed
+                    || current_model_changed
+                    || permission_mode_changed
+                {
                     capture.terminal_prompt = detected_prompt;
                     capture.activity_status = detected_activity_status;
                     if detected_current_model.is_some() {
                         capture.current_model = detected_current_model;
+                    }
+                    if detected_permission_mode.is_some() {
+                        capture.permission_mode = detected_permission_mode;
                     }
                     capture.status_revision = capture.status_revision.saturating_add(1);
                     capture.tab_id.map(|_| status_for_capture(capture, true))
@@ -1183,8 +1209,13 @@ impl ClaudeObserverManager {
                 terminal_prompt: None,
                 activity_status: None,
                 current_model: None,
+                permission_mode: Some("? for shortcuts".to_string()),
             };
         };
+        // A user may return from the raw terminal immediately after cycling a mode.
+        // Force the most recent terminal screen through the parser before exposing
+        // the snapshot, so its footer cannot be replaced by an older observation.
+        self.flush_one(&capture_id, true);
         let capture_context = {
             let Ok(captures) = self.captures.lock() else {
                 return unavailable_snapshot(tab_id, "Claude 观察器状态暂时不可读。".into());
@@ -1202,6 +1233,7 @@ impl ClaudeObserverManager {
                 capture.terminal_prompt.clone(),
                 capture.activity_status.clone(),
                 capture.current_model.clone(),
+                capture.permission_mode.clone(),
             )
         };
         let (
@@ -1214,6 +1246,7 @@ impl ClaudeObserverManager {
             terminal_prompt,
             activity_status,
             current_model,
+            permission_mode,
         ) = capture_context;
         let terminal_log =
             read_last_lines(&log_dir.join("terminal-output.txt"), 400).unwrap_or_default();
@@ -1230,6 +1263,7 @@ impl ClaudeObserverManager {
             terminal_prompt,
             activity_status,
             current_model,
+            permission_mode,
         }
     }
 }
@@ -1550,18 +1584,32 @@ fn parse_transcript_messages(contents: &str) -> Vec<HistoricalEvent> {
         let Some(kind) = record.get("type").and_then(Value::as_str) else {
             continue;
         };
-        match kind {
-            "user" | "assistant" => {}
-            _ => continue,
-        }
-        let Some(message) = record.get("message") else {
-            continue;
-        };
         let received_at = record
             .get("timestamp")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+        if kind == "system"
+            && record.get("subtype").and_then(Value::as_str) == Some("local_command")
+        {
+            if let Some(content) = record.get("content").and_then(Value::as_str) {
+                if let Some(event) = historical_local_command_event(content, &received_at) {
+                    events.push_back(event);
+                    while events.len() > MAX_HISTORY_EVENTS {
+                        events.pop_front();
+                    }
+                }
+            }
+            continue;
+        }
+
+        if !matches!(kind, "user" | "assistant") {
+            continue;
+        }
+        let Some(message) = record.get("message") else {
+            continue;
+        };
 
         for event in transcript_record_events(kind, message, &received_at, &mut tool_names) {
             events.push_back(event);
@@ -1664,6 +1712,19 @@ fn historical_text_event(kind: &str, text: &str, received_at: &str) -> Option<Hi
         } else {
             "HistoricalAssistantMessage"
         },
+        received_at: received_at.to_string(),
+        payload: json!({ "text": text, "historical": true }),
+    })
+}
+
+fn historical_local_command_event(text: &str, received_at: &str) -> Option<HistoricalEvent> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let text: String = text.chars().take(MAX_HISTORY_TEXT_CHARS).collect();
+    Some(HistoricalEvent {
+        event_name: "HistoricalLocalCommand",
         received_at: received_at.to_string(),
         payload: json!({ "text": text, "historical": true }),
     })
@@ -1798,6 +1859,7 @@ fn detect_terminal_prompt(screen: &str) -> Option<ClaudeTerminalPrompt> {
         .collect();
     detect_workspace_trust_prompt(&lines)
         .or_else(|| detect_model_switch_confirm_prompt(&lines))
+        .or_else(|| detect_plan_approval_prompt(&lines))
         .or_else(|| detect_plugin_install_prompt(&lines))
 }
 
@@ -1867,6 +1929,73 @@ fn detect_model_switch_confirm_prompt(lines: &[&str]) -> Option<ClaudeTerminalPr
         options,
         selected_index,
     })
+}
+
+fn detect_plan_approval_prompt(lines: &[&str]) -> Option<ClaudeTerminalPrompt> {
+    let footer_index = lines
+        .iter()
+        .rposition(|line| is_terminal_selection_footer(line))?;
+    if footer_index + 1 != lines.len() || footer_index < 2 {
+        return None;
+    }
+
+    for option_start in (0..footer_index).rev() {
+        let Some((first_number, first_label)) = parse_terminal_option(lines[option_start]) else {
+            continue;
+        };
+        if first_number != 1 {
+            continue;
+        }
+
+        let mut options = vec![first_label];
+        let mut next_number = 2;
+        let mut index = option_start + 1;
+        while index < footer_index {
+            let Some((number, label)) = parse_terminal_option(lines[index]) else {
+                break;
+            };
+            if number != next_number {
+                break;
+            }
+            options.push(label);
+            next_number += 1;
+            index += 1;
+        }
+        if options.len() < 2 || index != footer_index {
+            continue;
+        }
+
+        let context_start = option_start.saturating_sub(10);
+        let context = &lines[context_start..option_start];
+        let context_text = context.join(" ");
+        let is_plan_approval = contains_ascii_case_insensitive(&context_text, "plan")
+            && (contains_ascii_case_insensitive(&context_text, "ready to code")
+                || contains_ascii_case_insensitive(&context_text, "start coding")
+                || contains_ascii_case_insensitive(&context_text, "proceed")
+                || contains_ascii_case_insensitive(&context_text, "implement"));
+        if !is_plan_approval {
+            continue;
+        }
+
+        let selected_index = lines[option_start..footer_index]
+            .iter()
+            .position(|line| has_terminal_selection_marker(line))
+            .unwrap_or(0);
+        if selected_index >= options.len() {
+            continue;
+        }
+        let prompt = context
+            .join(" ")
+            .chars()
+            .take(360)
+            .collect::<String>();
+        return Some(ClaudeTerminalPrompt::PlanApproval {
+            prompt,
+            options,
+            selected_index,
+        });
+    }
+    None
 }
 
 fn detect_workspace_trust_prompt(lines: &[&str]) -> Option<ClaudeTerminalPrompt> {
@@ -2153,12 +2282,60 @@ fn detect_claude_activity_status(screen: &str) -> Option<DetectedClaudeActivityS
         })
 }
 
+fn is_claude_compaction_activity(status: &ClaudeActivityStatus) -> bool {
+    status.label.eq_ignore_ascii_case("Compacting conversation")
+}
+
 fn detect_claude_current_model(screen: &str) -> Option<String> {
     screen
         .lines()
         .rev()
         .take(12)
         .find_map(parse_claude_current_model_line)
+}
+
+fn detect_claude_permission_mode(screen: &str) -> Option<String> {
+    screen.lines().rev().take(12).find_map(|line| {
+        let normalized = line.trim().to_ascii_lowercase();
+        if !(normalized.contains("shift+tab") || normalized.contains("shift + tab"))
+            || !normalized.contains("cycle")
+        {
+            return None;
+        }
+
+        if normalized.contains("bypass permissions") {
+            terminal_permission_mode_label(line)
+        } else if normalized.contains("don't ask") || normalized.contains("dont ask") {
+            terminal_permission_mode_label(line)
+        } else if normalized.contains("auto-accept edits") || normalized.contains("accept edits") {
+            terminal_permission_mode_label(line)
+        } else if normalized.contains("plan mode") {
+            terminal_permission_mode_label(line)
+        } else if normalized.contains("auto mode") {
+            terminal_permission_mode_label(line)
+        } else if normalized.contains("manual mode")
+            || normalized.contains("default mode")
+            || normalized.contains("ask permissions")
+        {
+            terminal_permission_mode_label(line)
+        } else {
+            None
+        }
+    })
+}
+
+fn terminal_permission_mode_label(line: &str) -> Option<String> {
+    let label = line
+        .trim()
+        .split_once("(shift+tab")
+        .or_else(|| line.trim().split_once("(shift + tab"))
+        .map(|(label, _)| label.trim())?;
+    let label = label
+        .strip_suffix(" on")
+        .or_else(|| label.strip_suffix(" ON"))
+        .unwrap_or(label)
+        .trim();
+    (!label.is_empty()).then(|| label.to_string())
 }
 
 fn parse_claude_current_model_line(line: &str) -> Option<String> {
@@ -2351,6 +2528,7 @@ fn status_for_capture(capture: &CaptureState, available: bool) -> ClaudeObserver
         terminal_prompt: capture.terminal_prompt.clone(),
         activity_status: capture.activity_status.clone(),
         current_model: capture.current_model.clone(),
+        permission_mode: capture.permission_mode.clone(),
     }
 }
 
@@ -2368,6 +2546,7 @@ fn unavailable_snapshot(tab_id: u32, reason: String) -> ClaudeObserverSnapshot {
         terminal_prompt: None,
         activity_status: None,
         current_model: None,
+        permission_mode: Some("? for shortcuts".to_string()),
     }
 }
 
@@ -2574,6 +2753,24 @@ mod tests {
     }
 
     #[test]
+    fn transcript_parser_includes_local_command_output() {
+        let transcript = concat!(
+            r#"{"type":"user","timestamp":"2026-07-21T00:00:00Z","message":{"content":"/compact"}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"local_command","timestamp":"2026-07-21T00:00:01Z","content":"<local-command-stdout>Not enough messages to compact.</local-command-stdout>"}"#,
+        );
+        let events = parse_transcript_messages(transcript);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_name, "HistoricalUserMessage");
+        assert_eq!(events[1].event_name, "HistoricalLocalCommand");
+        assert_eq!(
+            events[1].payload["text"],
+            "<local-command-stdout>Not enough messages to compact.</local-command-stdout>"
+        );
+    }
+
+    #[test]
     fn transcript_parser_reconstructs_historical_tool_execution_in_order() {
         let transcript = concat!(
             r#"{"type":"assistant","timestamp":"2026-07-21T00:00:00Z","message":{"content":[{"type":"text","text":"checking"}]}}"#,
@@ -2668,6 +2865,43 @@ mod tests {
     }
 
     #[test]
+    fn detects_permission_mode_from_claude_footer() {
+        assert_eq!(
+            detect_claude_permission_mode("⏵⏵ plan mode on (shift+tab to cycle)").as_deref(),
+            Some("⏵⏵ plan mode")
+        );
+        assert_eq!(
+            detect_claude_permission_mode("⏵⏵ auto-accept edits on (shift + tab to cycle)")
+                .as_deref(),
+            Some("⏵⏵ auto-accept edits")
+        );
+        assert_eq!(
+            detect_claude_permission_mode("⏵⏵ bypass permissions on (shift+tab to cycle)")
+                .as_deref(),
+            Some("⏵⏵ bypass permissions")
+        );
+        assert_eq!(detect_claude_permission_mode("plan mode on"), None);
+    }
+
+    #[test]
+    fn detects_plan_approval_options_from_terminal() {
+        let screen = concat!(
+            "Plan complete. Ready to code?\n",
+            "❯ 1. Start coding\n",
+            "  2. Keep planning\n",
+            "Enter to confirm · Esc to cancel",
+        );
+        assert_eq!(
+            detect_terminal_prompt(screen),
+            Some(ClaudeTerminalPrompt::PlanApproval {
+                prompt: "Plan complete. Ready to code?".to_string(),
+                options: vec!["Start coding".to_string(), "Keep planning".to_string()],
+                selected_index: 0,
+            })
+        );
+    }
+
+    #[test]
     fn parses_classic_claude_activity_status() {
         let status =
             parse_claude_activity_status_line("  ✻ Actioning… (7s · ↓ 200 tokens · thinking)  ")
@@ -2683,6 +2917,14 @@ mod tests {
                 phase: Some("thinking".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn recognizes_context_compaction_activity_without_hook_activity() {
+        let status = parse_claude_activity_status_line("* Compacting conversation...")
+            .expect("compaction activity status");
+
+        assert!(is_claude_compaction_activity(&status));
     }
 
     #[test]

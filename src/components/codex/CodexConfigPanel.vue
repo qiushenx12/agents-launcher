@@ -1,5 +1,11 @@
 <template>
   <div class="codex-config-panel">
+    <Transition name="codex-left-pane">
+    <div
+      v-if="!props.sidebarCollapsed"
+      class="codex-config-panel__sidebar-shell"
+      :style="{ width: `${leftWidth + 9}px`, flexBasis: `${leftWidth + 9}px` }"
+    >
     <aside class="codex-config-panel__sidebar" :style="{ width: `${leftWidth}px`, flexBasis: `${leftWidth}px` }">
       <button class="btn btn-primary sidebar__new-btn" type="button" @click="store.newProfile()">
         新建配置
@@ -63,6 +69,8 @@
       :class="{ 'codex-config-panel__divider--dragging': isDragging }"
       @mousedown="onMouseDown"
     />
+    </div>
+    </Transition>
 
     <main class="codex-config-panel__content">
       <section class="card config-editor">
@@ -288,7 +296,7 @@ import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
 import ModelField from '@/components/config/ModelField.vue'
 import SecretField from '@/components/config/SecretField.vue'
 import { useDragReorder } from '@/composables/useDragReorder'
-import { useResizablePanes } from '@/composables/useResizablePanes'
+import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
 import { useSettingsPopover } from '@/composables/useSettingsPopover'
 
 const { toggleSettings } = useSettingsPopover()
@@ -296,6 +304,12 @@ import { usePlatform } from '@/composables/usePlatform'
 
 const store = useCodexConfigStore()
 const workspaceStore = useConfigWorkspaceStore()
+const props = defineProps<{
+  sidebarCollapsed?: boolean
+}>()
+const emit = defineEmits<{
+  (event: 'left-width-change', width: number): void
+}>()
 const { isMacOS } = usePlatform()
 const { draggingIndex, overIndex, justDragged, onPointerDown } = useDragReorder(
   () => store.orderedProfiles.map(item => item.id),
@@ -370,17 +384,16 @@ function onEffortSelect(event: Event) {
   ;(event.target as HTMLSelectElement).value = ''
 }
 
-const { leftWidth, isDragging, onMouseDown, loadSizes, saveSizes } = useResizablePanes(280, 200, 400)
-const PANE_KEY = 'codex-config-panel'
+const { leftWidth, isDragging, onMouseDown, loadWidth } = useSharedLeftSidebarWidth()
 
 onMounted(() => {
-  loadSizes(PANE_KEY).catch(() => {})
+  loadWidth().catch(() => {})
   store.loadProfiles().catch(() => {})
 })
 
-watch(isDragging, (dragging) => {
-  if (!dragging) saveSizes(PANE_KEY).catch(() => {})
-})
+watch(leftWidth, (width) => {
+  emit('left-width-change', width)
+}, { immediate: true })
 </script>
 
 <style scoped>
@@ -389,6 +402,26 @@ watch(isDragging, (dragging) => {
   min-height: 0;
   display: flex;
   background: var(--bg);
+}
+
+.codex-config-panel__sidebar-shell {
+  flex: 0 0 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+.codex-left-pane-enter-active,
+.codex-left-pane-leave-active {
+  transition: width 0.22s ease, flex-basis 0.22s ease, opacity 0.16s ease;
+}
+
+.codex-left-pane-enter-from,
+.codex-left-pane-leave-to {
+  width: 0 !important;
+  flex-basis: 0 !important;
+  opacity: 0;
 }
 
 .codex-config-panel__sidebar {

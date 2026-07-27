@@ -1,5 +1,3 @@
-import skillCatalog from '../data/claudeSkills.json' with { type: 'json' }
-
 export type ClaudeSlashCommandKind = 'builtin' | 'skill'
 
 export interface ClaudeSlashCommand {
@@ -8,17 +6,17 @@ export interface ClaudeSlashCommand {
   kind: ClaudeSlashCommandKind
 }
 
+export interface ClaudeSkillCatalogEntry {
+  name: string
+  description: string
+}
+
 export type ClaudeSlashCommandValidation =
   | { kind: 'plain' }
   | { kind: 'allowed'; command: ClaudeSlashCommand }
   | { kind: 'unsupported'; command: string }
 
 const BUILTIN_COMMANDS: readonly ClaudeSlashCommand[] = [
-  {
-    command: '/init',
-    description: '初始化项目的 Claude 配置',
-    kind: 'builtin',
-  },
   {
     command: '/compact',
     description: '压缩当前会话上下文',
@@ -36,30 +34,47 @@ const BUILTIN_COMMANDS: readonly ClaudeSlashCommand[] = [
   },
 ]
 
+// /init remains valid when typed manually, but is intentionally omitted from suggestions.
+const HIDDEN_BUILTIN_COMMANDS: readonly ClaudeSlashCommand[] = [
+  {
+    command: '/init',
+    description: '初始化项目的 Claude 配置',
+    kind: 'builtin',
+  },
+]
+
 function normalizeSkillName(name: string): string | undefined {
   const normalized = name.trim().replace(/^\/+/, '').toLowerCase()
   if (!normalized || !/^[a-z0-9][a-z0-9-]*$/.test(normalized)) return undefined
   return normalized
 }
 
-const skillCommands = skillCatalog.skills.flatMap<ClaudeSlashCommand>((skill) => {
-  const name = normalizeSkillName(skill.name)
-  if (!name) return []
-  return [{
-    command: `/${name}`,
-    description: skill.description.trim() || `运行 ${name} skill`,
-    kind: 'skill',
-  }]
-})
+let skillCommands: readonly ClaudeSlashCommand[] = []
 
-export const CLAUDE_SLASH_COMMANDS: readonly ClaudeSlashCommand[] = [
-  ...BUILTIN_COMMANDS,
-  ...skillCommands,
-]
+export function setClaudeSkillCommands(skills: readonly ClaudeSkillCatalogEntry[]): void {
+  const seen = new Set<string>()
+  skillCommands = skills.flatMap<ClaudeSlashCommand>((skill) => {
+    const name = normalizeSkillName(skill.name)
+    if (!name || seen.has(name)) return []
+    seen.add(name)
+    return [{
+      command: `/${name}`,
+      description: skill.description.trim() || `运行 ${name} skill`,
+      kind: 'skill',
+    }]
+  })
+}
 
-const commandsByName = new Map(
-  CLAUDE_SLASH_COMMANDS.map(command => [command.command, command]),
-)
+export function getClaudeSlashCommands(): readonly ClaudeSlashCommand[] {
+  return [...BUILTIN_COMMANDS, ...skillCommands]
+}
+
+function commandsByName(): ReadonlyMap<string, ClaudeSlashCommand> {
+  return new Map(
+    [...getClaudeSlashCommands(), ...HIDDEN_BUILTIN_COMMANDS]
+      .map(command => [command.command, command]),
+  )
+}
 
 function slashCommandToken(input: string): string | undefined {
   const trimmed = input.trimStart()
@@ -70,7 +85,7 @@ function slashCommandToken(input: string): string | undefined {
 export function validateClaudeSlashCommand(input: string): ClaudeSlashCommandValidation {
   const token = slashCommandToken(input)
   if (token === undefined) return { kind: 'plain' }
-  const command = commandsByName.get(token.toLowerCase())
+  const command = commandsByName().get(token.toLowerCase())
   return command
     ? { kind: 'allowed', command }
     : { kind: 'unsupported', command: token }
@@ -80,5 +95,5 @@ export function filterClaudeSlashCommands(input: string): readonly ClaudeSlashCo
   const trimmed = input.trimStart()
   if (!trimmed.startsWith('/') || /\s/.test(trimmed)) return []
   const query = trimmed.toLowerCase()
-  return CLAUDE_SLASH_COMMANDS.filter(command => command.command.startsWith(query))
+  return getClaudeSlashCommands().filter(command => command.command.startsWith(query))
 }
