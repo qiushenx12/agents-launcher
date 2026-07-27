@@ -111,7 +111,7 @@ onMounted(async () => {
   overflow-wrap: anywhere;
   color: var(--text-primary);
   background: var(--claude-log-surface-bg);
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.5;
 }

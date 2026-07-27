@@ -2919,7 +2919,7 @@ defineExpose({ appendDroppedFiles })
   border-radius: 8px;
   color: var(--text-primary);
   background: var(--claude-surface-bg);
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
 }
 
@@ -3350,7 +3350,7 @@ defineExpose({ appendDroppedFiles })
 .conversation-item__markdown :deep(.conversation-code-block__copy.is-failed .conversation-code-block__copy-icon) { display: none; }
 .conversation-item__markdown :deep(.conversation-code-block__copy.is-failed .conversation-code-block__error-icon) { display: block; }
 .conversation-item__markdown :deep(code) {
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: inherit;
 }
 
@@ -3386,7 +3386,7 @@ defineExpose({ appendDroppedFiles })
   min-width: 0;
   overflow: hidden;
   color: var(--text-secondary);
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: var(--claude-content-font-size);
   font-weight: 400;
   text-overflow: ellipsis;
@@ -3430,7 +3430,7 @@ defineExpose({ appendDroppedFiles })
   border-radius: 6px;
   color: var(--text-primary);
   background: var(--claude-elevated-bg);
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: var(--claude-content-font-size);
   line-height: var(--claude-content-line-height);
 }
@@ -3744,7 +3744,7 @@ defineExpose({ appendDroppedFiles })
   background: var(--claude-activity-bg);
   box-shadow: 0 5px 18px var(--claude-activity-shadow);
   backdrop-filter: blur(8px);
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: var(--claude-content-font-size);
   line-height: 1.5;
   white-space: nowrap;
@@ -3963,7 +3963,7 @@ defineExpose({ appendDroppedFiles })
   overflow: hidden;
   color: var(--primary);
   background: transparent;
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: var(--claude-content-font-size);
   font-weight: 600;
   text-overflow: ellipsis;

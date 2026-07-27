@@ -1285,6 +1285,25 @@ onBeforeUnmount(() => {
   background: var(--bg);
 }
 
+/* The native macOS title bar reserves space for the traffic lights by adding
+   left padding. Compensate the workspace section width so its right divider
+   stays aligned with the content sidebar divider below. Keep the collapsed
+   toggle area intact because it is still visible beside the traffic lights. */
+.app-layout--mac-title-bar .title-bar__workspace-section:not(.title-bar__workspace-section--collapsed) {
+  width: calc(var(--project-nav-width, 219px) - 80px);
+  flex-basis: calc(var(--project-nav-width, 219px) - 80px);
+}
+
+.app-layout--mac-title-bar.app-layout--mac-fullscreen .title-bar__workspace-section:not(.title-bar__workspace-section--collapsed) {
+  width: calc(var(--project-nav-width, 219px) - 8px);
+  flex-basis: calc(var(--project-nav-width, 219px) - 8px);
+}
+
+.app-layout--mac-title-bar .title-bar__workspace-section--collapsed {
+  width: 45px;
+  flex-basis: 45px;
+}
+
 .title-bar__workspace-section--collapsed {
   gap: 0;
 }

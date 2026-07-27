@@ -2044,40 +2044,58 @@ fn write_observer_plugin(
         })
         .collect();
     let mut hooks = hooks;
-    let session_start_script = format!(
-        "$inputStream = [Console]::OpenStandardInput()\r\n\
-         $memoryStream = New-Object System.IO.MemoryStream\r\n\
-         $inputStream.CopyTo($memoryStream)\r\n\
-         $bytes = $memoryStream.ToArray()\r\n\
-         try {{\r\n\
-           $headers = @{{ Authorization = \"Bearer $env:AGENTS_LAUNCHER_HOOK_TOKEN\" }}\r\n\
-           Invoke-WebRequest -UseBasicParsing -Uri \"{endpoint}/hooks/{capture_id}\" -Method Post -ContentType \"application/json; charset=utf-8\" -Headers $headers -Body $bytes -TimeoutSec 3 | Out-Null\r\n\
-         }} catch {{ }}\r\n\
-         $memoryStream.Dispose()\r\n\
-         exit 0\r\n"
-    );
-    fs::write(
-        plugin_dir.join("scripts").join("session-start.ps1"),
-        session_start_script,
-    )
+    #[cfg(windows)]
+    let (session_start_script_name, session_start_script, session_start_hook) = {
+        let script = format!(
+            "$inputStream = [Console]::OpenStandardInput()\r\n\
+             $memoryStream = New-Object System.IO.MemoryStream\r\n\
+             $inputStream.CopyTo($memoryStream)\r\n\
+             $bytes = $memoryStream.ToArray()\r\n\
+             try {{\r\n\
+               $headers = @{{ Authorization = \"Bearer $env:AGENTS_LAUNCHER_HOOK_TOKEN\" }}\r\n\
+               Invoke-WebRequest -UseBasicParsing -Uri \"{endpoint}/hooks/{capture_id}\" -Method Post -ContentType \"application/json; charset=utf-8\" -Headers $headers -Body $bytes -TimeoutSec 3 | Out-Null\r\n\
+             }} catch {{ }}\r\n\
+             $memoryStream.Dispose()\r\n\
+             exit 0\r\n"
+        );
+        let hook = json!({
+            "type": "command",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.ps1"
+            ],
+            "timeout": 5
+        });
+        ("session-start.ps1", script, hook)
+    };
+    #[cfg(not(windows))]
+    let (session_start_script_name, session_start_script, session_start_hook) = {
+        let script = format!(
+            "#!/bin/sh\n\
+             curl --silent --show-error --output /dev/null --max-time 3 --request POST --header \"Authorization: Bearer $AGENTS_LAUNCHER_HOOK_TOKEN\" --header \"Content-Type: application/json; charset=utf-8\" --data-binary @- \"{endpoint}/hooks/{capture_id}\" >/dev/null 2>&1\n\
+             exit 0\n"
+        );
+        let hook = json!({
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh"],
+            "timeout": 5
+        });
+        ("session-start.sh", script, hook)
+    };
+    let session_start_script_path = plugin_dir
+        .join("scripts")
+        .join(session_start_script_name);
+    fs::write(session_start_script_path, session_start_script)
     .map_err(|error| format!("写入 Claude observer SessionStart 脚本失败：{error}"))?;
     hooks.insert(
         "SessionStart".to_string(),
-        json!([{
-            "hooks": [{
-                "type": "command",
-                "command": "powershell.exe",
-                "args": [
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.ps1"
-                ],
-                "timeout": 5
-            }]
-        }]),
+        json!([{ "hooks": [session_start_hook] }]),
     );
     write_json_pretty(
         &plugin_dir.join("hooks").join("hooks.json"),
@@ -2780,7 +2798,7 @@ fn detect_workspace_trust_prompt(lines: &[&str]) -> Option<ClaudeTerminalPrompt>
     }
 
     let path = lines[workspace_index + 1..quick_check_index].concat();
-    if !looks_like_windows_workspace_path(&path) {
+    if !looks_like_workspace_path(&path) {
         return None;
     }
 
@@ -3252,13 +3270,14 @@ fn activity_diff_row_to_suppress(
     suppress_row
 }
 
-fn looks_like_windows_workspace_path(path: &str) -> bool {
+fn looks_like_workspace_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     (bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && matches!(bytes[2], b'\\' | b'/'))
         || path.starts_with(r"\\")
+        || path.starts_with('/')
 }
 
 fn line_counts(lines: &[String]) -> HashMap<&str, usize> {
@@ -3983,6 +4002,25 @@ mod tests {
     }
 
     #[test]
+    fn detects_unix_workspace_trust_prompt_and_extracts_path() {
+        let screen = concat!(
+            "Accessing workspace:\n\n",
+            " /Users/qiushenx12/project\n\n",
+            " Quick safety check: Is this a project you created or one you trust?\n\n",
+            " ❯ 1. Yes, I trust this folder\n",
+            "   2. No, exit\n\n",
+            " Enter to confirm · Esc to cancel",
+        );
+
+        assert_eq!(
+            detect_terminal_prompt(screen),
+            Some(ClaudeTerminalPrompt::WorkspaceTrust {
+                path: "/Users/qiushenx12/project".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn workspace_trust_detection_rejects_partial_terminal_text() {
         let screen = concat!(
             "Accessing workspace:\n\n",
@@ -4148,12 +4186,34 @@ mod tests {
             hooks["hooks"]["MessageDisplay"][0]["hooks"][0]["type"],
             "http"
         );
-        assert!(root.join("scripts").join("session-start.ps1").is_file());
-        let session_start = fs::read_to_string(root.join("scripts").join("session-start.ps1"))
-            .expect("session start script");
-        assert!(session_start.contains("[Console]::OpenStandardInput()"));
-        assert!(session_start.contains("$inputStream.CopyTo($memoryStream)"));
-        assert!(session_start.contains("-Body $bytes"));
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+                "powershell.exe"
+            );
+            assert!(root.join("scripts").join("session-start.ps1").is_file());
+            let session_start =
+                fs::read_to_string(root.join("scripts").join("session-start.ps1"))
+                    .expect("session start script");
+            assert!(session_start.contains("[Console]::OpenStandardInput()"));
+            assert!(session_start.contains("$inputStream.CopyTo($memoryStream)"));
+            assert!(session_start.contains("-Body $bytes"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+                "/bin/sh"
+            );
+            assert!(root.join("scripts").join("session-start.sh").is_file());
+            let session_start =
+                fs::read_to_string(root.join("scripts").join("session-start.sh"))
+                    .expect("session start script");
+            assert!(session_start.starts_with("#!/bin/sh\n"));
+            assert!(session_start.contains("curl --silent"));
+            assert!(session_start.contains("--data-binary @-"));
+        }
 
         fs::remove_dir_all(root).expect("remove test plugin");
     }
