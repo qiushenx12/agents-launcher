@@ -93,6 +93,7 @@
           v-else-if="activeClaudeView === 'log'"
           :key="`log-${activeTerminalId}`"
           :tab-id="activeTerminalId"
+          :project-session-id="store.activeSession!.id"
         />
       </template>
       <div v-if="!activeTerminalId" class="project-terminal__empty">

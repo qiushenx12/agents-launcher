@@ -3,24 +3,30 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::to_bytes;
 use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use chrono::Utc;
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const MAX_EVENTS_IN_MEMORY: usize = 500;
 const MAX_HOOK_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STATUSLINE_BODY_BYTES: usize = 256 * 1024;
+const MAX_STATUSLINE_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_TRANSCRIPT_USAGE_TAIL_BYTES: u64 = 1024 * 1024;
 const MAX_UI_VALUE_CHARS: usize = 256 * 1024;
 const MAX_TERMINAL_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_HOOK_LOG_BYTES: u64 = 10 * 1024 * 1024;
@@ -59,6 +65,7 @@ pub struct ClaudeObserverStatus {
     pub activity_status: Option<ClaudeActivityStatus>,
     pub current_model: Option<String>,
     pub permission_mode: Option<String>,
+    pub context_usage: Option<ClaudeContextUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -112,11 +119,40 @@ pub struct ClaudeObserverSnapshot {
     pub activity_status: Option<ClaudeActivityStatus>,
     pub current_model: Option<String>,
     pub permission_mode: Option<String>,
+    pub context_usage: Option<ClaudeContextUsage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeContextUsage {
+    pub used_percentage: u8,
+    pub remaining_percentage: u8,
+    pub used_tokens: Option<u64>,
+    pub context_window_size: Option<u64>,
+    pub source: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudePromptSubmissionBaseline {
+    pub capture_id: String,
+    pub event_sequence: u64,
+    pub transcript_len: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeTerminalLogResult {
+    pub text: String,
+    pub log_dir: String,
+    pub historical: bool,
 }
 
 pub struct PreparedCapture {
     pub capture_id: String,
     pub plugin_dir: PathBuf,
+    pub settings_path: PathBuf,
     pub token: String,
 }
 
@@ -390,6 +426,14 @@ struct CaptureState {
     activity_status: Option<ClaudeActivityStatus>,
     current_model: Option<String>,
     permission_mode: Option<String>,
+    context_usage: Option<ClaudeContextUsage>,
+    transcript_path: Option<PathBuf>,
+    last_native_context_at: Option<Instant>,
+    original_statusline_command: Option<String>,
+    launch_env: HashMap<String, String>,
+    launch_cwd: Option<PathBuf>,
+    terminal_cols: u16,
+    terminal_rows: u16,
     activity_expected: bool,
     last_screen_activity_signature: Option<String>,
     session_started: bool,
@@ -464,6 +508,7 @@ impl ClaudeObserverManager {
             };
             let router = Router::new()
                 .route("/hooks/{capture_id}", post(receive_hook))
+                .route("/statusline/{capture_id}", post(receive_statusline))
                 .with_state(manager);
             let _ = axum::serve(listener, router).await;
         });
@@ -494,6 +539,7 @@ impl ClaudeObserverManager {
         cols: u16,
         rows: u16,
         project_session_id: Option<String>,
+        cwd: Option<&str>,
         env: &HashMap<String, String>,
     ) -> Result<PreparedCapture, String> {
         let endpoint = self.endpoint.as_ref().ok_or_else(|| {
@@ -515,6 +561,10 @@ impl ClaudeObserverManager {
         fs::create_dir_all(&log_dir)
             .map_err(|error| format!("创建 Claude 日志目录失败：{error}"))?;
         write_observer_plugin(&plugin_dir, endpoint, &capture_id)?;
+        let settings_path = plugin_dir.join("observer-settings.json");
+        write_statusline_settings(&settings_path, endpoint, &capture_id, &token)?;
+        let original_statusline_command =
+            resolve_existing_statusline_command(env, cwd).unwrap_or(None);
 
         let mut secrets = collect_sensitive_values(env);
         secrets.push(token.clone());
@@ -546,6 +596,14 @@ impl ClaudeObserverManager {
             activity_status: None,
             current_model: None,
             permission_mode: Some("? for shortcuts".to_string()),
+            context_usage: None,
+            transcript_path: None,
+            last_native_context_at: None,
+            original_statusline_command,
+            launch_env: env.clone(),
+            launch_cwd: cwd.map(PathBuf::from),
+            terminal_cols: cols,
+            terminal_rows: rows,
             activity_expected: false,
             last_screen_activity_signature: None,
             session_started: false,
@@ -559,6 +617,7 @@ impl ClaudeObserverManager {
         Ok(PreparedCapture {
             capture_id,
             plugin_dir,
+            settings_path,
             token,
         })
     }
@@ -601,6 +660,7 @@ impl ClaudeObserverManager {
                 activity_status: None,
                 current_model: None,
                 permission_mode: Some("? for shortcuts".to_string()),
+                context_usage: None,
             },
         );
     }
@@ -620,6 +680,8 @@ impl ClaudeObserverManager {
         };
         if let Some(capture) = captures.get_mut(capture_id) {
             capture.screen.resize(rows, cols);
+            capture.terminal_cols = cols;
+            capture.terminal_rows = rows;
         }
     }
 
@@ -768,6 +830,10 @@ impl ClaudeObserverManager {
                 if capture.terminal_prompt.take().is_some() {
                     status_changed = true;
                 }
+                if capture.context_usage.take().is_some() {
+                    capture.last_native_context_at = None;
+                    status_changed = true;
+                }
             }
             if matches!(
                 event.event_name.as_str(),
@@ -791,6 +857,7 @@ impl ClaudeObserverManager {
             }
         };
 
+        let observed_transcript_path = transcript_path_from_payload(&redacted);
         let log_record = json!({
             "id": event.id,
             "sequence": event.sequence,
@@ -813,6 +880,103 @@ impl ClaudeObserverManager {
         if let Some(status) = observer_status {
             let _ = self.app.emit("claude_observer_status", status);
         }
+        self.refresh_context_usage_from_transcript(
+            &capture_id,
+            observed_transcript_path.as_deref(),
+        );
+    }
+
+    fn update_context_usage(&self, capture_id: &str, usage: ClaudeContextUsage, native: bool) {
+        let status = {
+            let Ok(mut captures) = self.captures.lock() else {
+                return;
+            };
+            let Some(capture) = captures.get_mut(capture_id) else {
+                return;
+            };
+            if native {
+                capture.last_native_context_at = Some(Instant::now());
+            }
+            let changed = capture
+                .context_usage
+                .as_ref()
+                .is_none_or(|current| !same_context_usage(current, &usage));
+            capture.context_usage = Some(usage);
+            if !changed {
+                return;
+            }
+            capture.status_revision = capture.status_revision.saturating_add(1);
+            capture.tab_id.map(|_| status_for_capture(capture, true))
+        };
+        if let Some(status) = status {
+            let _ = self.app.emit("claude_observer_status", status);
+        }
+    }
+
+    fn refresh_context_usage_from_transcript(
+        &self,
+        capture_id: &str,
+        observed_path: Option<&Path>,
+    ) {
+        let (transcript_path, context_window_size) = {
+            let Ok(mut captures) = self.captures.lock() else {
+                return;
+            };
+            let Some(capture) = captures.get_mut(capture_id) else {
+                return;
+            };
+            if let Some(path) = observed_path.filter(|path| is_jsonl_path(path)) {
+                capture.transcript_path = Some(path.to_path_buf());
+            }
+            if capture
+                .last_native_context_at
+                .is_some_and(|updated| updated.elapsed() < Duration::from_secs(5))
+            {
+                return;
+            }
+            let context_window_size = capture
+                .context_usage
+                .as_ref()
+                .and_then(|usage| usage.context_window_size)
+                .unwrap_or_else(|| infer_context_window_size(capture.current_model.as_deref()));
+            (capture.transcript_path.clone(), context_window_size)
+        };
+        let Some(path) = transcript_path else {
+            return;
+        };
+        let Ok(Some(usage)) = read_transcript_context_usage(&path, context_window_size) else {
+            return;
+        };
+        self.update_context_usage(capture_id, usage, false);
+    }
+
+    fn apply_native_context_usage(&self, capture_id: &str, payload: &Value) {
+        if let Some(path) = transcript_path_from_payload(payload) {
+            if let Ok(mut captures) = self.captures.lock() {
+                if let Some(capture) = captures.get_mut(capture_id) {
+                    capture.transcript_path = Some(path);
+                }
+            }
+        }
+        if let Some(usage) = context_usage_from_statusline(payload) {
+            self.update_context_usage(capture_id, usage, true);
+        }
+    }
+
+    fn statusline_passthrough(
+        &self,
+        capture_id: &str,
+    ) -> Option<(String, HashMap<String, String>, Option<PathBuf>)> {
+        let captures = self.captures.lock().ok()?;
+        let capture = captures.get(capture_id)?;
+        let mut env = capture.launch_env.clone();
+        env.insert("COLUMNS".to_string(), capture.terminal_cols.to_string());
+        env.insert("LINES".to_string(), capture.terminal_rows.to_string());
+        Some((
+            capture.original_statusline_command.clone()?,
+            env,
+            capture.launch_cwd.clone(),
+        ))
     }
 
     fn import_transcript_history(&self, capture_id: &str, payload: &Value, secrets: &[String]) {
@@ -1192,6 +1356,64 @@ impl ClaudeObserverManager {
             .and_then(|tab_captures| tab_captures.get(&tab_id).cloned())
     }
 
+    fn prompt_submission_baseline(
+        &self,
+        tab_id: u32,
+    ) -> Result<ClaudePromptSubmissionBaseline, String> {
+        let capture_id = self
+            .capture_id_for_tab(tab_id)
+            .ok_or_else(|| "当前终端没有 Claude 结构化观察数据".to_string())?;
+        let captures = self.captures.lock().map_err(|error| error.to_string())?;
+        let capture = captures
+            .get(&capture_id)
+            .ok_or_else(|| "Claude 观察会话已经清理".to_string())?;
+        let transcript_len = latest_transcript_path(&capture.events)
+            .map(|path| fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0));
+        Ok(ClaudePromptSubmissionBaseline {
+            capture_id,
+            event_sequence: capture.next_event_sequence,
+            transcript_len,
+        })
+    }
+
+    fn prompt_submission_observed(
+        &self,
+        tab_id: u32,
+        prompt: &str,
+        baseline: &ClaudePromptSubmissionBaseline,
+    ) -> Result<bool, String> {
+        let capture_id = self
+            .capture_id_for_tab(tab_id)
+            .ok_or_else(|| "当前终端没有 Claude 结构化观察数据".to_string())?;
+        if capture_id != baseline.capture_id {
+            return Ok(false);
+        }
+        let (hook_observed, transcript_path) = {
+            let captures = self.captures.lock().map_err(|error| error.to_string())?;
+            let capture = captures
+                .get(&capture_id)
+                .ok_or_else(|| "Claude 观察会话已经清理".to_string())?;
+            let expected = normalize_prompt_for_match(prompt);
+            let hook_observed = capture.events.iter().any(|event| {
+                event.sequence >= baseline.event_sequence
+                    && event.event_name == "UserPromptSubmit"
+                    && event_prompt_text(&event.payload)
+                        .is_some_and(|value| normalize_prompt_for_match(value) == expected)
+            });
+            (hook_observed, latest_transcript_path(&capture.events))
+        };
+        if hook_observed {
+            return Ok(true);
+        }
+        let (Some(transcript_path), Some(transcript_len)) =
+            (transcript_path, baseline.transcript_len)
+        else {
+            return Ok(false);
+        };
+        let appended = read_file_from_offset(&transcript_path, transcript_len)?;
+        Ok(transcript_contains_user_prompt(&appended, prompt))
+    }
+
     fn snapshot(&self, tab_id: u32) -> ClaudeObserverSnapshot {
         let Some(capture_id) = self.capture_id_for_tab(tab_id) else {
             return ClaudeObserverSnapshot {
@@ -1210,6 +1432,7 @@ impl ClaudeObserverManager {
                 activity_status: None,
                 current_model: None,
                 permission_mode: Some("? for shortcuts".to_string()),
+                context_usage: None,
             };
         };
         // A user may return from the raw terminal immediately after cycling a mode.
@@ -1234,6 +1457,7 @@ impl ClaudeObserverManager {
                 capture.activity_status.clone(),
                 capture.current_model.clone(),
                 capture.permission_mode.clone(),
+                capture.context_usage.clone(),
             )
         };
         let (
@@ -1247,6 +1471,7 @@ impl ClaudeObserverManager {
             activity_status,
             current_model,
             permission_mode,
+            context_usage,
         ) = capture_context;
         let terminal_log =
             read_last_lines(&log_dir.join("terminal-output.txt"), 400).unwrap_or_default();
@@ -1264,6 +1489,7 @@ impl ClaudeObserverManager {
             activity_status,
             current_model,
             permission_mode,
+            context_usage,
         }
     }
 }
@@ -1319,6 +1545,140 @@ async fn receive_hook(
     }
 }
 
+async fn receive_statusline(
+    State(manager): State<Arc<ClaudeObserverManager>>,
+    AxumPath(capture_id): AxumPath<String>,
+    request: Request,
+) -> Response {
+    if !manager.authorize(&capture_id, request.headers()) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let body = match to_bytes(request.into_body(), MAX_STATUSLINE_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::NO_CONTENT.into_response(),
+    };
+    let payload = match parse_hook_body(&body) {
+        Ok(payload) => payload,
+        Err(_) => return StatusCode::NO_CONTENT.into_response(),
+    };
+    manager.apply_native_context_usage(&capture_id, &payload);
+
+    let Some((command, env, cwd)) = manager.statusline_passthrough(&capture_id) else {
+        return String::new().into_response();
+    };
+    match run_statusline_command(&command, &env, cwd.as_deref(), &body).await {
+        Some(output) => output.into_response(),
+        None => String::new().into_response(),
+    }
+}
+
+async fn run_statusline_command(
+    command: &str,
+    env: &HashMap<String, String>,
+    cwd: Option<&Path>,
+    body: &[u8],
+) -> Option<String> {
+    #[cfg(windows)]
+    let mut process = {
+        if let Some(bash) = resolve_git_bash(env) {
+            let mut process = tokio::process::Command::new(bash);
+            process.args(["-lc", command]);
+            process
+        } else {
+            let executable = env
+                .get("COMSPEC")
+                .cloned()
+                .or_else(|| std::env::var("COMSPEC").ok())
+                .unwrap_or_else(|| "C:\\Windows\\System32\\cmd.exe".to_string());
+            let mut process = tokio::process::Command::new(executable);
+            process.args(["/d", "/s", "/c", command]);
+            process
+        }
+    };
+    #[cfg(not(windows))]
+    let mut process = {
+        let executable = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut process = tokio::process::Command::new(executable);
+        process.args(["-lc", command]);
+        process
+    };
+
+    process.envs(env);
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        process
+            .as_std_mut()
+            .creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = process
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    if stdin.write_all(body).await.is_err() {
+        return None;
+    }
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    let stdout = if output.stdout.len() > MAX_STATUSLINE_OUTPUT_BYTES {
+        &output.stdout[..MAX_STATUSLINE_OUTPUT_BYTES]
+    } else {
+        &output.stdout
+    };
+    Some(String::from_utf8_lossy(stdout).into_owned())
+}
+
+#[cfg(windows)]
+fn resolve_git_bash(env: &HashMap<String, String>) -> Option<PathBuf> {
+    for key in ["CLAUDE_CODE_GIT_BASH_PATH", "GIT_BASH_PATH"] {
+        if let Some(path) = env
+            .get(key)
+            .cloned()
+            .or_else(|| std::env::var(key).ok())
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+        {
+            return Some(path);
+        }
+    }
+    if let Ok(git) = which::which("git.exe").or_else(|_| which::which("git")) {
+        if let Some(root) = git.parent().and_then(Path::parent) {
+            let bash = root.join("bin").join("bash.exe");
+            if bash.is_file() {
+                return Some(bash);
+            }
+        }
+    }
+    for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        let Some(root) = std::env::var_os(variable).map(PathBuf::from) else {
+            continue;
+        };
+        let bash = if variable == "LOCALAPPDATA" {
+            root.join("Programs")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe")
+        } else {
+            root.join("Git").join("bin").join("bash.exe")
+        };
+        if bash.is_file() {
+            return Some(bash);
+        }
+    }
+    None
+}
+
 fn parse_hook_body(bytes: &[u8]) -> Result<Value, String> {
     if let Some(bytes) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         let text = std::str::from_utf8(bytes)
@@ -1371,69 +1731,259 @@ pub fn get_claude_observer_snapshot(
 }
 
 #[tauri::command]
+pub fn begin_claude_prompt_submission(
+    tab_id: u32,
+    observer: tauri::State<'_, Arc<ClaudeObserverManager>>,
+) -> Result<ClaudePromptSubmissionBaseline, String> {
+    observer.prompt_submission_baseline(tab_id)
+}
+
+#[tauri::command]
+pub fn confirm_claude_prompt_submission(
+    tab_id: u32,
+    prompt: String,
+    baseline: ClaudePromptSubmissionBaseline,
+    observer: tauri::State<'_, Arc<ClaudeObserverManager>>,
+) -> Result<bool, String> {
+    observer.prompt_submission_observed(tab_id, &prompt, &baseline)
+}
+
+#[tauri::command]
 pub fn get_claude_terminal_log(
     tab_id: u32,
     max_lines: Option<usize>,
+    project_session_id: Option<String>,
     observer: tauri::State<'_, Arc<ClaudeObserverManager>>,
-) -> Result<String, String> {
-    let capture_id = observer
-        .capture_id_for_tab(tab_id)
-        .ok_or_else(|| "当前终端没有 Claude 日志".to_string())?;
-    let log_dir = {
-        let captures = observer
-            .captures
-            .lock()
-            .map_err(|error| error.to_string())?;
-        captures
-            .get(&capture_id)
-            .map(|capture| capture.log_dir.clone())
-            .ok_or_else(|| "Claude 日志会话不存在".to_string())?
-    };
-    read_last_lines(
+) -> Result<ClaudeTerminalLogResult, String> {
+    let (log_dir, historical) = resolve_claude_log_dir(
+        observer.inner(),
+        tab_id,
+        project_session_id.as_deref(),
+        true,
+    )?;
+    let text = read_last_lines(
         &log_dir.join("terminal-output.txt"),
         max_lines.unwrap_or(400).clamp(1, 2_000),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(ClaudeTerminalLogResult {
+        text,
+        log_dir: log_dir.to_string_lossy().to_string(),
+        historical,
+    })
 }
 
 #[tauri::command]
 pub fn open_claude_log_dir(
     tab_id: u32,
+    project_session_id: Option<String>,
     observer: tauri::State<'_, Arc<ClaudeObserverManager>>,
 ) -> Result<(), String> {
-    let capture_id = observer
-        .capture_id_for_tab(tab_id)
-        .ok_or_else(|| "当前终端没有 Claude 日志目录".to_string())?;
-    let log_dir = {
-        let captures = observer
-            .captures
-            .lock()
-            .map_err(|error| error.to_string())?;
-        captures
-            .get(&capture_id)
-            .map(|capture| capture.log_dir.clone())
-            .ok_or_else(|| "Claude 日志会话不存在".to_string())?
-    };
+    let (log_dir, _) = resolve_claude_log_dir(
+        observer.inner(),
+        tab_id,
+        project_session_id.as_deref(),
+        false,
+    )?;
     crate::utils::open_directory(log_dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 pub fn report_claude_observer_timeout(
     tab_id: u32,
+    submission_accepted: Option<bool>,
     observer: tauri::State<'_, Arc<ClaudeObserverManager>>,
 ) {
     if let Some(capture_id) = observer.capture_id_for_tab(tab_id) {
+        let message = if submission_accepted == Some(true) {
+            "发送消息已由 Claude transcript 确认接收，但 6 秒内未收到对应 Hook 事件；结构化输入已降级。"
+        } else {
+            "发送消息后 6 秒内既未收到对应 Claude Hook 事件，也未能从 transcript 确认接收；结构化输入已降级。"
+        };
         observer.record_diagnostic(
             &capture_id,
-            "发送消息后未在 2.5 秒内收到 Claude Hook 事件；结构化输入已降级。",
+            message,
         );
     }
+}
+
+fn resolve_claude_log_dir(
+    observer: &ClaudeObserverManager,
+    tab_id: u32,
+    project_session_id: Option<&str>,
+    require_terminal_output: bool,
+) -> Result<(PathBuf, bool), String> {
+    let current = observer.capture_id_for_tab(tab_id).and_then(|capture_id| {
+        observer
+            .captures
+            .lock()
+            .ok()
+            .and_then(|captures| captures.get(&capture_id).map(|capture| capture.log_dir.clone()))
+    });
+    if let Some(log_dir) = current.as_ref() {
+        let usable = if require_terminal_output {
+            log_dir.join("terminal-output.txt").is_file()
+        } else {
+            has_useful_log_artifacts(log_dir)
+        };
+        if usable {
+            return Ok((log_dir.clone(), false));
+        }
+    }
+    if let Some(project_session_id) = project_session_id {
+        let root = app_data_base_dir()?.join("terminal_logs").join("claude");
+        if let Some(log_dir) =
+            find_latest_project_log_dir(&root, project_session_id, require_terminal_output)
+        {
+            let historical = current.as_ref() != Some(&log_dir);
+            return Ok((log_dir, historical));
+        }
+    }
+    current
+        .map(|log_dir| (log_dir, false))
+        .ok_or_else(|| "当前终端没有 Claude 日志，且未找到该项目会话的历史日志".to_string())
+}
+
+fn find_latest_project_log_dir(
+    root: &Path,
+    project_session_id: &str,
+    require_terminal_output: bool,
+) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let metadata_path = path.join("metadata.json");
+            let metadata: Value =
+                serde_json::from_str(&fs::read_to_string(metadata_path).ok()?).ok()?;
+            if metadata.get("projectSessionId").and_then(Value::as_str)
+                != Some(project_session_id)
+            {
+                return None;
+            }
+            let usable = if require_terminal_output {
+                path.join("terminal-output.txt").is_file()
+            } else {
+                has_useful_log_artifacts(&path)
+            };
+            if !usable {
+                return None;
+            }
+            let started_at = metadata
+                .get("startedAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some((started_at, path))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, path)| path)
+}
+
+fn has_useful_log_artifacts(log_dir: &Path) -> bool {
+    [
+        "terminal-output.txt",
+        "hook-events.jsonl",
+        "diagnostics.jsonl",
+        "pty-forensic-tail.txt",
+    ]
+    .into_iter()
+    .any(|name| log_dir.join(name).is_file())
 }
 
 fn app_data_base_dir() -> Result<PathBuf, String> {
     dirs::data_dir()
         .map(|path| path.join("ClaudeEnvManager"))
         .ok_or_else(|| "无法确定应用数据目录".to_string())
+}
+
+fn write_statusline_settings(
+    settings_path: &Path,
+    endpoint: &str,
+    capture_id: &str,
+    token: &str,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    let curl = std::env::var("SystemRoot")
+        .ok()
+        .map(|root| PathBuf::from(root).join("System32").join("curl.exe"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("curl.exe"));
+    #[cfg(not(windows))]
+    let curl = PathBuf::from("curl");
+    let authorization = format!("Authorization: Bearer {token}");
+    let command = format!(
+        "\"{}\" --silent --max-time 2 --request POST --header \"{}\" --header \"Content-Type: application/json\" --data-binary \"@-\" \"{}/statusline/{}\"",
+        curl.to_string_lossy(),
+        authorization,
+        endpoint,
+        capture_id,
+    );
+    write_json_pretty(
+        settings_path,
+        &json!({
+            "statusLine": {
+                "type": "command",
+                "command": command,
+            }
+        }),
+    )
+    .map_err(|error| format!("写入 Claude observer statusLine 配置失败：{error}"))
+}
+
+fn resolve_existing_statusline_command(
+    env: &HashMap<String, String>,
+    cwd: Option<&str>,
+) -> Result<Option<String>, String> {
+    let config_dir = env
+        .get("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")));
+    let mut paths = Vec::new();
+    if let Some(config_dir) = config_dir {
+        paths.push(config_dir.join("settings.json"));
+    }
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        let project_config = PathBuf::from(cwd).join(".claude");
+        paths.push(project_config.join("settings.json"));
+        paths.push(project_config.join("settings.local.json"));
+    }
+
+    let mut command = None;
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "无法读取 Claude statusLine 配置 {}：{error}",
+                path.display()
+            )
+        })?;
+        let value: Value = serde_json::from_str(&raw).map_err(|error| {
+            format!(
+                "无法解析 Claude statusLine 配置 {}：{error}",
+                path.display()
+            )
+        })?;
+        if let Some(statusline) = value
+            .as_object()
+            .and_then(|object| object.get("statusLine"))
+        {
+            command = statusline
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+        }
+    }
+    Ok(command)
 }
 
 fn write_observer_plugin(
@@ -1567,6 +2117,224 @@ fn read_transcript_tail(path: &Path) -> std::io::Result<String> {
         }
     }
     Ok(contents)
+}
+
+fn latest_transcript_path(events: &VecDeque<ClaudeAgentEvent>) -> Option<PathBuf> {
+    events.iter().rev().find_map(|event| {
+        let value = event
+            .payload
+            .get("transcript_path")
+            .or_else(|| event.payload.get("transcriptPath"))
+            .and_then(Value::as_str)?;
+        let path = PathBuf::from(value);
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+            .then_some(path)
+    })
+}
+
+fn transcript_path_from_payload(payload: &Value) -> Option<PathBuf> {
+    let value = payload
+        .get("transcript_path")
+        .or_else(|| payload.get("transcriptPath"))
+        .and_then(Value::as_str)?;
+    let path = PathBuf::from(value);
+    is_jsonl_path(&path).then_some(path)
+}
+
+fn is_jsonl_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+}
+
+fn usage_token_value(usage: &Value, key: &str) -> u64 {
+    usage
+        .get(key)
+        .and_then(|value| {
+            value.as_u64().or_else(|| {
+                value
+                    .as_f64()
+                    .filter(|number| *number >= 0.0)
+                    .map(|number| number as u64)
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn context_used_tokens(usage: &Value) -> u64 {
+    usage_token_value(usage, "input_tokens")
+        .saturating_add(usage_token_value(usage, "cache_creation_input_tokens"))
+        .saturating_add(usage_token_value(usage, "cache_read_input_tokens"))
+}
+
+fn bounded_percentage(value: f64) -> u8 {
+    value.round().clamp(0.0, 100.0) as u8
+}
+
+fn context_usage_from_statusline(payload: &Value) -> Option<ClaudeContextUsage> {
+    let context = payload.get("context_window")?;
+    let current_usage = context.get("current_usage");
+    let used_tokens = current_usage
+        .map(context_used_tokens)
+        .filter(|tokens| *tokens > 0);
+    let context_window_size = context
+        .get("context_window_size")
+        .and_then(Value::as_u64)
+        .filter(|size| *size > 0);
+    let native_percentage = context
+        .get("used_percentage")
+        .and_then(Value::as_f64)
+        .filter(|percentage| percentage.is_finite() && *percentage >= 0.0);
+    let used_percentage = if native_percentage.is_some_and(|percentage| percentage > 0.0) {
+        bounded_percentage(native_percentage.unwrap_or_default())
+    } else if let (Some(tokens), Some(size)) = (used_tokens, context_window_size) {
+        bounded_percentage(tokens as f64 / size as f64 * 100.0)
+    } else {
+        bounded_percentage(native_percentage?)
+    };
+    let remaining_percentage = context
+        .get("remaining_percentage")
+        .and_then(Value::as_f64)
+        .filter(|percentage| percentage.is_finite() && *percentage >= 0.0)
+        .map(bounded_percentage)
+        .unwrap_or(100u8.saturating_sub(used_percentage));
+    Some(ClaudeContextUsage {
+        used_percentage,
+        remaining_percentage,
+        used_tokens,
+        context_window_size,
+        source: "native".to_string(),
+        updated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+fn infer_context_window_size(current_model: Option<&str>) -> u64 {
+    let model = current_model.unwrap_or_default().to_ascii_lowercase();
+    if model.contains("[1m]") || model.contains("1m context") {
+        1_000_000
+    } else {
+        200_000
+    }
+}
+
+fn same_context_usage(left: &ClaudeContextUsage, right: &ClaudeContextUsage) -> bool {
+    left.used_percentage == right.used_percentage
+        && left.remaining_percentage == right.remaining_percentage
+        && left.used_tokens == right.used_tokens
+        && left.context_window_size == right.context_window_size
+        && left.source == right.source
+}
+
+fn read_transcript_context_usage(
+    path: &Path,
+    context_window_size: u64,
+) -> std::io::Result<Option<ClaudeContextUsage>> {
+    let mut file = fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(MAX_TRANSCRIPT_USAGE_TAIL_BYTES);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut contents = String::from_utf8_lossy(&bytes).into_owned();
+    if start > 0 {
+        if let Some(first_newline) = contents.find('\n') {
+            contents.drain(..=first_newline);
+        } else {
+            return Ok(None);
+        }
+    }
+    for line in contents.lines().rev() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("assistant")
+            || record.get("isSidechain").and_then(Value::as_bool) == Some(true)
+            || record.get("isMeta").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some(usage) = record
+            .get("message")
+            .and_then(|message| message.get("usage"))
+        else {
+            continue;
+        };
+        let used_tokens = context_used_tokens(usage);
+        if used_tokens == 0 || context_window_size == 0 {
+            continue;
+        }
+        let used_percentage =
+            bounded_percentage(used_tokens as f64 / context_window_size as f64 * 100.0);
+        return Ok(Some(ClaudeContextUsage {
+            used_percentage,
+            remaining_percentage: 100u8.saturating_sub(used_percentage),
+            used_tokens: Some(used_tokens),
+            context_window_size: Some(context_window_size),
+            source: "transcript".to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+        }));
+    }
+    Ok(None)
+}
+
+fn event_prompt_text(payload: &Value) -> Option<&str> {
+    ["prompt", "text", "message"]
+        .into_iter()
+        .find_map(|key| payload.get(key).and_then(Value::as_str))
+}
+
+fn normalize_prompt_for_match(value: &str) -> String {
+    value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|character| {
+            let code = *character as u32;
+            (!character.is_control() && code != 0x7f && !(0x80..=0x9f).contains(&code))
+                || matches!(character, '\n' | '\t')
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn read_file_from_offset(path: &Path, offset: u64) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    if length <= offset {
+        return Ok(String::new());
+    }
+    let start = offset.max(length.saturating_sub(MAX_TRANSCRIPT_TAIL_BYTES));
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let mut contents = String::from_utf8_lossy(&bytes).into_owned();
+    if start > offset {
+        if let Some(first_newline) = contents.find('\n') {
+            contents.drain(..=first_newline);
+        } else {
+            contents.clear();
+        }
+    }
+    Ok(contents)
+}
+
+fn transcript_contains_user_prompt(contents: &str, prompt: &str) -> bool {
+    let expected = normalize_prompt_for_match(prompt);
+    parse_transcript_messages(contents).into_iter().any(|event| {
+        event.event_name == "HistoricalUserMessage"
+            && event
+                .payload
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|value| normalize_prompt_for_match(value) == expected)
+    })
 }
 
 fn parse_transcript_messages(contents: &str) -> Vec<HistoricalEvent> {
@@ -2529,6 +3297,7 @@ fn status_for_capture(capture: &CaptureState, available: bool) -> ClaudeObserver
         activity_status: capture.activity_status.clone(),
         current_model: capture.current_model.clone(),
         permission_mode: capture.permission_mode.clone(),
+        context_usage: capture.context_usage.clone(),
     }
 }
 
@@ -2547,6 +3316,7 @@ fn unavailable_snapshot(tab_id: u32, reason: String) -> ClaudeObserverSnapshot {
         activity_status: None,
         current_model: None,
         permission_mode: Some("? for shortcuts".to_string()),
+        context_usage: None,
     }
 }
 
@@ -2768,6 +3538,151 @@ mod tests {
             events[1].payload["text"],
             "<local-command-stdout>Not enough messages to compact.</local-command-stdout>"
         );
+    }
+
+    #[test]
+    fn transcript_submission_confirmation_only_matches_appended_user_prompt() {
+        let appended = concat!(
+            r#"{"type":"user","timestamp":"2026-07-21T00:00:02Z","message":{"content":"  hello\r\nworld  "}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-07-21T00:00:03Z","message":{"content":"answer"}}"#,
+        );
+
+        assert!(transcript_contains_user_prompt(appended, "hello\nworld"));
+        assert!(!transcript_contains_user_prompt(appended, "older prompt"));
+    }
+
+    #[test]
+    fn statusline_context_prefers_native_percentage_and_reports_token_breakdown() {
+        let usage = context_usage_from_statusline(&json!({
+            "context_window": {
+                "used_percentage": 42.4,
+                "remaining_percentage": 57.6,
+                "context_window_size": 200000,
+                "current_usage": {
+                    "input_tokens": 12000,
+                    "cache_creation_input_tokens": 3000,
+                    "cache_read_input_tokens": 69000,
+                    "output_tokens": 99999
+                }
+            }
+        }))
+        .expect("context usage");
+
+        assert_eq!(usage.used_percentage, 42);
+        assert_eq!(usage.remaining_percentage, 58);
+        assert_eq!(usage.used_tokens, Some(84_000));
+        assert_eq!(usage.context_window_size, Some(200_000));
+        assert_eq!(usage.source, "native");
+    }
+
+    #[test]
+    fn statusline_context_calculates_initial_zero_frame_from_tokens() {
+        let usage = context_usage_from_statusline(&json!({
+            "context_window": {
+                "used_percentage": 0,
+                "context_window_size": 200000,
+                "current_usage": {
+                    "input_tokens": 10000,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 30000
+                }
+            }
+        }))
+        .expect("context usage");
+
+        assert_eq!(usage.used_percentage, 20);
+        assert_eq!(usage.remaining_percentage, 80);
+    }
+
+    #[test]
+    fn transcript_context_uses_latest_main_assistant_usage() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":3000,"output_tokens":90000}}}"#,
+                "\n",
+                r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":190000}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":25000,"cache_creation_input_tokens":5000,"cache_read_input_tokens":70000,"output_tokens":50000}}}"#,
+            ),
+        )
+        .expect("write transcript");
+
+        let usage = read_transcript_context_usage(&path, 200_000)
+            .expect("read transcript")
+            .expect("context usage");
+        assert_eq!(usage.used_tokens, Some(100_000));
+        assert_eq!(usage.used_percentage, 50);
+        assert_eq!(usage.source, "transcript");
+    }
+
+    #[test]
+    fn statusline_resolution_uses_local_project_override() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let config_dir = directory.path().join("config");
+        let project_dir = directory.path().join("project");
+        fs::create_dir_all(&config_dir).expect("config directory");
+        fs::create_dir_all(project_dir.join(".claude")).expect("project config directory");
+        fs::write(
+            config_dir.join("settings.json"),
+            r#"{"statusLine":{"type":"command","command":"user-hud"}}"#,
+        )
+        .expect("user settings");
+        fs::write(
+            project_dir.join(".claude").join("settings.local.json"),
+            r#"{"statusLine":{"type":"command","command":"project-hud"}}"#,
+        )
+        .expect("project settings");
+        let env = HashMap::from([(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            config_dir.to_string_lossy().to_string(),
+        )]);
+
+        assert_eq!(
+            resolve_existing_statusline_command(
+                &env,
+                Some(project_dir.to_string_lossy().as_ref()),
+            )
+            .expect("resolve statusline"),
+            Some("project-hud".to_string()),
+        );
+    }
+
+    #[test]
+    fn historical_log_lookup_skips_newer_metadata_only_capture() {
+        let root =
+            std::env::temp_dir().join(format!("agents-launcher-log-test-{}", Uuid::new_v4()));
+        let older = root.join("older");
+        let newer = root.join("newer");
+        fs::create_dir_all(&older).expect("older log dir");
+        fs::create_dir_all(&newer).expect("newer log dir");
+        write_json_pretty(
+            &older.join("metadata.json"),
+            &json!({
+                "projectSessionId": "session-1",
+                "startedAt": "2026-07-27T01:34:52Z",
+            }),
+        )
+        .expect("older metadata");
+        fs::write(older.join("terminal-output.txt"), "captured output")
+            .expect("older terminal log");
+        write_json_pretty(
+            &newer.join("metadata.json"),
+            &json!({
+                "projectSessionId": "session-1",
+                "startedAt": "2026-07-27T01:43:50Z",
+            }),
+        )
+        .expect("newer metadata");
+
+        assert_eq!(
+            find_latest_project_log_dir(&root, "session-1", true),
+            Some(older)
+        );
+        fs::remove_dir_all(root).expect("remove log fixture");
     }
 
     #[test]

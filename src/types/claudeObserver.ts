@@ -29,6 +29,18 @@ export interface ClaudePromptReceipt {
   terminalLogBaseline?: string
 }
 
+export interface ClaudePromptSubmissionBaseline {
+  captureId: string
+  eventSequence: number
+  transcriptLen?: number | null
+}
+
+export interface ClaudeTerminalLogResult {
+  text: string
+  logDir: string
+  historical: boolean
+}
+
 export interface ClaudeAgentEvent {
   id: string
   sequence: number
@@ -79,6 +91,15 @@ export interface ClaudeActivityStatus {
   phase?: string | null
 }
 
+export interface ClaudeContextUsage {
+  usedPercentage: number
+  remainingPercentage: number
+  usedTokens?: number | null
+  contextWindowSize?: number | null
+  source: 'native' | 'transcript'
+  updatedAt: string
+}
+
 export interface ClaudeObserverStatus {
   tabId: number
   statusRevision: number
@@ -91,6 +112,7 @@ export interface ClaudeObserverStatus {
   activityStatus?: ClaudeActivityStatus | null
   currentModel?: string | null
   permissionMode?: string | null
+  contextUsage?: ClaudeContextUsage | null
 }
 
 export interface ClaudeObserverSnapshot extends ClaudeObserverStatus {
@@ -132,6 +154,7 @@ export interface ClaudeConversationState {
   permissionMode?: string
   pendingPermissionMode?: 'bypassPermissions' | 'auto' | 'default' | 'acceptEdits' | 'plan'
   currentContext?: ClaudeModelContext
+  contextUsage?: ClaudeContextUsage
   queuedPrompts: ClaudeQueuedPrompt[]
   queueActionPending: boolean
 }

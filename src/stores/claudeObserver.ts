@@ -35,7 +35,9 @@ import type {
   ClaudeObserverSnapshot,
   ClaudeObserverStatus,
   ClaudePromptReceipt,
+  ClaudePromptSubmissionBaseline,
   ClaudeQueuedPrompt,
+  ClaudeTerminalLogResult,
   ClaudeTerminalPrompt,
 } from '@/types/claudeObserver'
 
@@ -169,6 +171,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
   const CLAUDE_MODEL_SELECTION_TIMEOUT_MS = 3_000
   const CLAUDE_COMPACT_COMPLETION_TIMEOUT_MS = 5 * 60_000
   const CLAUDE_COMPACT_COMPLETION_POLL_MS = 500
+  const CLAUDE_PROMPT_HOOK_TIMEOUT_MS = 6_000
 
   function waitForClaudeInputFrame(delayMs: number) {
     return new Promise<void>((resolve) => window.setTimeout(resolve, delayMs))
@@ -665,6 +668,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
         state.pendingPermissionMode = undefined
       }
     }
+    state.contextUsage = status.contextUsage ?? undefined
     const nextTerminalPrompt = state.active
       ? normalizeClaudeTerminalPrompt(status.terminalPrompt)
       : undefined
@@ -761,15 +765,25 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     }
   }
 
-  async function refreshTerminalLog(tabId: number): Promise<string | undefined> {
+  async function refreshTerminalLog(
+    tabId: number,
+    projectSessionId?: string,
+  ): Promise<string | undefined> {
     const state = stateFor(tabId)
     try {
-      const terminalLog = await invoke<string>('get_claude_terminal_log', {
+      const result = await invoke<ClaudeTerminalLogResult>('get_claude_terminal_log', {
         tabId,
         maxLines: 800,
+        projectSessionId,
       })
-      state.terminalLog = terminalLog
-      return terminalLog
+      state.terminalLog = result.text
+      state.logDir = result.logDir
+      if (result.historical) {
+        state.degradedReason = '当前终端没有实时观察日志，正在显示该项目会话最近一次历史日志。'
+      } else if (state.degradedReason?.startsWith('终端日志读取失败：')) {
+        state.degradedReason = undefined
+      }
+      return result.text
     } catch (error) {
       state.degradedReason = `终端日志读取失败：${error}`
       return undefined
@@ -853,8 +867,8 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     return true
   }
 
-  async function openLogDirectory(tabId: number) {
-    await invoke('open_claude_log_dir', { tabId })
+  async function openLogDirectory(tabId: number, projectSessionId?: string) {
+    await invoke('open_claude_log_dir', { tabId, projectSessionId })
   }
 
   async function loadBusyInputMode() {
@@ -1137,6 +1151,16 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     ) {
       throw new Error('当前状态需要在原始终端中继续')
     }
+    let submissionBaseline: ClaudePromptSubmissionBaseline | undefined
+    try {
+      submissionBaseline = await invoke<ClaudePromptSubmissionBaseline>(
+        'begin_claude_prompt_submission',
+        { tabId },
+      )
+    } catch {
+      // The PTY write still provides the primary delivery result. A missing
+      // baseline only disables the transcript fallback used by the watchdog.
+    }
     const terminalLogBaseline = await refreshTerminalLog(tabId) ?? state.terminalLog
     ptyRunStateByTab.set(tabId, 'working')
     state.runState = 'working'
@@ -1197,13 +1221,29 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
       await loadSnapshot(tabId)
       if (confirmCompactCommandReceipt(tabId)) return
       if (receiptsFor(tabId).includes(promptReceipt) && current.active) {
+        let submissionAccepted = false
+        if (submissionBaseline) {
+          try {
+            submissionAccepted = await invoke<boolean>('confirm_claude_prompt_submission', {
+              tabId,
+              prompt,
+              baseline: submissionBaseline,
+            })
+          } catch {
+            submissionAccepted = false
+          }
+        }
+        if (!receiptsFor(tabId).includes(promptReceipt) || !current.active) return
         removePromptReceiptByIdentity(tabId, promptReceipt)
+        pendingDirectPrompts.delete(tabId)
         unconfirmedTerminalInputTabs.add(tabId)
         current.available = false
-        current.degradedReason = '发送后未收到 Claude Hook 事件，已停止结构化输入；请切换到原始终端继续。'
-        invoke('report_claude_observer_timeout', { tabId }).catch(() => {})
+        current.degradedReason = submissionAccepted
+          ? '消息已提交到 Claude，但未收到对应 Hook 事件；已停止结构化输入，请在原始终端查看回复。'
+          : '未能确认 Claude 已接收消息，且未收到对应 Hook 事件；已停止结构化输入，请切换到原始终端确认后继续。'
+        invoke('report_claude_observer_timeout', { tabId, submissionAccepted }).catch(() => {})
       }
-    }, 2_500)
+    }, CLAUDE_PROMPT_HOOK_TIMEOUT_MS)
     return true
   }
 

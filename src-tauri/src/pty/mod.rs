@@ -145,8 +145,10 @@ pub fn pty_create(
 
     let mut observer_error = None;
     let prepared_capture = if cli_kind == CliKind::Claude && observe_claude.unwrap_or(false) {
-        match observer.prepare_capture(cols, rows, project_session_id, &env) {
+        match observer.prepare_capture(cols, rows, project_session_id, cwd.as_deref(), &env) {
             Ok(capture) => {
+                cmd.insert(1, capture.settings_path.to_string_lossy().to_string());
+                cmd.insert(1, "--settings".to_string());
                 cmd.insert(1, capture.plugin_dir.to_string_lossy().to_string());
                 cmd.insert(1, "--plugin-dir".to_string());
                 env.insert(
@@ -410,10 +412,15 @@ pub fn pty_write(
         // Step B: early flush — if buffer doesn't start with "tab-", pass through immediately
         if !is_tab_command_prefix(&line_buffer) {
             let bytes_to_send = std::mem::take(&mut line_buffer);
-            if let Some(session) = mgr.sessions.get_mut(&tab_id) {
-                let _ = session.writer.write_all(&bytes_to_send);
-            }
             mgr.line_buffers.insert(tab_id, line_buffer);
+            let session = mgr
+                .sessions
+                .get_mut(&tab_id)
+                .ok_or_else(|| format!("PTY tab {tab_id} not found"))?;
+            session
+                .writer
+                .write_all(&bytes_to_send)
+                .map_err(|error| format!("PTY tab {tab_id} write failed: {error}"))?;
             return Ok(());
         }
 
@@ -438,9 +445,16 @@ pub fn pty_write(
                         Ok(result) => {
                             // Write immediate output to caller's PTY (if any, None for --wait mode with deferred reply)
                             if let Some(output) = result.immediate_output {
-                                if let Some(session) = mgr.sessions.get_mut(&tab_id) {
-                                    let _ = session.writer.write_all(output.as_bytes());
-                                }
+                                let session = mgr
+                                    .sessions
+                                    .get_mut(&tab_id)
+                                    .ok_or_else(|| format!("PTY tab {tab_id} not found"))?;
+                                session
+                                    .writer
+                                    .write_all(output.as_bytes())
+                                    .map_err(|error| {
+                                        format!("PTY tab {tab_id} write failed: {error}")
+                                    })?;
                             }
                             // Apply pending actions (add/remove pending replies) -- critical for --wait mode
                             for action in result.pending_actions {
@@ -472,12 +486,17 @@ pub fn pty_write(
                             }
                         }
                         Err(e) => {
-                            if let Some(session) = mgr.sessions.get_mut(&tab_id) {
-                                use std::io::Write;
-                                let err_msg =
-                                    crate::tab_cli::format_message(&format!("Error: {}", e));
-                                let _ = session.writer.write_all(err_msg.as_bytes());
-                            }
+                            let session = mgr
+                                .sessions
+                                .get_mut(&tab_id)
+                                .ok_or_else(|| format!("PTY tab {tab_id} not found"))?;
+                            let err_msg = crate::tab_cli::format_message(&format!("Error: {}", e));
+                            session
+                                .writer
+                                .write_all(err_msg.as_bytes())
+                                .map_err(|error| {
+                                    format!("PTY tab {tab_id} write failed: {error}")
+                                })?;
                         }
                     }
                     continue;
@@ -496,15 +515,21 @@ pub fn pty_write(
             }
         }
 
+        // Restore the (possibly partially consumed) line buffer before writing,
+        // so a failed PTY write does not also lose parser state.
+        mgr.line_buffers.insert(tab_id, line_buffer);
+
         // Write all passthrough bytes to PTY
         for bytes in passthrough_bytes {
-            if let Some(session) = mgr.sessions.get_mut(&tab_id) {
-                let _ = session.writer.write_all(&bytes);
-            }
+            let session = mgr
+                .sessions
+                .get_mut(&tab_id)
+                .ok_or_else(|| format!("PTY tab {tab_id} not found"))?;
+            session
+                .writer
+                .write_all(&bytes)
+                .map_err(|error| format!("PTY tab {tab_id} write failed: {error}"))?;
         }
-
-        // Restore the (possibly partially consumed) line buffer
-        mgr.line_buffers.insert(tab_id, line_buffer);
     }
 
     Ok(())

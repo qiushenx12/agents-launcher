@@ -549,6 +549,35 @@
             {{ permissionModeLabel }}
           </span>
           <span class="claude-composer__actions-spacer" />
+          <span
+            v-if="contextUsage"
+            class="claude-composer__context-usage"
+            :class="`is-${contextUsageTone}`"
+            :aria-label="contextUsageTitle"
+            role="img"
+            aria-live="polite"
+          >
+            <svg
+              class="claude-composer__context-ring"
+              viewBox="0 0 20 20"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <circle class="claude-composer__context-ring-track" cx="10" cy="10" r="7" />
+              <circle
+                class="claude-composer__context-ring-value"
+                cx="10"
+                cy="10"
+                r="7"
+                transform="rotate(-90 10 10)"
+                :stroke-dasharray="contextRingCircumference"
+                :stroke-dashoffset="contextRingOffset"
+              />
+            </svg>
+            <span class="claude-composer__context-tooltip" role="tooltip" aria-hidden="true">
+              <span class="claude-composer__context-tooltip-main">{{ contextUsageTooltipMain }}</span>
+            </span>
+          </span>
           <div
             class="claude-composer__model-picker-shell"
           >
@@ -1508,6 +1537,50 @@ const baseModelLabel = computed(() => baseModel.value || '默认模型')
 const currentModelLabel = computed(() => (
   state.value.currentModel?.trim() || configuredModel.value || '默认模型'
 ))
+
+const contextUsage = computed(() => props.startupMode ? undefined : state.value.contextUsage)
+
+const contextUsageTone = computed(() => {
+  const percentage = contextUsage.value?.usedPercentage ?? 0
+  if (percentage >= 85) return 'critical'
+  if (percentage >= 70) return 'warning'
+  return 'normal'
+})
+
+function formatContextTokens(value: number) {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1).replace(/\.0$/, '')}k`
+  return String(value)
+}
+
+const contextUsageTitle = computed(() => {
+  const usage = contextUsage.value
+  if (!usage) return ''
+  const details = usage.usedTokens != null && usage.contextWindowSize != null
+    ? `已使用 ${formatContextTokens(usage.usedTokens)} / ${formatContextTokens(usage.contextWindowSize)}`
+    : `已使用 ${usage.usedPercentage}%`
+  const source = usage.source === 'native' ? 'Claude 原生数据' : '根据会话记录估算'
+  return `${details}，剩余 ${usage.remainingPercentage}% · ${source}`
+})
+
+const CONTEXT_RING_RADIUS = 7
+const contextRingCircumference = 2 * Math.PI * CONTEXT_RING_RADIUS
+
+const contextRingOffset = computed(() => {
+  const percentage = Math.min(100, Math.max(0, contextUsage.value?.usedPercentage ?? 0))
+  return contextRingCircumference * (1 - percentage / 100)
+})
+
+const contextUsageTooltipMain = computed(() => {
+  const usage = contextUsage.value
+  if (!usage) return ''
+  if (usage.usedTokens != null && usage.contextWindowSize != null) {
+    const used = formatContextTokens(usage.usedTokens)
+    const total = formatContextTokens(usage.contextWindowSize)
+    return `已用${usage.usedPercentage}% ${used}/${total}`
+  }
+  return `已用${usage.usedPercentage}%`
+})
 
 const selectedEffort = computed(() => {
   const effort = claudeStore.editingConfig.vars['CLAUDE_CODE_EFFORT_LEVEL']?.trim() ?? ''
@@ -2622,8 +2695,8 @@ defineExpose({ appendDroppedFiles })
 <style scoped>
 .claude-conversation {
   --claude-content-width: min(720px, 100%);
-  --claude-content-font-size: 14px;
-  --claude-meta-font-size: 12px;
+  --claude-content-font-size: var(--font-size-title, 14px);
+  --claude-meta-font-size: var(--font-size-small, 12px);
   --claude-content-line-height: 1.55;
   --claude-item-gap: 16px;
   --claude-block-padding: 12px;
@@ -4018,6 +4091,91 @@ defineExpose({ appendDroppedFiles })
 
 .claude-composer__actions-spacer {
   flex: 1;
+}
+
+.claude-composer__context-usage {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  margin-right: 6px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  line-height: 1;
+  user-select: none;
+}
+
+.claude-composer__context-usage:hover {
+  background: color-mix(in srgb, var(--claude-field-bg) 64%, transparent);
+}
+
+.claude-composer__context-usage.is-warning {
+  color: #a57500;
+}
+
+.claude-composer__context-usage.is-critical {
+  color: var(--danger);
+}
+
+[data-theme="dark"] .claude-composer__context-usage.is-warning {
+  color: #f0c85a;
+}
+
+.claude-composer__context-ring {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+
+.claude-composer__context-ring-track {
+  fill: none;
+  stroke: color-mix(in srgb, currentColor 22%, transparent);
+  stroke-width: 2.5;
+}
+
+.claude-composer__context-ring-value {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.35s ease;
+}
+
+.claude-composer__context-tooltip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--claude-composer-border) 72%, transparent);
+  border-radius: 8px;
+  background: var(--claude-field-bg);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.16);
+  color: var(--text-primary);
+  font-size: var(--claude-meta-font-size);
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateX(-50%) translateY(3px);
+  transition: opacity 0.12s ease, transform 0.12s ease, visibility 0.12s;
+  pointer-events: none;
+}
+
+.claude-composer__context-usage:hover .claude-composer__context-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
+
+.claude-composer__context-tooltip-main {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
 }
 
 .claude-composer__permission-mode {

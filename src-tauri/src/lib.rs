@@ -171,6 +171,8 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_kill,
             claude_observer::get_claude_observer_snapshot,
+            claude_observer::begin_claude_prompt_submission,
+            claude_observer::confirm_claude_prompt_submission,
             claude_observer::get_claude_terminal_log,
             claude_observer::open_claude_log_dir,
             claude_observer::report_claude_observer_timeout,

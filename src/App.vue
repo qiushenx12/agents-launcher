@@ -6,13 +6,12 @@
       :style="{
         '--project-nav-width': `${leftSidebarOpen ? sharedSidebarHeaderWidth : 45}px`,
       }"
-      data-tauri-drag-region
-      @dblclick="toggleMaximize"
+      @mousedown="startTitleBarDrag"
+      @dblclick="handleTitleBarDoubleClick"
     >
       <div
         class="title-bar__workspace-section"
         :class="{ 'title-bar__workspace-section--collapsed': !leftSidebarOpen }"
-        @dblclick.stop
       >
         <span class="title-bar__sidebar-slot">
           <button
@@ -56,7 +55,7 @@
         </nav>
       </div>
 
-      <nav class="title-bar__tabs" aria-label="前端" @dblclick.stop>
+      <nav class="title-bar__tabs" aria-label="前端">
         <button
           v-for="kind in topBarStore.cliOrder"
           :key="kind"
@@ -70,7 +69,7 @@
         </button>
       </nav>
 
-      <div class="title-bar__controls" @dblclick.stop>
+      <div class="title-bar__controls">
         <button
           class="title-bar__control"
           data-tauri-drag-region="false"
@@ -332,6 +331,10 @@ import { useConfigWorkspaceStore } from './stores/configWorkspace'
 import { useTopBarStore } from './stores/topBar'
 import { usePlatform } from './composables/usePlatform'
 import {
+  shouldStartTitleBarDrag,
+  shouldToggleTitleBarMaximize,
+} from './utils/windowTitleBar'
+import {
   CLI_DESCRIPTORS,
   isCliKind,
   normalizePersistedMainTab,
@@ -491,6 +494,16 @@ async function selectCliKind(kind: CliKind) {
 // ── Window controls ────────────────────────────────────────────────────────
 const win = getCurrentWindow()
 const isMaximized = ref(false)
+
+function startTitleBarDrag(event: MouseEvent) {
+  if (!shouldStartTitleBarDrag(event)) return
+  void win.startDragging().catch(() => {})
+}
+
+function handleTitleBarDoubleClick(event: MouseEvent) {
+  if (!shouldToggleTitleBarMaximize(event)) return
+  void toggleMaximize()
+}
 
 async function minimizeWindow() {
   await win.minimize().catch(() => {})

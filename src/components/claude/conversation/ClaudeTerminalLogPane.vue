@@ -24,7 +24,10 @@
 import { computed, onMounted } from 'vue'
 import { useClaudeObserverStore } from '@/stores/claudeObserver'
 
-const props = defineProps<{ tabId: number }>()
+const props = defineProps<{
+  tabId: number
+  projectSessionId: string
+}>()
 const observerStore = useClaudeObserverStore()
 const state = computed(() => observerStore.states[props.tabId] ?? {
   tabId: props.tabId,
@@ -39,12 +42,12 @@ const state = computed(() => observerStore.states[props.tabId] ?? {
 })
 
 async function refresh() {
-  await observerStore.refreshTerminalLog(props.tabId)
+  await observerStore.refreshTerminalLog(props.tabId, props.projectSessionId)
 }
 
 async function openDirectory() {
   try {
-    await observerStore.openLogDirectory(props.tabId)
+    await observerStore.openLogDirectory(props.tabId, props.projectSessionId)
   } catch (error) {
     state.value.degradedReason = `打开日志目录失败：${error}`
   }

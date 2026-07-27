@@ -288,6 +288,7 @@ export const useProjectStore = defineStore('project', () => {
   })
 
   const sessionTerminalIds = ref<Record<string, number>>({})
+  const sessionTerminalLaunches = new Map<string, Promise<number | null>>()
   const persistedRootExtras = ref<Record<string, unknown>>({})
   const pendingClaudeClearSessionIds = new Map<number, string>()
   let projectsLoaded = false
@@ -1732,78 +1733,98 @@ export const useProjectStore = defineStore('project', () => {
     const existing = terminalStore.tabs.find((t) => t.id === existingId)
     if (existing && existing.alive) return existing.id
 
-    const runtimeStore = useCliRuntimeStore()
-    const runtimeStatus = await runtimeStore.check(session.cliKind)
-    if (runtimeStatus.state !== 'ready') {
-      return failSessionTerminalLaunch(runtimeStatus.message, options)
-    }
-    const envVars: Record<string, string> = {}
-    let cmd: string[]
-    if (session.cliKind === 'claude') {
-      const claudeStore = useClaudeStore()
-      const profileVars = claudeStore.editingConfig.vars
-      for (const [key, value] of Object.entries(profileVars)) {
-        if (value) envVars[key] = value
-      }
-      const args: string[] = []
-      if (claudeStore.skipPermissions) args.push('--dangerously-skip-permissions')
-      const nativeSessionId = session.nativeSessionId ?? session.claudeSessionId
-      if (nativeSessionId) args.push('-r', nativeSessionId)
-      cmd = [runtimeStore.executable('claude'), ...args]
-    } else if (session.cliKind === 'codex') {
-      const codexStore = useCodexConfigStore()
-      const { isWindows } = usePlatform()
-      const args: string[] = ['--no-alt-screen']
-      // This is a Windows ConPTY/IME workaround. Unix PTYs must keep Codex's
-      // normal paste heuristics and receive their UTF-8 input untouched.
-      if (isWindows.value) args.push('-c', 'disable_paste_burst=true')
-      try {
-        await codexStore.ensureLoaded()
-        if (codexStore.globalConfigError) {
-          return failSessionTerminalLaunch(codexStore.globalConfigError, options)
-        }
-        const activeProfileRef = codexStore.activeProfileRef
-        if (activeProfileRef) {
-          const context = await codexStore.resolveLaunchContext(activeProfileRef.profileId)
-          args.push('--profile', context.managedProfileName)
-          Object.assign(envVars, context.envVars)
-        }
-      } catch (error) {
-        return failSessionTerminalLaunch(`CodeX 配置无法用于启动：${error}`, options)
-      }
-      args.push('-C', project.path)
-      if (session.nativeSessionId) {
-        args.push('resume', session.nativeSessionId)
-      } else if (session.launchMode === 'resume_picker') {
-        args.push('resume')
-      }
-      cmd = [runtimeStore.executable('codex'), ...args]
-    } else {
-      const args: string[] = []
-      const opencodeStore = useOpencodeConfigStore()
-      try {
-        await opencodeStore.resolveLaunchContext(
-          session.cwd || project.path,
-        )
-      } catch (error) {
-        return failSessionTerminalLaunch(
-          `OpenCode 当前配置获取失败，已阻止启动：${error}`,
-          options,
-        )
-      }
-      if (session.nativeSessionId) args.push('--session', session.nativeSessionId)
-      cmd = [runtimeStore.executable('opencode'), ...args]
+    const pendingLaunch = sessionTerminalLaunches.get(sessionId)
+    if (pendingLaunch) return pendingLaunch
+
+    // Do not keep rendering the conversation/log panes against a released tab
+    // while a replacement PTY is being created.
+    if (existingId) {
+      delete sessionTerminalIds.value[sessionId]
+      if (existing) await terminalStore.closeTab(existingId)
     }
 
-    const tabId = await terminalStore.createTab(cmd, envVars, session.cwd || project.path, session.name, {
-      scope: 'project',
-      projectSessionId: session.id,
-      activate: false,
-      cliKind: session.cliKind,
-      observeClaude: session.cliKind === 'claude',
-    })
-    sessionTerminalIds.value[session.id] = tabId
-    return tabId
+    const launch = (async (): Promise<number | null> => {
+      const runtimeStore = useCliRuntimeStore()
+      const runtimeStatus = await runtimeStore.check(session.cliKind)
+      if (runtimeStatus.state !== 'ready') {
+        return failSessionTerminalLaunch(runtimeStatus.message, options)
+      }
+      const envVars: Record<string, string> = {}
+      let cmd: string[]
+      if (session.cliKind === 'claude') {
+        const claudeStore = useClaudeStore()
+        const profileVars = claudeStore.editingConfig.vars
+        for (const [key, value] of Object.entries(profileVars)) {
+          if (value) envVars[key] = value
+        }
+        const args: string[] = []
+        if (claudeStore.skipPermissions) args.push('--dangerously-skip-permissions')
+        const nativeSessionId = session.nativeSessionId ?? session.claudeSessionId
+        if (nativeSessionId) args.push('-r', nativeSessionId)
+        cmd = [runtimeStore.executable('claude'), ...args]
+      } else if (session.cliKind === 'codex') {
+        const codexStore = useCodexConfigStore()
+        const { isWindows } = usePlatform()
+        const args: string[] = ['--no-alt-screen']
+        // This is a Windows ConPTY/IME workaround. Unix PTYs must keep Codex's
+        // normal paste heuristics and receive their UTF-8 input untouched.
+        if (isWindows.value) args.push('-c', 'disable_paste_burst=true')
+        try {
+          await codexStore.ensureLoaded()
+          if (codexStore.globalConfigError) {
+            return failSessionTerminalLaunch(codexStore.globalConfigError, options)
+          }
+          const activeProfileRef = codexStore.activeProfileRef
+          if (activeProfileRef) {
+            const context = await codexStore.resolveLaunchContext(activeProfileRef.profileId)
+            args.push('--profile', context.managedProfileName)
+            Object.assign(envVars, context.envVars)
+          }
+        } catch (error) {
+          return failSessionTerminalLaunch(`CodeX 配置无法用于启动：${error}`, options)
+        }
+        args.push('-C', project.path)
+        if (session.nativeSessionId) {
+          args.push('resume', session.nativeSessionId)
+        } else if (session.launchMode === 'resume_picker') {
+          args.push('resume')
+        }
+        cmd = [runtimeStore.executable('codex'), ...args]
+      } else {
+        const args: string[] = []
+        const opencodeStore = useOpencodeConfigStore()
+        try {
+          await opencodeStore.resolveLaunchContext(
+            session.cwd || project.path,
+          )
+        } catch (error) {
+          return failSessionTerminalLaunch(
+            `OpenCode 当前配置获取失败，已阻止启动：${error}`,
+            options,
+          )
+        }
+        if (session.nativeSessionId) args.push('--session', session.nativeSessionId)
+        cmd = [runtimeStore.executable('opencode'), ...args]
+      }
+
+      const tabId = await terminalStore.createTab(cmd, envVars, session.cwd || project.path, session.name, {
+        scope: 'project',
+        projectSessionId: session.id,
+        activate: false,
+        cliKind: session.cliKind,
+        observeClaude: session.cliKind === 'claude',
+      })
+      sessionTerminalIds.value[session.id] = tabId
+      return tabId
+    })()
+    sessionTerminalLaunches.set(sessionId, launch)
+    try {
+      return await launch
+    } finally {
+      if (sessionTerminalLaunches.get(sessionId) === launch) {
+        sessionTerminalLaunches.delete(sessionId)
+      }
+    }
   }
 
   async function closeSessionTerminal(sessionId = activeSessionId.value) {
