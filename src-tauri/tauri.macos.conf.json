@@ -1,4 +1,26 @@
 {
+  "app": {
+    "windows": [
+      {
+        "title": "Agents Launcher",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "decorations": true,
+        "transparent": false,
+        "center": true,
+        "visible": false,
+        "theme": null,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 14,
+          "y": 21
+        }
+      }
+    ]
+  },
   "bundle": {
     "targets": ["app", "dmg"],
     "icon": ["icons/app.icns"],
