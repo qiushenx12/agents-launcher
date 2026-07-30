@@ -70,6 +70,9 @@ pub fn run() {
                     let style = persistent_state::load_title_bar_style_value()
                         .unwrap_or_else(|_| "macos".to_string());
                     let style_result = if style == "macos" {
+                        // Keep native traffic lights and AppKit's fullscreen
+                        // transition; the green button is wired below so the
+                        // web title-bar animation can run in the correct order.
                         window
                             .set_decorations(true)
                             .and_then(|_| {

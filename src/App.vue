@@ -306,20 +306,6 @@
           <div class="settings-dropdown__font-row"><span>Markdown 字体</span><div class="font-size-row"><button class="font-size-btn" type="button" :disabled="mdFontSize <= MD_FONT_MIN" aria-label="减小 Markdown 字体" @click="setMdFontSize(mdFontSize - 1)">−</button><span class="font-size-value">{{ mdFontSize }}px</span><button class="font-size-btn" type="button" :disabled="mdFontSize >= MD_FONT_MAX" aria-label="增大 Markdown 字体" @click="setMdFontSize(mdFontSize + 1)">+</button></div></div>
         </div>
       </div>
-      <div class="settings-dropdown__section">Markdown 字体大小</div>
-      <div class="settings-dropdown__item font-size-row">
-        <button
-          class="font-size-btn"
-          :disabled="mdFontSize <= MD_FONT_MIN"
-          @click="setMdFontSize(mdFontSize - 1)"
-        >−</button>
-        <span class="font-size-value">{{ mdFontSize }}px</span>
-        <button
-          class="font-size-btn"
-          :disabled="mdFontSize >= MD_FONT_MAX"
-          @click="setMdFontSize(mdFontSize + 1)"
-        >+</button>
-      </div>
 
       <template v-if="isMacOS">
         <div class="settings-dropdown__section">标题栏风格</div>
@@ -847,7 +833,7 @@ async function setPreferredTitleBarStyle(style: TitleBarStyle) {
     showSettings.value = false
     const label = style === 'macos' ? 'macOS 原生交通灯' : 'Windows 风格'
     const closeNow = window.confirm(
-      `标题栏已切换为”${label}”，重启应用后生效。\n\n是否现在关闭应用？`
+      `标题栏已切换为"${label}"，重启应用后生效。\n\n是否现在关闭应用？`
     )
     if (closeNow) {
       await closeWindow()
@@ -1254,7 +1240,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  background-color: var(--bg);
+  background: var(--app-bg-gradient);
   position: relative;
 }
 
@@ -1269,7 +1255,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: flex-start;
   padding: 0 8px 0 0;
-  background-color: var(--card);
+  background: var(--card-bg-gradient);
   user-select: none;
 }
 
@@ -1552,7 +1538,7 @@ onBeforeUnmount(() => {
 
 .settings-dropdown__menu,
 .settings-dropdown__submenu {
-  background-color: var(--card);
+  background: var(--card-bg-gradient);
   border: 1px solid var(--input-border);
   border-radius: 10px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
@@ -1784,6 +1770,7 @@ onBeforeUnmount(() => {
   flex: 1;
   overflow: hidden;
   position: relative;
+  background: var(--app-bg-gradient);
 }
 
 .app-panel {
