@@ -365,46 +365,6 @@
         </div>
       </div>
 
-      <template v-if="isMacOS">
-        <div class="settings-dropdown__section">标题栏风格</div>
-        <button
-          class="settings-dropdown__item"
-          :class="{ active: preferredTitleBarStyle === 'macos' }"
-          @click="setPreferredTitleBarStyle('macos')"
-        >
-          <span class="settings-dropdown__check" v-if="preferredTitleBarStyle === 'macos'">✓</span>
-          <span class="settings-dropdown__check" v-else></span>
-          <span class="settings-dropdown__item-label">macOS 原生交通灯</span>
-          <span
-            v-if="titleBarRestartPending && preferredTitleBarStyle === 'macos'"
-            class="settings-dropdown__meta"
-          >
-            重启后生效
-          </span>
-        </button>
-        <button
-          class="settings-dropdown__item"
-          :class="{ active: preferredTitleBarStyle === 'windows' }"
-          @click="setPreferredTitleBarStyle('windows')"
-        >
-          <span class="settings-dropdown__check" v-if="preferredTitleBarStyle === 'windows'">✓</span>
-          <span class="settings-dropdown__check" v-else></span>
-          <span class="settings-dropdown__item-label">Windows 风格</span>
-          <span
-            v-if="titleBarRestartPending && preferredTitleBarStyle === 'windows'"
-            class="settings-dropdown__meta"
-          >
-            重启后生效
-          </span>
-        </button>
-      </template>
-
-      <div class="settings-dropdown__section">界面布局</div>
-      <button class="settings-dropdown__item" @click="openTopBarOrderModal">
-        <span class="settings-dropdown__check">↕</span>
-        <span class="settings-dropdown__item-label">顶栏排序</span>
-        <span class="settings-dropdown__chevron">›</span>
-      </button>
     </div>
 
     <TopBarOrderModal
@@ -452,8 +412,6 @@ import type { ClaudeAgentEvent } from './types/claudeObserver'
 type DependencyName = 'node' | 'git'
 type DependencyStatus = 'installed' | 'missing' | 'unsupported' | 'error'
 type DependencyGateState = 'checking' | 'missing' | 'unsupported' | 'error' | 'installing' | 'restart_required' | 'ready'
-type TitleBarStyle = 'macos' | 'windows'
-
 const claudeViewOptions: Array<{ value: ClaudeView; label: string }> = [
   { value: 'conversation', label: '界面' },
   { value: 'terminal', label: '终端' },
@@ -483,18 +441,7 @@ const cliRuntimeStore = useCliRuntimeStore()
 const configWorkspaceStore = useConfigWorkspaceStore()
 const topBarStore = useTopBarStore()
 const { isWindows, isMacOS } = usePlatform()
-const cachedTitleBarStyle = localStorage.getItem('title-bar-style')
-const initialTitleBarStyle: TitleBarStyle = isMacOS.value && cachedTitleBarStyle !== 'windows'
-  ? 'macos'
-  : 'windows'
-const appliedTitleBarStyle = ref<TitleBarStyle>(initialTitleBarStyle)
-const preferredTitleBarStyle = ref<TitleBarStyle>(initialTitleBarStyle)
-const usesNativeMacTitleBar = computed(() => (
-  isMacOS.value && appliedTitleBarStyle.value === 'macos'
-))
-const titleBarRestartPending = computed(() => (
-  preferredTitleBarStyle.value !== appliedTitleBarStyle.value
-))
+const usesNativeMacTitleBar = computed(() => isMacOS.value)
 const terminalManagerRef = ref<InstanceType<typeof TerminalManager> | null>(null)
 const projectPanelRef = ref<InstanceType<typeof ProjectPanel> | null>(null)
 const topBarOrderModalOpen = ref(false)
@@ -939,42 +886,6 @@ async function setClaudeBusyInputMode(mode: 'native' | 'after-stop') {
   }
 }
 
-async function loadTitleBarStyle() {
-  if (!isMacOS.value) return
-  try {
-    const saved = await invoke<TitleBarStyle>('load_title_bar_style')
-    const style = saved === 'windows' ? 'windows' : 'macos'
-    appliedTitleBarStyle.value = style
-    preferredTitleBarStyle.value = style
-    localStorage.setItem('title-bar-style', style)
-  } catch {
-    // The backend already applied the platform default before showing the window.
-  }
-}
-
-async function setPreferredTitleBarStyle(style: TitleBarStyle) {
-  if (!isMacOS.value || style === preferredTitleBarStyle.value) {
-    showSettings.value = false
-    return
-  }
-
-  try {
-    await invoke('save_title_bar_style', { style })
-    preferredTitleBarStyle.value = style
-    localStorage.setItem('title-bar-style', style)
-    showSettings.value = false
-    const label = style === 'macos' ? 'macOS 原生交通灯' : 'Windows 风格'
-    const closeNow = window.confirm(
-      `标题栏已切换为"${label}"，重启应用后生效。\n\n是否现在关闭应用？`
-    )
-    if (closeNow) {
-      await closeWindow()
-    }
-  } catch (error) {
-    window.alert(`无法保存标题栏设置：${String(error)}`)
-  }
-}
-
 function openTopBarOrderModal() {
   showSettings.value = false
   topBarOrderModalOpen.value = true
@@ -1292,7 +1203,6 @@ onMounted(async () => {
   loadAppFontSize()
   await claudeViewModeStore.load()
   await claudeObserverStore.loadBusyInputMode()
-  await loadTitleBarStyle()
   await topBarStore.loadOrder()
   await loadWindowState()
   await loadLastMainTab()
@@ -1407,7 +1317,8 @@ onBeforeUnmount(() => {
   gap: 6px;
   padding: 0 8px;
   border-right: 1px solid var(--separator);
-  background: var(--bg);
+  background: var(--app-bg-gradient);
+  background-attachment: fixed;
 }
 
 /* The native macOS title bar reserves space for the traffic lights by adding
@@ -1444,12 +1355,30 @@ onBeforeUnmount(() => {
 }
 
 .app-layout--mac-title-bar .title-bar {
+  position: relative;
   padding-left: 80px;
   transition: padding-left 0.26s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
+/* Make the traffic-light area background consistent with the left sidebar */
+.app-layout--mac-title-bar .title-bar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 80px;
+  height: 100%;
+  pointer-events: none;
+  background: var(--app-bg-gradient);
+  background-attachment: fixed;
+}
+
 .app-layout--mac-title-bar.app-layout--mac-fullscreen .title-bar {
   padding-left: 8px;
+}
+
+.app-layout--mac-title-bar.app-layout--mac-fullscreen .title-bar::before {
+  width: 8px;
 }
 
 @media (prefers-reduced-motion: reduce) {
