@@ -170,6 +170,9 @@ pub fn run() {
             persistent_state::save_project_drop_path_mode,
             persistent_state::load_claude_busy_input_mode,
             persistent_state::save_claude_busy_input_mode,
+            persistent_state::load_claude_startup_view,
+            persistent_state::save_claude_startup_view,
+            persistent_state::load_claude_log_output_enabled,
             persistent_state::load_last_active_main_tab,
             persistent_state::save_last_active_main_tab,
             persistent_state::load_top_bar_layout,
@@ -215,6 +218,8 @@ pub fn run() {
             claude_observer::get_claude_terminal_log,
             claude_observer::open_claude_log_dir,
             claude_observer::report_claude_observer_timeout,
+            claude_observer::record_claude_ui_error,
+            claude_observer::set_claude_log_output_enabled,
             // tab_cli commands (inter-tab communication)
             tab_cli::set_tab_permission,
             tab_cli::get_tab_permission,

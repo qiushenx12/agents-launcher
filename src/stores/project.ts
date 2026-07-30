@@ -6,6 +6,7 @@ import { useClaudeStore } from './claude'
 import { useCodexConfigStore } from './codexConfig'
 import { useOpencodeConfigStore } from './opencodeConfig'
 import { useTerminalStore } from './terminal'
+import { useClaudeViewModeStore } from './claudeViewMode'
 import type { CliProfileRef, SessionEntry } from '@/types/config'
 import { CLI_DESCRIPTORS, type CliKind } from '@/types/cli'
 import { useCliRuntimeStore } from './cliRuntime'
@@ -1736,7 +1737,7 @@ export const useProjectStore = defineStore('project', () => {
     const pendingLaunch = sessionTerminalLaunches.get(sessionId)
     if (pendingLaunch) return pendingLaunch
 
-    // Do not keep rendering the conversation/log panes against a released tab
+    // Do not keep rendering the conversation pane against a released tab
     // while a replacement PTY is being created.
     if (existingId) {
       delete sessionTerminalIds.value[sessionId]
@@ -1751,8 +1752,12 @@ export const useProjectStore = defineStore('project', () => {
       }
       const envVars: Record<string, string> = {}
       let cmd: string[]
+      let observeClaude = false
       if (session.cliKind === 'claude') {
         const claudeStore = useClaudeStore()
+        const claudeViewModeStore = useClaudeViewModeStore()
+        await claudeViewModeStore.load()
+        observeClaude = claudeViewModeStore.structuredCaptureEnabled
         const profileVars = claudeStore.editingConfig.vars
         for (const [key, value] of Object.entries(profileVars)) {
           if (value) envVars[key] = value
@@ -1812,7 +1817,7 @@ export const useProjectStore = defineStore('project', () => {
         projectSessionId: session.id,
         activate: false,
         cliKind: session.cliKind,
-        observeClaude: session.cliKind === 'claude',
+        observeClaude,
       })
       sessionTerminalIds.value[session.id] = tabId
       return tabId

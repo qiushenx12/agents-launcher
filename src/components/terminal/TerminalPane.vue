@@ -309,8 +309,7 @@ watch(() => store.refitSignal, () => {
 
 .terminal-pane__inner {
   width: 100%;
-  height: calc(100% - 6px);
-  padding: 8px;
+  height: 100%;
   position: relative;
 }
 
@@ -326,6 +325,9 @@ watch(() => store.refitSignal, () => {
 
 .terminal-pane :deep(.xterm) {
   height: 100%;
+  /* FitAddon subtracts padding from the generated xterm element, but not from
+     its parent. Keep spacing here so the last fitted row remains fully visible. */
+  padding: 8px;
 }
 
 .terminal-pane :deep(.xterm-viewport) {

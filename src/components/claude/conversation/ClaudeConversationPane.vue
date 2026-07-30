@@ -182,7 +182,7 @@
             <div class="question-card__header">
               <div>
                 <strong>Claude 问题</strong>
-                <span v-if="item.state === 'waiting' && !questionSubmitted[item.id]">请逐题选择</span>
+                <span v-if="item.state === 'waiting' && !questionIsSubmitted(item)">请逐题选择</span>
               </div>
               <span class="question-card__state">
                 {{ questionCardStateLabel(item) }}
@@ -194,7 +194,7 @@
                 :key="`${item.id}-step-${questionIndex}`"
                 class="question-card__step"
                 :class="{
-                  'is-active': questionIndex === activeQuestionIndex(item) && !questionSubmitted[item.id],
+                  'is-active': questionIndex === activeQuestionIndex(item) && !questionIsSubmitted(item),
                   'is-complete': questionStepComplete(item, questionIndex),
                 }"
               >
@@ -205,7 +205,7 @@
               </span>
               <span
                 class="question-card__step"
-                :class="{ 'is-active': !!questionSubmitted[item.id], 'is-complete': item.state !== 'waiting' }"
+                :class="{ 'is-active': questionIsSubmitted(item), 'is-complete': item.state !== 'waiting' }"
               >
                 <span aria-hidden="true">{{ item.state !== 'waiting' ? '✓' : '→' }}</span>
                 提交
@@ -254,10 +254,10 @@
               </label>
             </div>
             <div
-              v-if="item.state !== 'waiting' || questionSubmitted[item.id]"
+              v-if="item.state !== 'waiting' || questionIsSubmitted(item)"
               class="question-card__complete-summary"
             >
-              {{ item.state === 'failed' ? '问题回复失败' : questionSubmitted[item.id] && item.state === 'waiting'
+              {{ item.state === 'failed' ? '问题回复失败' : questionIsSubmitted(item) && item.state === 'waiting'
                 ? '回答已发送，正在等待 Claude 继续'
                 : `已完成 ${askUserQuestions(item).length} 个问题` }}
             </div>
@@ -265,13 +265,13 @@
               <span v-if="questionErrors[item.id]" class="question-card__error" role="alert">
                 {{ questionErrors[item.id] }}
               </span>
-              <span v-else-if="questionSubmitted[item.id]" class="question-card__sent">
+              <span v-else-if="questionIsSubmitted(item)" class="question-card__sent">
                 已发送
               </span>
               <button
                 class="btn btn-primary question-card__submit"
                 type="button"
-                :disabled="!questionAnswerReady(item) || !!questionSubmitting[item.id] || !!questionSubmitted[item.id]"
+                :disabled="!questionAnswerReady(item) || !!questionSubmitting[item.id] || questionIsSubmitted(item)"
                 @click="submitQuestionAnswers(item)"
               >
                 {{ questionSubmitLabel(item) }}
@@ -280,8 +280,52 @@
           </div>
         </template>
 
+        <template v-else-if="isSubagentItem(item)">
+          <div
+            class="subagent-card"
+            :class="[
+              `is-${item.state}`,
+              { 'is-background': item.state === 'running' && item.subagentRunMode === 'background' },
+            ]"
+            :aria-label="subagentAriaLabel(item)"
+          >
+            <div class="subagent-card__header">
+              <span class="subagent-card__state" aria-hidden="true" />
+              <strong>Agent({{ subagentTitle(item) }})</strong>
+            </div>
+            <div
+              v-if="item.state === 'running' || subagentActivity(item)"
+              class="subagent-card__meta"
+            >
+              <span class="subagent-card__branch" aria-hidden="true">⎿</span>
+              <span class="subagent-card__mode">
+                {{ item.subagentRunMode === 'background' ? 'Backgrounded agent' : 'Running agent' }}
+              </span>
+              <span v-if="subagentActivityDetails(item)" class="subagent-card__activity">
+                {{ subagentActivityDetails(item) }}
+              </span>
+            </div>
+            <div v-if="recentSubagentTools(item).length" class="subagent-card__tools">
+              <div
+                v-for="(tool, index) in recentSubagentTools(item)"
+                :key="tool.id"
+                class="subagent-card__tool"
+                :class="`is-${tool.state}`"
+              >
+                <span class="subagent-card__branch" aria-hidden="true">
+                  {{ index === recentSubagentTools(item).length - 1 ? '└─' : '├─' }}
+                </span>
+                <code>{{ subagentToolLabel(tool) }}</code>
+              </div>
+            </div>
+            <div v-if="hiddenSubagentToolCount(item)" class="subagent-card__hidden">
+              … +{{ hiddenSubagentToolCount(item) }} tool uses
+            </div>
+          </div>
+        </template>
+
         <template v-else-if="item.kind === 'tool'">
-          <details class="tool-card" :open="isToolCardOpen(item)">
+          <details class="tool-card">
             <summary>
               <span class="tool-card__state" :class="`is-${item.state}`" />
               <span class="tool-card__heading">
@@ -769,9 +813,9 @@
         </div>
       </div>
       </div>
-      <div v-if="submitError || externalError" class="claude-composer__footer">
-        <span class="claude-composer__error">
-          {{ submitError || externalError }}
+      <div v-if="submitError || state.terminalError || externalError" class="claude-composer__footer">
+        <span class="claude-composer__error" role="alert">
+          {{ submitError || state.terminalError || externalError }}
         </span>
       </div>
     </form>
@@ -790,6 +834,8 @@ import type {
   ClaudeConversationItem,
   ClaudeConversationState,
   ClaudeQueuedPrompt,
+  ClaudeSubagentActivityStatus,
+  ClaudeSubagentToolUse,
 } from '@/types/claudeObserver'
 import { copyTextToClipboard } from '@/utils/clipboard'
 import {
@@ -887,7 +933,6 @@ const questionSelections = ref<Record<string, number[]>>({})
 const questionCustomAnswers = ref<Record<string, string>>({})
 const questionActiveIndexes = ref<Record<string, number>>({})
 const questionSubmitting = ref<Record<string, boolean>>({})
-const questionSubmitted = ref<Record<string, boolean>>({})
 const questionErrors = ref<Record<string, string>>({})
 const modelPickerOpen = ref(false)
 const modelPreferencePending = ref(false)
@@ -1071,6 +1116,7 @@ const state = computed<ClaudeConversationState>(() => {
       loading: false,
       activityStatus: undefined,
       compactCompletionRevision: 0,
+      submittedQuestionIds: [],
       queuedPrompts: [],
       queueActionPending: false,
     }
@@ -1088,6 +1134,7 @@ const state = computed<ClaudeConversationState>(() => {
     loading: true,
     activityStatus: undefined,
     compactCompletionRevision: 0,
+    submittedQuestionIds: [],
     queuedPrompts: [],
     queueActionPending: false,
   }
@@ -1184,10 +1231,6 @@ function shouldShowConversationItemContent(item: ClaudeConversationItem) {
   return !group || isProcessGroupOpen(item)
 }
 
-function isToolCardOpen(item: ClaudeConversationItem) {
-  return isProcessGroupOpen(item) || item.state === 'running' || item.state === 'failed'
-}
-
 function toggleProcessGroup(item: ClaudeConversationItem) {
   const group = processGroupForItem(item)
   if (!group || isActiveProcessGroup(group)) return
@@ -1236,7 +1279,7 @@ const selectionPrompt = computed(() => (
 const terminalPrompt = computed(() => !!state.value.terminalPrompt)
 
 const pendingQuestion = computed(() => state.value.items.some(item => (
-  isAskUserQuestionItem(item) && item.state === 'waiting'
+  isAskUserQuestionItem(item) && item.state === 'waiting' && !questionIsSubmitted(item)
 )))
 
 const statusLabel = computed(() => {
@@ -1417,7 +1460,7 @@ const permissionModeLabel = computed(() => {
   if (state.value.pendingPermissionMode) {
     return STARTUP_PERMISSION_MODE_LABELS[state.value.pendingPermissionMode]
   }
-  if (observedMode) return observedLabel!
+  if (observedMode) return STARTUP_PERMISSION_MODE_LABELS[observedMode]
   return STARTUP_PERMISSION_MODE_LABELS[props.initialPermissionMode ?? 'auto']
 })
 const permissionModeTone = computed(() => {
@@ -1909,6 +1952,10 @@ function isAskUserQuestionItem(item: ClaudeConversationItem) {
   return askUserQuestions(item).length > 0
 }
 
+function questionIsSubmitted(item: ClaudeConversationItem) {
+  return state.value.submittedQuestionIds?.includes(item.id) ?? false
+}
+
 function activeQuestionIndex(item: ClaudeConversationItem) {
   const questions = askUserQuestions(item)
   const requested = questionActiveIndexes.value[item.id] ?? 0
@@ -1916,7 +1963,7 @@ function activeQuestionIndex(item: ClaudeConversationItem) {
 }
 
 function activeAskUserQuestions(item: ClaudeConversationItem) {
-  if (item.state !== 'waiting' || questionSubmitted.value[item.id]) return []
+  if (item.state !== 'waiting' || questionIsSubmitted(item)) return []
   const questionIndex = activeQuestionIndex(item)
   const question = askUserQuestions(item)[questionIndex]
   return question ? [{ question, questionIndex }] : []
@@ -1924,7 +1971,7 @@ function activeAskUserQuestions(item: ClaudeConversationItem) {
 
 function questionStepComplete(item: ClaudeConversationItem, questionIndex: number) {
   return item.state !== 'waiting'
-    || !!questionSubmitted.value[item.id]
+    || questionIsSubmitted(item)
     || questionIndex < activeQuestionIndex(item)
 }
 
@@ -1965,7 +2012,7 @@ function isQuestionOptionSelected(
 function questionCanAnswer(item: ClaudeConversationItem) {
   return item.state === 'waiting'
     && !questionSubmitting.value[item.id]
-    && !questionSubmitted.value[item.id]
+    && !questionIsSubmitted(item)
     && props.tabId !== null
     && props.tabId !== undefined
     && state.value.available
@@ -2003,7 +2050,7 @@ function questionAnswerReady(item: ClaudeConversationItem) {
 
 function questionCardStateLabel(item: ClaudeConversationItem) {
   if (questionSubmitting.value[item.id]) return '正在提交'
-  if (questionSubmitted.value[item.id] && item.state === 'waiting') return '等待 Claude'
+  if (questionIsSubmitted(item) && item.state === 'waiting') return '等待 Claude'
   if (item.state !== 'waiting') return toolStateLabel(item.state)
   const questions = askUserQuestions(item)
   if (questions.length > 0) {
@@ -2034,17 +2081,21 @@ async function submitQuestionAnswers(item: ClaudeConversationItem) {
     selectedOptions: [...selectedQuestionOptions(item, questionIndex)],
     customText: questionCustomAnswer(item, questionIndex),
   }
+  const finalQuestion = questionIndex === questions.length - 1
   questionSubmitting.value = { ...questionSubmitting.value, [item.id]: true }
   questionErrors.value = { ...questionErrors.value, [item.id]: '' }
   try {
-    await observerStore.respondToAskUserQuestion(props.tabId, question, answer)
+    await observerStore.respondToAskUserQuestion(
+      props.tabId,
+      item.id,
+      question,
+      answer,
+      finalQuestion ? 'submit' : 'next',
+    )
     const nextQuestionIndex = questionIndex + 1
     questionActiveIndexes.value = {
       ...questionActiveIndexes.value,
       [item.id]: nextQuestionIndex,
-    }
-    if (nextQuestionIndex >= questions.length) {
-      questionSubmitted.value = { ...questionSubmitted.value, [item.id]: true }
     }
   } catch (error) {
     questionErrors.value = {
@@ -2067,6 +2118,72 @@ function toolStateLabel(stateValue: ClaudeConversationItem['state']) {
 
 function toolSummary(item: ClaudeConversationItem) {
   return summarizeClaudeTool(item.toolName, item.toolInput)
+}
+
+function isSubagentItem(item: ClaudeConversationItem) {
+  const tool = item.toolName?.trim().toLowerCase()
+  return item.kind === 'tool' && (tool === 'agent' || tool === 'task') && item.subagentTools !== undefined
+}
+
+function subagentTitle(item: ClaudeConversationItem) {
+  return item.subagentDescription || item.subagentType || 'Subagent'
+}
+
+function normalizeSubagentActivityText(value: string | undefined) {
+  return value?.trim().replace(/\s+/g, ' ').toLowerCase() ?? ''
+}
+
+function subagentActivity(item: ClaudeConversationItem): ClaudeSubagentActivityStatus | undefined {
+  const description = normalizeSubagentActivityText(item.subagentDescription)
+  const agentType = normalizeSubagentActivityText(item.subagentType)
+  const activities = state.value.subagentActivities ?? []
+  const exactDescription = activities.filter(activity => (
+    normalizeSubagentActivityText(activity.description) === description
+  ))
+  return exactDescription.find(activity => (
+    !agentType || normalizeSubagentActivityText(activity.agentType) === agentType
+  )) ?? exactDescription[0] ?? activities.find(activity => {
+    const observedDescription = normalizeSubagentActivityText(activity.description)
+    const sameType = !agentType || normalizeSubagentActivityText(activity.agentType) === agentType
+    return sameType
+      && description.length >= 8
+      && (description.startsWith(observedDescription) || observedDescription.startsWith(description))
+  })
+}
+
+function subagentActivityDetails(item: ClaudeConversationItem) {
+  const activity = subagentActivity(item)
+  if (!activity) return ''
+  const details: string[] = []
+  if (activity.tokenCount) {
+    details.push(`${activity.tokenDirection ? `${activity.tokenDirection} ` : ''}${activity.tokenCount} tokens`)
+  }
+  if (activity.elapsed) details.push(activity.elapsed)
+  return details.join(' · ')
+}
+
+function recentSubagentTools(item: ClaudeConversationItem) {
+  return (item.subagentTools ?? []).slice(-3)
+}
+
+function hiddenSubagentToolCount(item: ClaudeConversationItem) {
+  const tools = item.subagentTools ?? []
+  const total = Math.max(item.subagentTotalToolUseCount ?? 0, tools.length)
+  return Math.max(0, total - Math.min(3, tools.length))
+}
+
+function subagentToolLabel(tool: ClaudeSubagentToolUse) {
+  const summary = summarizeClaudeTool(tool.toolName, tool.toolInput)
+  return summary ? `${tool.toolName}(${summary})` : tool.toolName
+}
+
+function subagentAriaLabel(item: ClaudeConversationItem) {
+  const count = Math.max(item.subagentTotalToolUseCount ?? 0, item.subagentTools?.length ?? 0)
+  const mode = item.state === 'running' && item.subagentRunMode === 'background'
+    ? 'backgrounded'
+    : toolStateLabel(item.state)
+  const activity = subagentActivityDetails(item)
+  return `Agent ${subagentTitle(item)}, ${mode}${activity ? `, ${activity}` : ''}, ${count} tool uses`
 }
 
 function prettyValue(value: unknown) {
@@ -2500,9 +2617,20 @@ function trapWorkspaceTrustFocus(event: KeyboardEvent) {
 }
 
 watch(
-  () => state.value.items.map(item => `${item.id}:${item.text?.length ?? 0}:${item.state ?? ''}`).join('|'),
+  () => state.value.items.map(item => (
+    `${item.id}:${item.eventId}:${item.text?.length ?? 0}:${item.state ?? ''}:${item.subagentRunMode ?? ''}:${item.subagentTools?.length ?? 0}`
+  )).join('|'),
   () => {
     if (scrollInitialized) void scrollToLatest()
+  },
+)
+
+watch(
+  () => (state.value.subagentActivities ?? []).map(activity => (
+    `${activity.agentType}:${activity.description}:${activity.elapsed ?? ''}:${activity.tokenDirection ?? ''}:${activity.tokenCount ?? ''}`
+  )).join('|'),
+  () => {
+    if (scrollInitialized && followLatest.value) void scrollToLatest()
   },
 )
 
@@ -2634,6 +2762,7 @@ watch(canEditInput, (enabled) => {
 })
 
 watch(() => [props.tabId, props.sessionId, props.startupMode] as const, ([tabId, sessionId, startupMode], [, previousSessionId]) => {
+  expandedProcessGroupIds.value = new Set()
   if (startupMode) {
     scrollInitialized = true
     submitError.value = ''
@@ -3433,6 +3562,138 @@ defineExpose({ appendDroppedFiles })
   font-family: var(--font-mono);
   font-size: var(--claude-content-font-size);
   line-height: var(--claude-content-line-height);
+}
+
+.subagent-card {
+  padding: 11px 14px 12px;
+  overflow: hidden;
+  border: 1px solid #34373b;
+  border-radius: 8px;
+  color: #d7d9dc;
+  background: #1e1f21;
+  box-shadow: inset 3px 0 0 #777b80;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: var(--claude-content-font-size);
+  line-height: 1.48;
+}
+
+.subagent-card.is-running {
+  box-shadow: inset 3px 0 0 #d29922;
+}
+
+.subagent-card.is-background {
+  box-shadow: inset 3px 0 0 #58a6ff;
+}
+
+.subagent-card.is-success {
+  box-shadow: inset 3px 0 0 #3fb950;
+}
+
+.subagent-card.is-failed {
+  box-shadow: inset 3px 0 0 #f85149;
+}
+
+.subagent-card__header {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 9px;
+  color: #f4f4f4;
+}
+
+.subagent-card__header strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-card__state {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #8b8f94;
+}
+
+.subagent-card.is-running .subagent-card__state {
+  background: #d29922;
+  box-shadow: 0 0 0 3px rgba(210, 153, 34, 0.14);
+}
+
+.subagent-card.is-background .subagent-card__state {
+  background: #58a6ff;
+  box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.14);
+}
+
+.subagent-card.is-success .subagent-card__state { background: #3fb950; }
+.subagent-card.is-failed .subagent-card__state { background: #f85149; }
+
+.subagent-card__meta {
+  display: flex;
+  min-width: 0;
+  margin-top: 3px;
+  padding-left: 16px;
+  align-items: baseline;
+  gap: 8px;
+  color: #aeb2b7;
+}
+
+.subagent-card__mode {
+  flex: 0 0 auto;
+}
+
+.subagent-card.is-background .subagent-card__mode {
+  color: #79c0ff;
+}
+
+.subagent-card__activity {
+  min-width: 0;
+  overflow: hidden;
+  color: #c7cbd0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-card__tools {
+  margin-top: 3px;
+  padding-left: 16px;
+}
+
+.subagent-card__tool {
+  display: flex;
+  min-width: 0;
+  gap: 8px;
+  color: #e2e4e7;
+}
+
+.subagent-card__tool.is-running {
+  color: #f0c674;
+}
+
+.subagent-card__tool.is-failed {
+  color: #ff7b72;
+}
+
+.subagent-card__branch {
+  flex: 0 0 auto;
+  color: #878b90;
+  user-select: none;
+}
+
+.subagent-card__tool code {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-card__hidden {
+  margin-top: 1px;
+  padding-left: 40px;
+  color: #9ca0a5;
 }
 
 .question-card {

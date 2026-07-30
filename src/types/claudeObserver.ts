@@ -91,6 +91,14 @@ export interface ClaudeActivityStatus {
   phase?: string | null
 }
 
+export interface ClaudeSubagentActivityStatus {
+  agentType: string
+  description: string
+  elapsed?: string | null
+  tokenDirection?: '↑' | '↓' | null
+  tokenCount?: string | null
+}
+
 export interface ClaudeContextUsage {
   usedPercentage: number
   remainingPercentage: number
@@ -107,9 +115,11 @@ export interface ClaudeObserverStatus {
   available: boolean
   active: boolean
   degradedReason?: string | null
+  terminalError?: string | null
   logDir?: string | null
   terminalPrompt?: ClaudeTerminalPrompt | null
   activityStatus?: ClaudeActivityStatus | null
+  subagentActivities?: ClaudeSubagentActivityStatus[] | null
   currentModel?: string | null
   permissionMode?: string | null
   contextUsage?: ClaudeContextUsage | null
@@ -132,6 +142,20 @@ export interface ClaudeConversationItem {
   toolResult?: unknown
   state?: 'running' | 'success' | 'failed' | 'waiting'
   messageKey?: string
+  subagentId?: string
+  subagentType?: string
+  subagentDescription?: string
+  subagentRunMode?: 'foreground' | 'background'
+  subagentTools?: ClaudeSubagentToolUse[]
+  subagentTotalToolUseCount?: number
+}
+
+export interface ClaudeSubagentToolUse {
+  id: string
+  toolName: string
+  toolInput?: unknown
+  state: 'running' | 'success' | 'failed'
+  timestamp: string
 }
 
 export interface ClaudeConversationState {
@@ -142,6 +166,7 @@ export interface ClaudeConversationState {
   active: boolean
   sessionReady: boolean
   degradedReason?: string
+  terminalError?: string
   logDir?: string
   runState: ClaudeConversationRunState
   items: ClaudeConversationItem[]
@@ -149,12 +174,14 @@ export interface ClaudeConversationState {
   loading: boolean
   terminalPrompt?: ClaudeTerminalPrompt | null
   activityStatus?: ClaudeActivityStatus | null
+  subagentActivities?: ClaudeSubagentActivityStatus[] | null
   compactCompletionRevision: number
   currentModel?: string
   permissionMode?: string
   pendingPermissionMode?: 'bypassPermissions' | 'auto' | 'default' | 'acceptEdits' | 'plan'
   currentContext?: ClaudeModelContext
   contextUsage?: ClaudeContextUsage
+  submittedQuestionIds: string[]
   queuedPrompts: ClaudeQueuedPrompt[]
   queueActionPending: boolean
 }

@@ -3,10 +3,13 @@ import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import {
+  claudePermissionModeLabelFromHookEvent,
   claudeModelContextFromText,
   claudeObservedModelSwitchApplied,
+  isClaudeExitPlanModeTool,
   normalizeClaudeModelDisplayName,
   parseClaudeModelCommandResult,
+  pendingClaudeExitPlanModePrompt,
   reduceClaudeAgentEvents,
 } from '@/utils/claudeObserverEvents'
 import { encodeClaudeConversationInputWrites } from '@/utils/claudeConversationInput'
@@ -23,6 +26,7 @@ import {
 import {
   encodeClaudeQuestionAnswerWrites,
   type ClaudeAskUserQuestion,
+  type ClaudeQuestionAdvance,
   type ClaudeQuestionAnswer,
 } from '@/utils/claudeQuestion'
 import { ClaudeObserverSnapshotGate } from '@/utils/claudeObserverSnapshotGate'
@@ -126,8 +130,10 @@ function createState(tabId: number): ClaudeConversationState {
     loading: true,
     terminalPrompt: undefined,
     activityStatus: undefined,
+    subagentActivities: [],
     compactCompletionRevision: 0,
     permissionMode: '? for shortcuts',
+    submittedQuestionIds: [],
     queuedPrompts: [],
     queueActionPending: false,
   }
@@ -151,6 +157,8 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
   const retractedPromptEventIds = new Set<string>()
   const retractedPromptTexts = new Map<number, string>()
   const questionResponseTabs = new Set<number>()
+  const planPromptResponseTabs = new Set<number>()
+  const resolvedPlanPromptSequenceByTab = new Map<number, number>()
   const pendingModelSwitchByTab = new Map<number, {
     model: string
     context?: ClaudeModelContext
@@ -165,6 +173,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
   const CLAUDE_SUBMIT_KEY_DELAY_MS = 100
   const CLAUDE_QUEUE_KEY_DELAY_MS = 70
   const CLAUDE_QUESTION_KEY_DELAY_MS = 180
+  const CLAUDE_QUESTION_SUBMIT_TIMEOUT_MS = 6_000
   const CLAUDE_INTERRUPT_TIMEOUT_MS = 5_000
   const CLAUDE_MODEL_CONFIRMATION_TIMEOUT_MS = 4_000
   const CLAUDE_MODEL_CONFIRMATION_POLL_MS = 120
@@ -179,9 +188,9 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
 
   async function waitForTerminalPromptToClear(
     tabId: number,
-    promptKind: 'modelSwitchConfirm' | 'pluginInstall',
+    promptKind: 'modelSwitchConfirm' | 'pluginInstall' | 'planApproval',
   ) {
-    const deadline = Date.now() + 1_000
+    const deadline = Date.now() + (promptKind === 'planApproval' ? 3_000 : 1_000)
     while (Date.now() < deadline) {
       const state = stateFor(tabId)
       if (state.terminalPrompt?.kind !== promptKind) return
@@ -213,6 +222,25 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
   function stateFor(tabId: number): ClaudeConversationState {
     if (!states.value[tabId]) states.value[tabId] = createState(tabId)
     return states.value[tabId]
+  }
+
+  function pendingExitPlanModePromptForTab(tabId: number) {
+    return pendingClaudeExitPlanModePrompt(eventsByTab.get(tabId) ?? [])
+  }
+
+  function fallbackExitPlanModePromptForTab(tabId: number) {
+    if (planPromptResponseTabs.has(tabId)) return undefined
+    const pending = pendingExitPlanModePromptForTab(tabId)
+    if (!pending) return undefined
+    const resolvedSequence = resolvedPlanPromptSequenceByTab.get(tabId) ?? 0
+    return pending.sequence > resolvedSequence ? pending.prompt : undefined
+  }
+
+  function markQuestionSubmitted(tabId: number, itemId: string) {
+    const state = stateFor(tabId)
+    const submittedQuestionIds = state.submittedQuestionIds ?? []
+    if (submittedQuestionIds.includes(itemId)) return
+    state.submittedQuestionIds = [...submittedQuestionIds, itemId]
   }
 
   function modelFromSwitchConfirmation(prompt: ClaudeTerminalPrompt | null | undefined) {
@@ -551,6 +579,12 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
       }
       if (existingIds.has(event.id)) continue
       acceptedEvents.push(event)
+      const permissionModeLabel = claudePermissionModeLabelFromHookEvent(event)
+      if (permissionModeLabel) {
+        const current = stateFor(tabId)
+        current.permissionMode = permissionModeLabel
+        current.pendingPermissionMode = undefined
+      }
       if (
         event.eventName === 'PreToolUse'
         || event.eventName === 'MessageDisplay'
@@ -630,6 +664,24 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     const reduced = reduceClaudeAgentEvents(merged)
     const state = stateFor(tabId)
     state.items = reduced.items
+    const waitingQuestionIds = new Set(reduced.items
+      .filter(item => item.state === 'waiting' && item.toolName?.trim().toLowerCase() === 'askuserquestion')
+      .map(item => item.id))
+    state.submittedQuestionIds = (state.submittedQuestionIds ?? [])
+      .filter(id => waitingQuestionIds.has(id))
+    const pendingExitPlanMode = pendingExitPlanModePromptForTab(tabId)
+    if (state.active && !state.terminalPrompt && pendingExitPlanMode) {
+      state.terminalPrompt = fallbackExitPlanModePromptForTab(tabId)
+    } else if (
+      state.terminalPrompt?.kind === 'planApproval'
+      && !pendingExitPlanMode
+      && acceptedEvents.some(event => (
+        (event.eventName === 'PostToolUse' || event.eventName === 'PostToolUseFailure')
+        && isClaudeExitPlanModeTool(String(event.payload.tool_name ?? event.payload.tool ?? ''))
+      ))
+    ) {
+      state.terminalPrompt = undefined
+    }
     if (!updateRuntimeStatus || !state.active) return
     state.runState = reduced.runState === 'working' && ptyRunStateByTab.get(tabId) === 'idle'
       ? 'idle'
@@ -658,6 +710,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     state.available = status.available && !unconfirmedTerminalInputTabs.has(status.tabId)
     state.active = stoppedPtyTabs.has(status.tabId) ? false : status.active
     state.degradedReason = status.degradedReason ?? undefined
+    state.terminalError = status.terminalError ?? undefined
     state.logDir = status.logDir ?? undefined
     const observedCurrentModel = status.currentModel?.trim()
     if (observedCurrentModel) state.currentModel = observedCurrentModel
@@ -672,8 +725,11 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     const nextTerminalPrompt = state.active
       ? normalizeClaudeTerminalPrompt(status.terminalPrompt)
       : undefined
-    state.terminalPrompt = nextTerminalPrompt
+    state.terminalPrompt = state.active
+      ? nextTerminalPrompt ?? fallbackExitPlanModePromptForTab(status.tabId)
+      : undefined
     state.activityStatus = state.active ? status.activityStatus : undefined
+    state.subagentActivities = state.active ? (status.subagentActivities ?? []) : []
     confirmCompactCommandReceipt(status.tabId)
     state.loading = false
     if (
@@ -736,6 +792,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
           state.runState = 'stopped'
           state.terminalPrompt = undefined
           state.activityStatus = undefined
+          state.subagentActivities = []
           state.loading = false
         }
       })
@@ -1345,25 +1402,45 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
       return
     }
     if (state.terminalPrompt?.kind === 'planApproval') {
-      if (action === -1 || action === 'cancel') {
-        await invoke('pty_write', { tabId, data: '\u001b' })
-        return
+      const approvalPrompt = state.terminalPrompt
+      const pendingRequest = pendingExitPlanModePromptForTab(tabId)
+      planPromptResponseTabs.add(tabId)
+      try {
+        if (action === -1 || action === 'cancel') {
+          await invoke('pty_write', { tabId, data: '\u001b' })
+        } else {
+          if (
+            typeof action !== 'number'
+            || !Number.isInteger(action)
+            || action < 0
+            || action >= approvalPrompt.options.length
+          ) {
+            throw new Error('Invalid plan approval choice')
+          }
+          const delta = action - approvalPrompt.selectedIndex
+          const direction = delta >= 0 ? '\u001b[B' : '\u001b[A'
+          for (let index = 0; index < Math.abs(delta); index += 1) {
+            await invoke('pty_write', { tabId, data: direction })
+            await waitForClaudeInputFrame(CLAUDE_QUEUE_KEY_DELAY_MS)
+          }
+          await invoke('pty_write', { tabId, data: '\r' })
+          const selectedOption = approvalPrompt.options[action]?.toLowerCase() ?? ''
+          if (selectedOption.includes('bypass permissions')) {
+            state.pendingPermissionMode = 'bypassPermissions'
+          } else if (selectedOption.includes('manually approve') || selectedOption.includes('manual mode')) {
+            state.pendingPermissionMode = 'default'
+          } else if (selectedOption.includes('keep planning') || selectedOption === 'no') {
+            state.pendingPermissionMode = 'plan'
+          }
+        }
+        await waitForTerminalPromptToClear(tabId, 'planApproval')
+        if (pendingRequest) {
+          resolvedPlanPromptSequenceByTab.set(tabId, pendingRequest.sequence)
+        }
+        state.terminalPrompt = undefined
+      } finally {
+        planPromptResponseTabs.delete(tabId)
       }
-      if (
-        typeof action !== 'number'
-        || !Number.isInteger(action)
-        || action < 0
-        || action >= state.terminalPrompt.options.length
-      ) {
-        throw new Error('Invalid plan approval choice')
-      }
-      const delta = action - state.terminalPrompt.selectedIndex
-      const direction = delta >= 0 ? '\u001b[B' : '\u001b[A'
-      for (let index = 0; index < Math.abs(delta); index += 1) {
-        await invoke('pty_write', { tabId, data: direction })
-        await waitForClaudeInputFrame(CLAUDE_QUEUE_KEY_DELAY_MS)
-      }
-      await invoke('pty_write', { tabId, data: '\r' })
       return
     }
     if (state.terminalPrompt?.kind === 'pluginInstall') {
@@ -1403,11 +1480,13 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
 
   async function respondToAskUserQuestion(
     tabId: number,
+    itemId: string,
     question: ClaudeAskUserQuestion,
     answer: ClaudeQuestionAnswer,
+    advance: ClaudeQuestionAdvance,
   ) {
     const state = stateFor(tabId)
-    const writes = encodeClaudeQuestionAnswerWrites(question, answer)
+    const writes = encodeClaudeQuestionAnswerWrites(question, answer, advance)
     if (!writes?.length) {
       throw new Error('璇疯涓烘瘡涓€涓棶棰樻彁渚涘悎娉曠殑閫夐」')
     }
@@ -1429,6 +1508,19 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
       for (const data of writes) {
         await invoke('pty_write', { tabId, data })
         await waitForClaudeInputFrame(CLAUDE_QUESTION_KEY_DELAY_MS)
+      }
+      if (advance === 'submit') {
+        const deadline = Date.now() + CLAUDE_QUESTION_SUBMIT_TIMEOUT_MS
+        while (Date.now() < deadline) {
+          const current = stateFor(tabId)
+          const item = current.items.find(candidate => candidate.id === itemId)
+          if (!item || item.state !== 'waiting' || pendingExitPlanModePromptForTab(tabId)) {
+            markQuestionSubmitted(tabId, itemId)
+            return
+          }
+          await waitForClaudeInputFrame(CLAUDE_QUESTION_KEY_DELAY_MS)
+        }
+        throw new Error('Claude 终端未确认回答提交，请重试或切换到终端检查当前选项')
       }
     } finally {
       questionResponseTabs.delete(tabId)
@@ -1452,6 +1544,8 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     interruptedInputDrafts.delete(tabId)
     retractedPromptTexts.delete(tabId)
     questionResponseTabs.delete(tabId)
+    planPromptResponseTabs.delete(tabId)
+    resolvedPlanPromptSequenceByTab.delete(tabId)
     pendingModelSwitchByTab.delete(tabId)
   }
 

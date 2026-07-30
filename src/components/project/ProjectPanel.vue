@@ -24,7 +24,7 @@
         >
           <ProjectSidebar
             :width="leftWidth"
-            @open-settings="emit('open-settings')"
+            @open-settings="emit('open-settings', $event)"
           />
           <div
             class="project-panel__divider project-panel__divider--left"
@@ -35,14 +35,7 @@
       </Transition>
 
       <section class="project-panel__main">
-        <ModuleToolbar
-          :show-claude-controls="showClaudeToolbarControls"
-          :claude-view="activeClaudeView"
-          :claude-status="claudeStatusLabel"
-          :claude-status-state="claudeStatusState"
-          :claude-status-detail="claudeStatusDetail"
-          @select-claude-view="selectClaudeView"
-        />
+        <ModuleToolbar :claude-error="activeClaudeError" />
         <div ref="contentRef" class="project-panel__content">
         <div v-if="sidebarDropHint === 'right'" class="project-panel__drop-hint">
           <span>松开以在侧边栏打开</span>
@@ -98,6 +91,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useProjectStore } from '@/stores/project'
 import { useClaudeObserverStore } from '@/stores/claudeObserver'
+import { useClaudeViewModeStore, type ClaudeView } from '@/stores/claudeViewMode'
 import { useResizableDivider } from '@/composables/useResizableDivider'
 import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
 import { useTauriDrop } from '@/composables/useTauriDrop'
@@ -111,11 +105,12 @@ import type { CliKind } from '@/types/cli'
 
 const store = useProjectStore()
 const claudeObserverStore = useClaudeObserverStore()
+const claudeViewModeStore = useClaudeViewModeStore()
 const props = defineProps<{
   cliKind: CliKind
 }>()
 const emit = defineEmits<{
-  (event: 'open-settings'): void
+  (event: 'open-settings', mouseEvent: MouseEvent): void
   (event: 'left-width-change', width: number): void
 }>()
 
@@ -133,39 +128,45 @@ const MIN_BOTTOM = 160
 const contentRef = ref<HTMLElement | null>(null)
 const panelRef = ref<HTMLElement | null>(null)
 
-type ClaudeView = 'conversation' | 'terminal' | 'log'
-
-const claudeViews = ref<Record<number, ClaudeView>>({})
 const activeTerminalId = computed(() => {
   const sessionId = store.activeSessionId
   return sessionId ? store.sessionTerminalIds[sessionId] : undefined
 })
-const showClaudeToolbarControls = computed(() => (
+const showClaudeViewControls = computed(() => (
   !!activeTerminalId.value && store.activeSession?.cliKind === 'claude'
 ))
-const activeClaudeView = computed<ClaudeView>(() => {
+const activeClaudeView = computed<ClaudeView>(() => claudeViewModeStore.runtimeView)
+const activeClaudeObserverError = computed(() => {
   const tabId = activeTerminalId.value
-  return tabId ? (claudeViews.value[tabId] ?? 'conversation') : 'conversation'
+  if (!tabId || !claudeViewModeStore.structuredCaptureEnabled) return ''
+  const state = claudeObserverStore.states[tabId]
+  return state?.terminalError?.trim() || state?.degradedReason?.trim() || ''
 })
-const activeClaudeState = computed(() => {
-  const tabId = activeTerminalId.value
-  return tabId ? claudeObserverStore.states[tabId] : undefined
-})
-const claudeStatusState = computed(() => activeClaudeState.value?.runState ?? 'starting')
-const claudeStatusDetail = computed(() => activeClaudeState.value?.degradedReason ?? '')
-const claudeStatusLabel = computed(() => {
-  switch (claudeStatusState.value) {
-    case 'idle': return '等待输入'
-    case 'working': return 'Claude 正在处理'
-    case 'permission': return '等待终端确认'
-    case 'stopped': return '会话已结束'
-    default: return '正在连接 Claude'
+const activeClaudeError = computed(() => (
+  activeClaudeView.value === 'terminal' ? '' : activeClaudeObserverError.value
+))
+const loggedClaudeErrors = new Map<number, string>()
+
+watch([activeTerminalId, activeClaudeObserverError], ([tabId, error]) => {
+  if (!tabId) return
+  if (!error) {
+    loggedClaudeErrors.delete(tabId)
+    return
   }
+  if (loggedClaudeErrors.get(tabId) === error) return
+  loggedClaudeErrors.set(tabId, error)
+  invoke('record_claude_ui_error', { tabId, message: error }).catch((logError) => {
+    console.error('Failed to record Claude UI error:', logError)
+  })
 })
 
 async function selectClaudeView(view: ClaudeView) {
   const tabId = activeTerminalId.value
   if (!tabId || view === activeClaudeView.value) return
+  if (!claudeViewModeStore.structuredCaptureEnabled && view !== 'terminal') {
+    store.statusMessage = '对话界面功能需要关闭并重新启动 App 后才能激活。'
+    return
+  }
   const previousView = activeClaudeView.value
 
   if (view === 'terminal') {
@@ -176,7 +177,7 @@ async function selectClaudeView(view: ClaudeView) {
     }
   }
 
-  claudeViews.value[tabId] = view
+  claudeViewModeStore.setRuntimeView(view)
   if (previousView === 'terminal' && view !== 'terminal') {
     claudeObserverStore.resumePromptQueueFromRawTerminal(tabId)
   }
@@ -410,6 +411,12 @@ onBeforeUnmount(() => {
 watch(() => props.cliKind, (kind) => {
   store.setActiveCliKind(kind)
 }, { immediate: true })
+
+defineExpose({
+  activeClaudeView,
+  showClaudeViewControls,
+  selectClaudeView,
+})
 </script>
 
 <style scoped>

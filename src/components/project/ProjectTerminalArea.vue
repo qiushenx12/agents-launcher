@@ -44,22 +44,9 @@
     />
 
     <div v-else-if="!store.activeSession" class="project-terminal__empty">
+      <div class="project-terminal__empty-prompt">{{ emptyTerminalPrompt }}</div>
       <div class="project-terminal__actions">
         <button class="btn btn-primary" @click="store.createSession()">新建项目会话</button>
-        <button
-          v-if="store.activeCliKind === 'codex'"
-          class="btn btn-secondary"
-          @click="store.resumeCodexSession()"
-        >
-          原生恢复会话
-        </button>
-        <button
-          v-if="store.activeCliKind === 'codex' || store.activeCliKind === 'opencode'"
-          class="btn btn-secondary"
-          @click="store.refreshActiveCliHistory()"
-        >
-          刷新真实会话
-        </button>
       </div>
     </div>
 
@@ -89,15 +76,9 @@
           v-model:session-attachment-paths="activeClaudeSessionAttachmentPaths"
           @show-terminal="emit('select-claude-view', 'terminal')"
         />
-        <ClaudeTerminalLogPane
-          v-else-if="activeClaudeView === 'log'"
-          :key="`log-${activeTerminalId}`"
-          :tab-id="activeTerminalId"
-          :project-session-id="store.activeSession!.id"
-        />
       </template>
       <div v-if="!activeTerminalId" class="project-terminal__empty">
-        <div class="project-terminal__project-name">{{ store.activeProject?.name }}</div>
+        <div class="project-terminal__empty-prompt">{{ emptyTerminalPrompt }}</div>
         <template v-if="isFreshProject">
           <button
             class="btn btn-primary project-terminal__action-btn"
@@ -107,9 +88,6 @@
           </button>
         </template>
         <template v-else>
-          <div class="project-terminal__empty-title">
-            {{ store.activeSession?.name }} 未开启
-          </div>
           <div class="project-terminal__actions">
             <button class="btn btn-secondary project-terminal__action-btn" @click="store.createSession()">
               新会话
@@ -119,20 +97,6 @@
               @click="store.ensureSessionTerminal(store.activeSession!.id)"
             >
               继续对话
-            </button>
-            <button
-              v-if="store.activeCliKind === 'codex'"
-              class="btn btn-secondary project-terminal__action-btn"
-              @click="store.resumeCodexSession()"
-            >
-              原生恢复
-            </button>
-            <button
-              v-if="store.activeCliKind === 'codex' || store.activeCliKind === 'opencode'"
-              class="btn btn-secondary project-terminal__action-btn"
-              @click="store.refreshActiveCliHistory()"
-            >
-              刷新真实会话
             </button>
           </div>
         </template>
@@ -152,13 +116,12 @@ import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import { isInSidebarDropZone, isInTopSidebarDropZone } from '@/composables/useSidebarDropZone'
 import TerminalPane from '@/components/terminal/TerminalPane.vue'
 import ClaudeConversationPane from '@/components/claude/conversation/ClaudeConversationPane.vue'
-import ClaudeTerminalLogPane from '@/components/claude/conversation/ClaudeTerminalLogPane.vue'
 import {
   ClaudeStartupPromptCancelledError,
   waitForClaudePromptReady,
 } from '@/utils/claudeStartupPrompt'
 
-type ClaudeView = 'conversation' | 'terminal' | 'log'
+type ClaudeView = 'conversation' | 'terminal'
 type ClaudeDefaultPermissionMode = 'bypassPermissions' | 'auto' | 'default' | 'acceptEdits' | 'plan'
 
 const store = useProjectStore()
@@ -226,6 +189,7 @@ const isActiveClaudeSession = computed(() => store.activeSession?.cliKind === 'c
 const showClaudeEmptyComposer = computed(() => (
   !!store.activeProject
   && store.activeCliKind === 'claude'
+  && activeClaudeView.value === 'conversation'
   && !activeTerminalId.value
 ))
 
@@ -267,6 +231,28 @@ const activeClaudeSessionAttachmentPaths = computed({
 })
 
 const activeClaudeView = computed<ClaudeView>(() => props.claudeView)
+
+const EMPTY_TERMINAL_PROMPT_TEMPLATES = [
+  (projectName: string) => `我们在 ${projectName} 中构建什么？`,
+  (projectName: string) => `我们应该在 ${projectName} 中做些什么？`,
+  (projectName: string) => `想给 ${projectName} 加些什么新功能？`,
+  (projectName: string) => `让我们在 ${projectName} 中继续创造吧！`,
+]
+const emptyTerminalPromptIndex = ref(0)
+const emptyTerminalPrompt = computed(() => {
+  const projectName = store.activeProject?.name ?? '这个项目'
+  return EMPTY_TERMINAL_PROMPT_TEMPLATES[emptyTerminalPromptIndex.value](projectName)
+})
+
+watch(
+  () => [store.activeCliKind, store.activeProjectId] as const,
+  () => {
+    emptyTerminalPromptIndex.value = Math.floor(
+      Math.random() * EMPTY_TERMINAL_PROMPT_TEMPLATES.length,
+    )
+  },
+  { immediate: true },
+)
 
 const isFreshProject = computed(() => {
   const session = store.activeSession
@@ -583,17 +569,6 @@ useTauriDrop((paths, position) => {
   text-align: center;
 }
 
-.project-terminal__project-name {
-  max-width: clamp(180px, 36vw, 360px);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 700;
-  font-size: 30px;
-  line-height: 1.4;
-  color: var(--text-primary);
-}
-
 .project-terminal__empty-title {
   max-width: clamp(180px, 36vw, 360px);
   overflow: hidden;
@@ -603,6 +578,15 @@ useTauriDrop((paths, position) => {
   font-size: var(--font-size-base);
   line-height: 1.4;
   color: var(--text-primary);
+}
+
+.project-terminal__empty-prompt {
+  max-width: min(680px, 72vw);
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-size: clamp(20px, 2vw, 26px);
+  font-weight: 500;
+  line-height: 1.4;
 }
 
 .project-terminal__actions {

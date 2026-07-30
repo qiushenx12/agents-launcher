@@ -11,6 +11,8 @@ Agents Launcher is a Windows desktop workspace for **Claude Code**, **Codex**, a
 - **Target platform:** Windows only
 - **Package manager:** npm
 - **Application data:** `%APPDATA%\ClaudeEnvManager\`
+- **Claude capture logs (when “Claude 日志输出” is enabled):** `%APPDATA%\ClaudeEnvManager\terminal_logs\claude\<capture-id>\`
+- **Claude conversation UI error log:** `%APPDATA%\ClaudeEnvManager\terminal_logs\claude\ui-errors.jsonl`
 
 The backend depends on Windows APIs through the `winreg` and `windows` crates. Do not assume that the Rust project can compile or run on another platform.
 

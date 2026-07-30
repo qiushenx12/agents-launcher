@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { summarizeClaudeTool } from '../src/utils/claudeToolPresentation.ts'
+import {
+  isClaudeCommandTool,
+  summarizeClaudeTool,
+} from '../src/utils/claudeToolPresentation.ts'
+
+test('command tools can be kept collapsed by default', () => {
+  assert.equal(isClaudeCommandTool('Bash'), true)
+  assert.equal(isClaudeCommandTool('PowerShell'), true)
+  assert.equal(isClaudeCommandTool('Read'), false)
+})
 
 test('Bash card preview shows its command on one line', () => {
   assert.equal(
