@@ -60,7 +60,7 @@
         </div>
       </div>
       <footer class="codex-config-panel__sidebar-footer">
-        <button class="settings-entry" type="button" @click="toggleSettings()">⚙ <span>设置</span></button>
+        <button class="settings-entry" type="button" @click="toggleSettings($event)">⚙ <span>设置</span></button>
       </footer>
     </aside>
 
@@ -401,7 +401,7 @@ watch(leftWidth, (width) => {
   height: 100%;
   min-height: 0;
   display: flex;
-  background: var(--bg);
+  background: var(--app-bg-gradient);
 }
 
 .codex-config-panel__sidebar-shell {

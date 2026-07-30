@@ -3,6 +3,8 @@ import type {
   ClaudeConversationItem,
   ClaudeConversationRunState,
   ClaudeModelContext,
+  ClaudePlanApprovalPrompt,
+  ClaudeSubagentToolUse,
 } from '../types/claudeObserver.ts'
 import { parseClaudeAskUserQuestions } from './claudeQuestion.ts'
 
@@ -60,6 +62,72 @@ function toolKey(event: ClaudeAgentEvent): string {
 
 function toolName(payload: Record<string, unknown>): string {
   return stringValue(payload, 'tool_name', 'tool') ?? '工具调用'
+}
+
+function isSubagentLauncherTool(name: string): boolean {
+  const normalized = name.trim().toLowerCase()
+  return normalized === 'agent' || normalized === 'task'
+}
+
+export function isClaudeExitPlanModeTool(name: string): boolean {
+  return name.trim().toLowerCase() === 'exitplanmode'
+}
+
+export interface ClaudePendingExitPlanModePrompt {
+  sequence: number
+  prompt: ClaudePlanApprovalPrompt
+}
+
+export function pendingClaudeExitPlanModePrompt(
+  events: ClaudeAgentEvent[],
+): ClaudePendingExitPlanModePrompt | undefined {
+  let pending: ClaudeAgentEvent | undefined
+  for (const event of [...events].sort((left, right) => (
+    left.sequence - right.sequence || left.receivedAt.localeCompare(right.receivedAt)
+  ))) {
+    if (!isClaudeExitPlanModeTool(toolName(event.payload))) continue
+    if (event.eventName === 'PreToolUse' || event.eventName === 'PermissionRequest') {
+      pending = event
+    } else if (event.eventName === 'PostToolUse' || event.eventName === 'PostToolUseFailure') {
+      pending = undefined
+    }
+  }
+  if (!pending) return undefined
+  return {
+    sequence: pending.sequence,
+    prompt: {
+      kind: 'planApproval',
+      prompt: 'Exit plan mode? Claude wants to exit plan mode.',
+      options: ['Yes', 'No'],
+      selectedIndex: 0,
+    },
+  }
+}
+
+export function claudePermissionModeLabelFromHookEvent(
+  event: ClaudeAgentEvent,
+): string | undefined {
+  const mode = stringValue(event.payload, 'permission_mode', 'permissionMode')
+  switch (mode) {
+    case 'bypassPermissions': return '⏵⏵ bypass permissions'
+    case 'acceptEdits': return '⏵⏵ accept edits'
+    case 'auto': return '⏵⏵ auto mode'
+    case 'default': return '⏸ manual mode'
+    case 'plan': return '⏸ plan mode'
+    default: return undefined
+  }
+}
+
+function subagentId(payload: Record<string, unknown>): string | undefined {
+  return stringValue(payload, 'agent_id', 'agentId')
+}
+
+function numberValue(payload: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = payload[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
 }
 
 function statusText(eventName: string, payload: Record<string, unknown>): string {
@@ -171,6 +239,20 @@ function isNoResponsePlaceholder(text: string): boolean {
   return text.trim().toLowerCase() === 'no response requested.'
 }
 
+function isInternalUserPrompt(payload: Record<string, unknown>, text: string): boolean {
+  if (payload.internal === true || payload.is_meta === true || payload.isMeta === true) return true
+
+  const promptSource = stringValue(payload, 'prompt_source', 'promptSource')?.trim().toLowerCase()
+  if (promptSource === 'system') return true
+
+  const origin = record(payload, 'origin')
+  if (origin && stringValue(origin, 'kind')?.trim().toLowerCase() === 'task-notification') {
+    return true
+  }
+
+  return /^<task-notification(?:\s|>)/i.test(text.trimStart())
+}
+
 function mergeAssistantText(current: string, incoming: string, isDelta: boolean): string {
   if (!incoming) return current
   if (!current) return incoming
@@ -187,6 +269,58 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
   const assistantItems = new Map<string, ClaudeConversationItem>()
   const assistantIndexes = new Map<string, Set<number>>()
   const toolItems = new Map<string, ClaudeConversationItem>()
+  const subagentItems = new Map<string, ClaudeConversationItem>()
+  const pendingSubagentItems: ClaudeConversationItem[] = []
+  const subagentToolItems = new Map<string, ClaudeSubagentToolUse>()
+
+  const createSubagentItem = (
+    event: ClaudeAgentEvent,
+    agentId?: string,
+  ): ClaudeConversationItem => {
+    const type = stringValue(event.payload, 'agent_type')
+    const item: ClaudeConversationItem = {
+      id: agentId ? `subagent-${agentId}` : `tool-${toolKey(event)}`,
+      eventId: event.id,
+      kind: 'tool',
+      eventName: event.eventName,
+      timestamp: event.receivedAt,
+      toolName: 'Agent',
+      state: 'running',
+      subagentId: agentId,
+      subagentType: type,
+      subagentDescription: type,
+      subagentRunMode: 'foreground',
+      subagentTools: [],
+      subagentTotalToolUseCount: 0,
+    }
+    if (agentId) subagentItems.set(agentId, item)
+    items.push(item)
+    return item
+  }
+
+  const bindSubagentItem = (
+    event: ClaudeAgentEvent,
+    agentId: string,
+  ): ClaudeConversationItem => {
+    const existing = subagentItems.get(agentId)
+    if (existing) return existing
+
+    const type = stringValue(event.payload, 'agent_type')
+    const matchingPending = [...pendingSubagentItems].reverse().find(item => (
+      !item.subagentId
+      && item.state === 'running'
+      && (!type || !item.subagentType || item.subagentType === type)
+    )) ?? [...pendingSubagentItems].reverse().find(item => !item.subagentId && item.state === 'running')
+
+    if (!matchingPending) return createSubagentItem(event, agentId)
+    matchingPending.subagentId = agentId
+    matchingPending.subagentType = type ?? matchingPending.subagentType
+    matchingPending.subagentDescription ??= type
+    matchingPending.eventId = event.id
+    matchingPending.timestamp = event.receivedAt
+    subagentItems.set(agentId, matchingPending)
+    return matchingPending
+  }
 
   const orderedEvents = [...events].sort((left, right) =>
     left.sequence - right.sequence || left.receivedAt.localeCompare(right.receivedAt)
@@ -204,6 +338,7 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
         const kind = eventName === 'HistoricalUserMessage' ? 'user' : 'assistant'
         const text = stringValue(payload, 'text')
         if (!text) break
+        if (kind === 'user' && isInternalUserPrompt(payload, text)) break
         const modelResult = parseClaudeModelCommandResult(text)
         if (modelResult) {
           items.push({
@@ -260,12 +395,16 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
           assistantItems.clear()
           assistantIndexes.clear()
           toolItems.clear()
+          subagentItems.clear()
+          pendingSubagentItems.length = 0
+          subagentToolItems.clear()
         }
         runState = 'idle'
         break
       case 'UserPromptSubmit': {
         runState = 'working'
         const text = stringValue(payload, 'prompt', 'text', 'message') ?? '已提交用户消息'
+        if (isInternalUserPrompt(payload, text)) break
         const compactResult = parseClaudeCompactCommandResult(text)
         if (compactResult) {
           runState = 'idle'
@@ -341,6 +480,32 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
       case 'PreToolUse': {
         const key = toolKey(event)
         const currentToolName = toolName(payload)
+        const currentSubagentId = subagentId(payload)
+        if (currentSubagentId) {
+          runState = 'working'
+          const subagentItem = bindSubagentItem(event, currentSubagentId)
+          const nestedKey = `${currentSubagentId}:${key}`
+          const existingTool = subagentToolItems.get(nestedKey)
+          if (existingTool) {
+            existingTool.toolInput = payload.tool_input ?? payload.input
+            existingTool.timestamp = event.receivedAt
+          } else {
+            const nestedTool: ClaudeSubagentToolUse = {
+              id: nestedKey,
+              toolName: currentToolName,
+              toolInput: payload.tool_input ?? payload.input,
+              state: 'running',
+              timestamp: event.receivedAt,
+            }
+            subagentToolItems.set(nestedKey, nestedTool)
+            subagentItem.subagentTools ??= []
+            subagentItem.subagentTools.push(nestedTool)
+            subagentItem.subagentTotalToolUseCount = subagentItem.subagentTools.length
+          }
+          subagentItem.eventId = event.id
+          subagentItem.timestamp = event.receivedAt
+          break
+        }
         const isQuestion = parseClaudeAskUserQuestions(
           currentToolName,
           payload.tool_input ?? payload.input,
@@ -363,6 +528,15 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
           toolInput: payload.tool_input ?? payload.input,
           state: isQuestion ? 'waiting' : 'running',
         }
+        if (isSubagentLauncherTool(currentToolName)) {
+          const input = record(payload, 'tool_input') ?? record(payload, 'input')
+          item.subagentType = input ? stringValue(input, 'subagent_type', 'agent_type') : undefined
+          item.subagentDescription = input ? stringValue(input, 'description') : undefined
+          item.subagentRunMode = 'foreground'
+          item.subagentTools = []
+          item.subagentTotalToolUseCount = 0
+          pendingSubagentItems.push(item)
+        }
         toolItems.set(key, item)
         items.push(item)
         break
@@ -370,6 +544,32 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
       case 'PostToolUse':
       case 'PostToolUseFailure': {
         const key = toolKey(event)
+        const currentSubagentId = subagentId(payload)
+        if (currentSubagentId) {
+          const subagentItem = bindSubagentItem(event, currentSubagentId)
+          const nestedKey = `${currentSubagentId}:${key}`
+          const nestedState = eventName === 'PostToolUse' ? 'success' : 'failed'
+          const existingTool = subagentToolItems.get(nestedKey)
+          if (existingTool) {
+            existingTool.state = nestedState
+            existingTool.timestamp = event.receivedAt
+          } else {
+            const nestedTool: ClaudeSubagentToolUse = {
+              id: nestedKey,
+              toolName: toolName(payload),
+              toolInput: payload.tool_input ?? payload.input,
+              state: nestedState,
+              timestamp: event.receivedAt,
+            }
+            subagentToolItems.set(nestedKey, nestedTool)
+            subagentItem.subagentTools ??= []
+            subagentItem.subagentTools.push(nestedTool)
+            subagentItem.subagentTotalToolUseCount = subagentItem.subagentTools.length
+          }
+          subagentItem.eventId = event.id
+          subagentItem.timestamp = event.receivedAt
+          break
+        }
         const existing = toolItems.get(key)
         const state = eventName === 'PostToolUse' ? 'success' : 'failed'
         if (existing) {
@@ -377,6 +577,34 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
           existing.toolResult = payload.tool_response ?? payload.tool_result ?? payload.error
           existing.eventId = event.id
           existing.timestamp = event.receivedAt
+          if (isSubagentLauncherTool(existing.toolName ?? '')) {
+            const response = record(payload, 'tool_response') ?? record(payload, 'tool_result')
+            const responseStatus = response ? stringValue(response, 'status')?.toLowerCase() : undefined
+            const backgrounded = eventName === 'PostToolUse' && (
+              response?.isAsync === true || responseStatus === 'async_launched'
+            )
+            if (backgrounded) {
+              existing.state = 'running'
+              existing.subagentRunMode = 'background'
+            }
+            const responseAgentId = response ? stringValue(response, 'agentId', 'agent_id') : undefined
+            if (responseAgentId) {
+              existing.subagentId = responseAgentId
+              existing.subagentType = response
+                ? stringValue(response, 'agentType', 'agent_type') ?? existing.subagentType
+                : existing.subagentType
+              subagentItems.set(responseAgentId, existing)
+            }
+            const totalToolUseCount = response
+              ? numberValue(response, 'totalToolUseCount', 'total_tool_use_count')
+              : undefined
+            if (totalToolUseCount !== undefined) {
+              existing.subagentTotalToolUseCount = Math.max(
+                totalToolUseCount,
+                existing.subagentTools?.length ?? 0,
+              )
+            }
+          }
           if (existing.toolName?.toLowerCase() === 'askuserquestion') runState = 'working'
         } else {
           const item: ClaudeConversationItem = {
@@ -395,8 +623,36 @@ export function reduceClaudeAgentEvents(events: ClaudeAgentEvent[]): ClaudeEvent
         }
         break
       }
+      case 'SubagentStart': {
+        runState = 'working'
+        const currentSubagentId = subagentId(payload)
+        if (!currentSubagentId) break
+        const item = bindSubagentItem(event, currentSubagentId)
+        item.subagentType = stringValue(payload, 'agent_type') ?? item.subagentType
+        item.subagentDescription ??= item.subagentType
+        item.subagentRunMode ??= 'foreground'
+        item.state = 'running'
+        break
+      }
+      case 'SubagentStop': {
+        const currentSubagentId = subagentId(payload)
+        if (!currentSubagentId) break
+        const item = bindSubagentItem(event, currentSubagentId)
+        item.subagentType = stringValue(payload, 'agent_type') ?? item.subagentType
+        item.subagentDescription ??= item.subagentType
+        item.state = 'success'
+        item.eventId = event.id
+        item.timestamp = event.receivedAt
+        break
+      }
       case 'PermissionRequest':
         runState = 'permission'
+        if (isClaudeExitPlanModeTool(toolName(payload))) {
+          // The store promotes this permission request to the structured plan
+          // approval overlay, including a Yes/No fallback when the terminal
+          // redraw has not exposed its options yet.
+          break
+        }
         if (parseClaudeAskUserQuestions(
           toolName(payload),
           payload.tool_input ?? payload.input,

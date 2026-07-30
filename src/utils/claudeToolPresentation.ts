@@ -33,6 +33,10 @@ function withLocation(label: string, location: string): string {
   return `${label} · ${location}`
 }
 
+export function isClaudeCommandTool(toolName: string | undefined): boolean {
+  return ['bash', 'shell', 'powershell', 'terminal'].includes((toolName ?? '').toLowerCase())
+}
+
 /** Builds a useful, single-line preview for a collapsed Claude tool card. */
 export function summarizeClaudeTool(toolName: string | undefined, value: unknown): string {
   const input = asRecord(value)
@@ -41,7 +45,7 @@ export function summarizeClaudeTool(toolName: string | undefined, value: unknown
   const filePath = firstText(input, ['file_path', 'path', 'notebook_path'])
   const pattern = firstText(input, ['pattern', 'query'])
 
-  if (['bash', 'shell', 'powershell', 'terminal'].includes(normalizedName) && command) {
+  if (isClaudeCommandTool(normalizedName) && command) {
     return oneLine(command)
   }
 

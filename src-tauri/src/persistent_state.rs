@@ -52,6 +52,10 @@ pub struct ToolState {
     pub project_drop_path_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_busy_input_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_startup_view: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_log_output_enabled: Option<bool>,
     #[serde(default = "default_pane_width")]
     pub pane_width: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +99,17 @@ fn normalize_claude_busy_input_mode(value: &str) -> String {
     }
 }
 
+fn default_claude_startup_view() -> String {
+    "terminal".to_string()
+}
+
+fn normalize_claude_startup_view(value: &str) -> String {
+    match value {
+        "conversation" => "conversation".to_string(),
+        _ => default_claude_startup_view(),
+    }
+}
+
 impl Default for ToolState {
     fn default() -> Self {
         Self {
@@ -103,6 +118,8 @@ impl Default for ToolState {
             use_builtin_terminal: false,
             project_drop_path_mode: default_drop_path_mode(),
             claude_busy_input_mode: None,
+            claude_startup_view: None,
+            claude_log_output_enabled: None,
             pane_width: default_pane_width(),
             pane_sizes: None,
             active_profile_id: None,
@@ -603,6 +620,45 @@ pub fn save_claude_busy_input_mode(mode: String) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Tauri commands — Claude startup view
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn load_claude_startup_view() -> Result<String, String> {
+    Ok(normalize_claude_startup_view(
+        load_state()?
+            .claude
+            .claude_startup_view
+            .as_deref()
+            .unwrap_or("conversation"),
+    ))
+}
+
+#[tauri::command]
+pub fn save_claude_startup_view(view: String) -> Result<(), String> {
+    let normalized = normalize_claude_startup_view(&view);
+    update_tool_state("claude", |tool| tool.claude_startup_view = Some(normalized))
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands — Claude log output
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn load_claude_log_output_enabled() -> Result<bool, String> {
+    Ok(load_state()?
+        .claude
+        .claude_log_output_enabled
+        .unwrap_or(false))
+}
+
+pub fn save_claude_log_output_enabled(enabled: bool) -> Result<(), String> {
+    update_tool_state("claude", |tool| {
+        tool.claude_log_output_enabled = Some(enabled)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tauri commands — last active main tab
 // ---------------------------------------------------------------------------
 
@@ -751,6 +807,27 @@ mod tests {
         assert_eq!(default_claude_busy_input_mode(), "native");
         assert_eq!(normalize_claude_busy_input_mode("after-stop"), "after-stop");
         assert_eq!(normalize_claude_busy_input_mode("future-mode"), "native");
+    }
+
+    #[test]
+    fn claude_startup_view_defaults_and_rejects_unknown_values() {
+        assert_eq!(default_claude_startup_view(), "terminal");
+        assert_eq!(
+            normalize_claude_startup_view("conversation"),
+            "conversation"
+        );
+        assert_eq!(normalize_claude_startup_view("terminal"), "terminal");
+        assert_eq!(normalize_claude_startup_view("log"), "terminal");
+        assert_eq!(
+            normalize_claude_startup_view("future-view"),
+            "terminal"
+        );
+    }
+
+    #[test]
+    fn claude_log_output_defaults_to_disabled() {
+        let state = ToolState::default();
+        assert_eq!(state.claude_log_output_enabled, None);
     }
 
     #[test]

@@ -17,7 +17,7 @@
             <ConfigList />
           </div>
           <footer class="claude-panel__sidebar-footer">
-            <button class="settings-entry" type="button" @click="toggleSettings()">⚙ <span>设置</span></button>
+            <button class="settings-entry" type="button" @click="toggleSettings($event)">⚙ <span>设置</span></button>
           </footer>
         </aside>
 

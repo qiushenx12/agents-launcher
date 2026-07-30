@@ -15,6 +15,8 @@ export interface ClaudeQuestionAnswer {
   customText?: string
 }
 
+export type ClaudeQuestionAdvance = 'next' | 'submit'
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -78,18 +80,25 @@ function validCustomText(value: string | undefined): string | undefined {
 }
 
 /**
- * Claude Code's active question starts on its first option. Return only the
- * writes for that question so the caller can advance in lockstep with the TUI.
+ * Claude Code's active question starts on its first option. Answers are
+ * selected inside the current tab, then Tab advances to the next question or
+ * the Submit tab. Enter on the Submit tab confirms the full response.
  */
 export function encodeClaudeQuestionAnswerWrites(
   question: ClaudeAskUserQuestion,
   answer: ClaudeQuestionAnswer,
+  advance: ClaudeQuestionAdvance,
 ): string[] | null {
+  const advanceWrites = advance === 'submit' ? ['\t', '\r'] : ['\t']
   const customText = validCustomText(answer.customText)
   if (customText) {
     // Claude Code appends "Type something" after the supplied options.
     // Confirm it first, then enter the text in the dedicated input field.
-    return ['\x1b[B'.repeat(question.options.length) + '\r', customText + '\r']
+    return [
+      '\x1b[B'.repeat(question.options.length) + '\r',
+      customText + '\r',
+      ...advanceWrites,
+    ]
   }
 
   const selected = validSelection(question, answer.selectedOptions)
@@ -102,8 +111,8 @@ export function encodeClaudeQuestionAnswerWrites(
     if (question.multiSelect) input += ' '
     cursor = optionIndex
   }
-  input += '\r'
-  return [input]
+  if (!question.multiSelect) input += '\r'
+  return [input, ...advanceWrites]
 }
 
 export function encodeClaudeQuestionResponseWrites(
@@ -116,7 +125,11 @@ export function encodeClaudeQuestionResponseWrites(
   for (const [questionIndex, question] of questions.entries()) {
     const answer = answers[questionIndex]
     if (!answer) return null
-    const questionWrites = encodeClaudeQuestionAnswerWrites(question, answer)
+    const questionWrites = encodeClaudeQuestionAnswerWrites(
+      question,
+      answer,
+      questionIndex === questions.length - 1 ? 'submit' : 'next',
+    )
     if (!questionWrites) return null
     writes.push(...questionWrites)
   }

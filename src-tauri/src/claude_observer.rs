@@ -4,6 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -60,9 +61,11 @@ pub struct ClaudeObserverStatus {
     pub available: bool,
     pub active: bool,
     pub degraded_reason: Option<String>,
+    pub terminal_error: Option<String>,
     pub log_dir: Option<String>,
     pub terminal_prompt: Option<ClaudeTerminalPrompt>,
     pub activity_status: Option<ClaudeActivityStatus>,
+    pub subagent_activities: Vec<ClaudeSubagentActivityStatus>,
     pub current_model: Option<String>,
     pub permission_mode: Option<String>,
     pub context_usage: Option<ClaudeContextUsage>,
@@ -103,6 +106,16 @@ pub struct ClaudeActivityStatus {
     pub phase: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeSubagentActivityStatus {
+    pub agent_type: String,
+    pub description: String,
+    pub elapsed: Option<String>,
+    pub token_direction: Option<String>,
+    pub token_count: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeObserverSnapshot {
@@ -112,11 +125,13 @@ pub struct ClaudeObserverSnapshot {
     pub available: bool,
     pub active: bool,
     pub degraded_reason: Option<String>,
+    pub terminal_error: Option<String>,
     pub log_dir: Option<String>,
     pub events: Vec<ClaudeAgentEvent>,
     pub terminal_log: String,
     pub terminal_prompt: Option<ClaudeTerminalPrompt>,
     pub activity_status: Option<ClaudeActivityStatus>,
+    pub subagent_activities: Vec<ClaudeSubagentActivityStatus>,
     pub current_model: Option<String>,
     pub permission_mode: Option<String>,
     pub context_usage: Option<ClaudeContextUsage>,
@@ -224,6 +239,11 @@ impl ForensicTextCollector {
     fn reset_activity_dedup(&mut self) {
         self.last_activity_signature = None;
     }
+
+    fn reset_terminal_error_dedup(&mut self) {
+        self.recent
+            .retain(|line| parse_claude_terminal_error_line(line).is_none());
+    }
 }
 
 impl vte::Perform for ForensicTextCollector {
@@ -291,6 +311,10 @@ impl ScreenCapture {
 
     fn reset_forensic_activity_dedup(&mut self) {
         self.forensic.reset_activity_dedup();
+    }
+
+    fn reset_forensic_terminal_error_dedup(&mut self) {
+        self.forensic.reset_terminal_error_dedup();
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -410,6 +434,7 @@ struct ScreenDiff {
 
 struct CaptureState {
     capture_id: String,
+    started_at: String,
     token: String,
     tab_id: Option<u32>,
     project_session_id: Option<String>,
@@ -419,11 +444,15 @@ struct CaptureState {
     next_event_sequence: u64,
     imported_transcripts: HashSet<String>,
     screen: ScreenCapture,
+    terminal_log: String,
     secrets: Vec<String>,
+    log_output_enabled: bool,
     active: bool,
     log_error: Option<String>,
+    terminal_error: Option<String>,
     terminal_prompt: Option<ClaudeTerminalPrompt>,
     activity_status: Option<ClaudeActivityStatus>,
+    subagent_activities: Vec<ClaudeSubagentActivityStatus>,
     current_model: Option<String>,
     permission_mode: Option<String>,
     context_usage: Option<ClaudeContextUsage>,
@@ -447,6 +476,7 @@ pub struct ClaudeObserverManager {
     captures: Mutex<HashMap<String, CaptureState>>,
     tab_captures: Mutex<HashMap<u32, String>>,
     hook_tx: mpsc::Sender<HookEnvelope>,
+    log_output_enabled: AtomicBool,
     secret_assignment: Regex,
     bearer: Regex,
 }
@@ -483,6 +513,9 @@ impl ClaudeObserverManager {
             captures: Mutex::new(HashMap::new()),
             tab_captures: Mutex::new(HashMap::new()),
             hook_tx,
+            log_output_enabled: AtomicBool::new(
+                crate::persistent_state::load_claude_log_output_enabled().unwrap_or(false),
+            ),
             secret_assignment: Regex::new(SECRET_ASSIGNMENT_PATTERN)
                 .expect("valid secret redaction regex"),
             bearer: Regex::new(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
@@ -534,6 +567,46 @@ impl ClaudeObserverManager {
         });
     }
 
+    pub fn set_log_output_enabled(&self, enabled: bool) {
+        self.log_output_enabled.store(enabled, Ordering::Relaxed);
+        let statuses = {
+            let Ok(mut captures) = self.captures.lock() else {
+                return;
+            };
+            captures
+                .values_mut()
+                .filter_map(|capture| {
+                    if capture.log_output_enabled == enabled {
+                        return None;
+                    }
+                    capture.log_output_enabled = enabled;
+                    capture.status_revision = capture.status_revision.saturating_add(1);
+                    if enabled {
+                        let metadata = json!({
+                            "captureId": capture.capture_id,
+                            "projectSessionId": capture.project_session_id,
+                            "startedAt": capture.started_at,
+                            "formatVersion": 1,
+                            "terminalLogMode": "stable-screen-diff"
+                        });
+                        let result = fs::create_dir_all(&capture.log_dir).and_then(|_| {
+                            write_json_pretty(&capture.log_dir.join("metadata.json"), &metadata)
+                        });
+                        if let Err(error) = result {
+                            capture.log_error = Some(error.to_string());
+                        }
+                    }
+                    capture
+                        .tab_id
+                        .map(|_| status_for_capture(capture, true))
+                })
+                .collect::<Vec<_>>()
+        };
+        for status in statuses {
+            let _ = self.app.emit("claude_observer_status", status);
+        }
+    }
+
     pub fn prepare_capture(
         &self,
         cols: u16,
@@ -549,6 +622,8 @@ impl ClaudeObserverManager {
         })?;
         let capture_id = Uuid::new_v4().to_string();
         let token = Uuid::new_v4().to_string();
+        let started_at = Utc::now().to_rfc3339();
+        let log_output_enabled = self.log_output_enabled.load(Ordering::Relaxed);
         let app_data_dir = app_data_base_dir()?;
         let log_dir = app_data_dir
             .join("terminal_logs")
@@ -558,8 +633,6 @@ impl ClaudeObserverManager {
             .join("claude_observer")
             .join("runtime")
             .join(&capture_id);
-        fs::create_dir_all(&log_dir)
-            .map_err(|error| format!("创建 Claude 日志目录失败：{error}"))?;
         write_observer_plugin(&plugin_dir, endpoint, &capture_id)?;
         let settings_path = plugin_dir.join("observer-settings.json");
         write_statusline_settings(&settings_path, endpoint, &capture_id, &token)?;
@@ -568,18 +641,23 @@ impl ClaudeObserverManager {
 
         let mut secrets = collect_sensitive_values(env);
         secrets.push(token.clone());
-        let metadata = json!({
-            "captureId": capture_id,
-            "projectSessionId": project_session_id,
-            "startedAt": Utc::now().to_rfc3339(),
-            "formatVersion": 1,
-            "terminalLogMode": "stable-screen-diff"
-        });
-        write_json_pretty(&log_dir.join("metadata.json"), &metadata)
-            .map_err(|error| format!("写入 Claude 日志元数据失败：{error}"))?;
+        if log_output_enabled {
+            fs::create_dir_all(&log_dir)
+                .map_err(|error| format!("创建 Claude 日志目录失败：{error}"))?;
+            let metadata = json!({
+                "captureId": capture_id,
+                "projectSessionId": project_session_id,
+                "startedAt": started_at,
+                "formatVersion": 1,
+                "terminalLogMode": "stable-screen-diff"
+            });
+            write_json_pretty(&log_dir.join("metadata.json"), &metadata)
+                .map_err(|error| format!("写入 Claude 日志元数据失败：{error}"))?;
+        }
 
         let state = CaptureState {
             capture_id: capture_id.clone(),
+            started_at,
             token: token.clone(),
             tab_id: None,
             project_session_id,
@@ -589,11 +667,15 @@ impl ClaudeObserverManager {
             next_event_sequence: 1,
             imported_transcripts: HashSet::new(),
             screen: ScreenCapture::new(rows, cols),
+            terminal_log: String::new(),
             secrets,
+            log_output_enabled,
             active: true,
             log_error: None,
+            terminal_error: None,
             terminal_prompt: None,
             activity_status: None,
+            subagent_activities: Vec::new(),
             current_model: None,
             permission_mode: Some("? for shortcuts".to_string()),
             context_usage: None,
@@ -655,9 +737,11 @@ impl ClaudeObserverManager {
                 available: false,
                 active: true,
                 degraded_reason: Some(reason),
+                terminal_error: None,
                 log_dir: None,
                 terminal_prompt: None,
                 activity_status: None,
+                subagent_activities: Vec::new(),
                 current_model: None,
                 permission_mode: Some("? for shortcuts".to_string()),
                 context_usage: None,
@@ -715,20 +799,23 @@ impl ClaudeObserverManager {
                 capture.log_dir.clone(),
                 capture.plugin_dir.clone(),
                 metadata,
+                capture.log_output_enabled,
             )
         };
-        let (log_dir, plugin_dir, mut metadata) = finish_context;
-        if let Ok(existing) = fs::read_to_string(log_dir.join("metadata.json")) {
-            if let Ok(Value::Object(existing)) = serde_json::from_str::<Value>(&existing) {
-                if let Value::Object(target) = &mut metadata {
-                    for (key, value) in existing {
-                        target.entry(key).or_insert(value);
+        let (log_dir, plugin_dir, mut metadata, log_output_enabled) = finish_context;
+        if log_output_enabled {
+            if let Ok(existing) = fs::read_to_string(log_dir.join("metadata.json")) {
+                if let Ok(Value::Object(existing)) = serde_json::from_str::<Value>(&existing) {
+                    if let Value::Object(target) = &mut metadata {
+                        for (key, value) in existing {
+                            target.entry(key).or_insert(value);
+                        }
                     }
                 }
             }
-        }
-        if let Err(error) = write_json_pretty(&log_dir.join("metadata.json"), &metadata) {
-            self.record_log_error(capture_id, error.to_string());
+            if let Err(error) = write_json_pretty(&log_dir.join("metadata.json"), &metadata) {
+                self.record_log_error(capture_id, error.to_string());
+            }
         }
         let _ = fs::remove_dir_all(plugin_dir);
         let status = self.captures.lock().ok().and_then(|captures| {
@@ -778,20 +865,25 @@ impl ClaudeObserverManager {
                 capture.capture_id.clone(),
                 capture.log_dir.clone(),
                 capture.secrets.clone(),
+                capture.log_output_enabled,
             )
         };
-        let (capture_id, log_dir, secrets) = capture_context;
-        let redacted = self.redact_value(envelope.body, &secrets);
+        let (capture_id, log_dir, secrets, log_output_enabled) = capture_context;
+        let mut redacted = self.redact_value(envelope.body, &secrets);
         let event_name = redacted
             .get("hook_event_name")
             .or_else(|| redacted.get("event_name"))
             .and_then(Value::as_str)
             .unwrap_or("Unknown")
             .to_string();
+        if event_name == "UserPromptSubmit" {
+            mark_internal_user_prompt(&mut redacted);
+        }
         if event_name == "SessionStart" {
             self.import_transcript_history(&capture_id, &redacted, &secrets);
         }
         let received_at = Utc::now().to_rfc3339();
+        let hook_permission_mode = claude_permission_mode_from_hook_payload(&redacted);
         let mut event = ClaudeAgentEvent {
             id: Uuid::new_v4().to_string(),
             sequence: 0,
@@ -817,6 +909,13 @@ impl ClaudeObserverManager {
                 capture.events.pop_front();
             }
             let mut status_changed = false;
+            if hook_permission_mode
+                .as_ref()
+                .is_some_and(|mode| capture.permission_mode.as_ref() != Some(mode))
+            {
+                capture.permission_mode = hook_permission_mode;
+                status_changed = true;
+            }
             if matches!(event.event_name.as_str(), "UserPromptSubmit" | "PreToolUse") {
                 capture.activity_expected = true;
             } else if matches!(
@@ -834,6 +933,14 @@ impl ClaudeObserverManager {
                     capture.last_native_context_at = None;
                     status_changed = true;
                 }
+            }
+            if matches!(
+                event.event_name.as_str(),
+                "UserPromptSubmit" | "PreToolUse" | "MessageDisplay" | "SessionStart"
+            ) && capture.terminal_error.take().is_some()
+            {
+                capture.screen.reset_forensic_terminal_error_dedup();
+                status_changed = true;
             }
             if matches!(
                 event.event_name.as_str(),
@@ -867,12 +974,14 @@ impl ClaudeObserverManager {
             "receivedAt": event.received_at,
             "payload": redacted,
         });
-        if let Err(error) = append_json_line(
-            &log_dir.join("hook-events.jsonl"),
-            &log_record,
-            MAX_HOOK_LOG_BYTES,
-        ) {
-            self.record_log_error(&capture_id, error.to_string());
+        if log_output_enabled {
+            if let Err(error) = append_json_line(
+                &log_dir.join("hook-events.jsonl"),
+                &log_record,
+                MAX_HOOK_LOG_BYTES,
+            ) {
+                self.record_log_error(&capture_id, error.to_string());
+            }
         }
         if event.tab_id.is_some() {
             let _ = self.app.emit("claude_agent_event", event);
@@ -1019,7 +1128,7 @@ impl ClaudeObserverManager {
             return;
         }
 
-        let (imported, log_dir) = {
+        let (imported, log_dir, log_output_enabled) = {
             let Ok(mut captures) = self.captures.lock() else {
                 return;
             };
@@ -1050,7 +1159,11 @@ impl ClaudeObserverManager {
                 }
                 imported.push(event);
             }
-            (imported, capture.log_dir.clone())
+            (
+                imported,
+                capture.log_dir.clone(),
+                capture.log_output_enabled,
+            )
         };
         for event in imported {
             let log_record = json!({
@@ -1063,12 +1176,14 @@ impl ClaudeObserverManager {
                 "source": "transcript-import",
                 "payload": event.payload,
             });
-            if let Err(error) = append_json_line(
-                &log_dir.join("history-events.jsonl"),
-                &log_record,
-                MAX_HOOK_LOG_BYTES,
-            ) {
-                self.record_log_error(capture_id, error.to_string());
+            if log_output_enabled {
+                if let Err(error) = append_json_line(
+                    &log_dir.join("history-events.jsonl"),
+                    &log_record,
+                    MAX_HOOK_LOG_BYTES,
+                ) {
+                    self.record_log_error(capture_id, error.to_string());
+                }
             }
             if event.tab_id.is_some() {
                 let _ = self.app.emit("claude_agent_event", event);
@@ -1104,14 +1219,20 @@ impl ClaudeObserverManager {
                 forensic_lines,
                 capture.log_dir.clone(),
                 capture.secrets.clone(),
+                capture.log_output_enabled,
             )
         };
-        let (screen_update, forensic_lines, log_dir, secrets) = capture_context;
+        let (screen_update, forensic_lines, log_dir, secrets, log_output_enabled) =
+            capture_context;
         let recorded_at = Utc::now().to_rfc3339();
-        if !forensic_lines.is_empty() {
+        let detected_terminal_error = forensic_lines
+            .iter()
+            .rev()
+            .find_map(|line| parse_claude_terminal_error_line(line));
+        if log_output_enabled && !forensic_lines.is_empty() {
             let mut forensic_text = String::new();
-            for line in forensic_lines {
-                let line = self.redact_text(&line, &secrets);
+            for line in &forensic_lines {
+                let line = self.redact_text(line, &secrets);
                 forensic_text.push_str(&format!("[{recorded_at}] {line}\n"));
             }
             if !forensic_text.is_empty() {
@@ -1125,6 +1246,22 @@ impl ClaudeObserverManager {
             }
         }
 
+        if let Some(error) = detected_terminal_error {
+            let error = self.redact_text(&error, &secrets);
+            let observer_status = self.captures.lock().ok().and_then(|mut captures| {
+                let capture = captures.get_mut(capture_id)?;
+                if capture.terminal_error.as_ref() == Some(&error) {
+                    return None;
+                }
+                capture.terminal_error = Some(error);
+                capture.status_revision = capture.status_revision.saturating_add(1);
+                capture.tab_id.map(|_| status_for_capture(capture, true))
+            });
+            if let Some(status) = observer_status {
+                let _ = self.app.emit("claude_observer_status", status);
+            }
+        }
+
         let Some(mut screen_update) = screen_update else {
             return;
         };
@@ -1132,6 +1269,8 @@ impl ClaudeObserverManager {
 
         let detected_prompt = detect_terminal_prompt(&screen_update.latest_screen);
         let detected_activity = detect_claude_activity_status(&screen_update.latest_screen);
+        let detected_subagent_activities =
+            detect_claude_subagent_activities(&screen_update.latest_screen);
         let detected_current_model = detect_claude_current_model(&screen_update.latest_screen);
         let detected_permission_mode = detect_claude_permission_mode(&screen_update.latest_screen);
         let detected_activity_row = detected_activity.as_ref().map(|detected| detected.row);
@@ -1170,6 +1309,8 @@ impl ClaudeObserverManager {
                 };
                 let prompt_changed = capture.terminal_prompt != detected_prompt;
                 let activity_changed = capture.activity_status != detected_activity_status;
+                let subagent_activities_changed =
+                    capture.subagent_activities != detected_subagent_activities;
                 let current_model_changed = detected_current_model
                     .as_ref()
                     .is_some_and(|model| capture.current_model.as_ref() != Some(model));
@@ -1178,11 +1319,13 @@ impl ClaudeObserverManager {
                     .is_some_and(|mode| capture.permission_mode.as_ref() != Some(mode));
                 let observer_status = if prompt_changed
                     || activity_changed
+                    || subagent_activities_changed
                     || current_model_changed
                     || permission_mode_changed
                 {
                     capture.terminal_prompt = detected_prompt;
                     capture.activity_status = detected_activity_status;
+                    capture.subagent_activities = detected_subagent_activities;
                     if detected_current_model.is_some() {
                         capture.current_model = detected_current_model;
                     }
@@ -1201,11 +1344,13 @@ impl ClaudeObserverManager {
             let _ = self.app.emit("claude_observer_status", status);
         }
 
-        if let Err(error) = fs::write(
-            log_dir.join("terminal-latest.txt"),
-            screen_update.latest_screen.as_bytes(),
-        ) {
-            self.record_log_error(capture_id, error.to_string());
+        if log_output_enabled {
+            if let Err(error) = fs::write(
+                log_dir.join("terminal-latest.txt"),
+                screen_update.latest_screen.as_bytes(),
+            ) {
+                self.record_log_error(capture_id, error.to_string());
+            }
         }
 
         let Some(mut diff) = screen_update.diff else {
@@ -1236,12 +1381,14 @@ impl ClaudeObserverManager {
             "recordedAt": recorded_at,
             "changedRows": changed_rows,
         });
-        if let Err(error) = append_json_line(
-            &log_dir.join("terminal-output.jsonl"),
-            &record,
-            MAX_TERMINAL_LOG_BYTES,
-        ) {
-            self.record_log_error(capture_id, error.to_string());
+        if log_output_enabled {
+            if let Err(error) = append_json_line(
+                &log_dir.join("terminal-output.jsonl"),
+                &record,
+                MAX_TERMINAL_LOG_BYTES,
+            ) {
+                self.record_log_error(capture_id, error.to_string());
+            }
         }
 
         let mut readable = format!("\n[{recorded_at}] 屏幕差分 #{}\n", diff.sequence);
@@ -1252,12 +1399,23 @@ impl ClaudeObserverManager {
                 readable.push_str(&format!("  L{}: {}\n", row.row, row.text));
             }
         }
-        if let Err(error) = append_limited(
-            &log_dir.join("terminal-output.txt"),
-            readable.as_bytes(),
-            MAX_TERMINAL_LOG_BYTES,
-        ) {
-            self.record_log_error(capture_id, error.to_string());
+        if let Ok(mut captures) = self.captures.lock() {
+            if let Some(capture) = captures.get_mut(capture_id) {
+                append_bounded_text(
+                    &mut capture.terminal_log,
+                    &readable,
+                    MAX_TERMINAL_LOG_BYTES as usize,
+                );
+            }
+        }
+        if log_output_enabled {
+            if let Err(error) = append_limited(
+                &log_dir.join("terminal-output.txt"),
+                readable.as_bytes(),
+                MAX_TERMINAL_LOG_BYTES,
+            ) {
+                self.record_log_error(capture_id, error.to_string());
+            }
         }
     }
 
@@ -1283,24 +1441,68 @@ impl ClaudeObserverManager {
     }
 
     fn record_diagnostic(&self, capture_id: &str, message: &str) {
-        let log_dir = self.captures.lock().ok().and_then(|captures| {
+        let context = self.captures.lock().ok().and_then(|captures| {
             captures
                 .get(capture_id)
-                .map(|capture| capture.log_dir.clone())
+                .map(|capture| (capture.log_dir.clone(), capture.secrets.clone()))
         });
-        let Some(log_dir) = log_dir else {
+        let Some((log_dir, secrets)) = context else {
             return;
         };
+        let message = self.redact_text(message, &secrets);
         let diagnostic = json!({
             "recordedAt": Utc::now().to_rfc3339(),
             "level": "warning",
             "message": message,
         });
+        let _ = fs::create_dir_all(&log_dir);
         let _ = append_json_line(
             &log_dir.join("diagnostics.jsonl"),
             &diagnostic,
             MAX_DIAGNOSTIC_LOG_BYTES,
         );
+    }
+
+    fn record_ui_error(&self, tab_id: u32, message: &str) -> Result<(), String> {
+        let capture_id = self.capture_id_for_tab(tab_id);
+        let secrets = capture_id
+            .as_deref()
+            .and_then(|capture_id| {
+                self.captures
+                    .lock()
+                    .ok()
+                    .and_then(|captures| {
+                        captures
+                            .get(capture_id)
+                            .map(|capture| capture.secrets.clone())
+                    })
+            })
+            .unwrap_or_default();
+        let redacted_message = self.redact_text(message, &secrets);
+
+        if let Some(capture_id) = capture_id.as_deref() {
+            self.record_diagnostic(capture_id, message);
+        }
+
+        let log_root = app_data_base_dir()?
+            .join("terminal_logs")
+            .join("claude");
+        fs::create_dir_all(&log_root)
+            .map_err(|error| format!("创建 Claude 错误日志目录失败：{error}"))?;
+        let diagnostic = json!({
+            "recordedAt": Utc::now().to_rfc3339(),
+            "level": "error",
+            "source": "conversation-ui",
+            "tabId": tab_id,
+            "captureId": capture_id,
+            "message": redacted_message,
+        });
+        append_json_line(
+            &log_root.join("ui-errors.jsonl"),
+            &diagnostic,
+            MAX_DIAGNOSTIC_LOG_BYTES,
+        )
+        .map_err(|error| format!("写入 Claude UI 错误日志失败：{error}"))
     }
 
     fn redact_text(&self, input: &str, secrets: &[String]) -> String {
@@ -1354,6 +1556,25 @@ impl ClaudeObserverManager {
             .lock()
             .ok()
             .and_then(|tab_captures| tab_captures.get(&tab_id).cloned())
+    }
+
+    fn terminal_log_for_tab(
+        &self,
+        tab_id: u32,
+        max_lines: usize,
+    ) -> Option<ClaudeTerminalLogResult> {
+        let capture_id = self.capture_id_for_tab(tab_id)?;
+        self.captures.lock().ok().and_then(|captures| {
+            let capture = captures.get(&capture_id)?;
+            Some(ClaudeTerminalLogResult {
+                text: last_lines(&capture.terminal_log, max_lines),
+                log_dir: capture
+                    .log_output_enabled
+                    .then(|| capture.log_dir.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                historical: false,
+            })
+        })
     }
 
     fn prompt_submission_baseline(
@@ -1425,11 +1646,13 @@ impl ClaudeObserverManager {
                 degraded_reason: Some(
                     "当前终端没有 Claude 结构化观察数据，可继续使用原始终端。".into(),
                 ),
+                terminal_error: None,
                 log_dir: None,
                 events: Vec::new(),
                 terminal_log: String::new(),
                 terminal_prompt: None,
                 activity_status: None,
+                subagent_activities: Vec::new(),
                 current_model: None,
                 permission_mode: Some("? for shortcuts".to_string()),
                 context_usage: None,
@@ -1451,10 +1674,14 @@ impl ClaudeObserverManager {
                 capture.status_revision,
                 capture.active,
                 capture.log_error.clone(),
+                capture.terminal_error.clone(),
                 capture.log_dir.clone(),
+                capture.log_output_enabled,
                 capture.events.iter().cloned().collect::<Vec<_>>(),
+                capture.terminal_log.clone(),
                 capture.terminal_prompt.clone(),
                 capture.activity_status.clone(),
+                capture.subagent_activities.clone(),
                 capture.current_model.clone(),
                 capture.permission_mode.clone(),
                 capture.context_usage.clone(),
@@ -1465,16 +1692,18 @@ impl ClaudeObserverManager {
             status_revision,
             active,
             log_error,
+            terminal_error,
             log_dir,
+            log_output_enabled,
             events,
+            terminal_log,
             terminal_prompt,
             activity_status,
+            subagent_activities,
             current_model,
             permission_mode,
             context_usage,
         ) = capture_context;
-        let terminal_log =
-            read_last_lines(&log_dir.join("terminal-output.txt"), 400).unwrap_or_default();
         ClaudeObserverSnapshot {
             tab_id,
             status_revision,
@@ -1482,11 +1711,13 @@ impl ClaudeObserverManager {
             available: true,
             active,
             degraded_reason: log_error,
-            log_dir: Some(log_dir.to_string_lossy().to_string()),
+            terminal_error,
+            log_dir: log_output_enabled.then(|| log_dir.to_string_lossy().to_string()),
             events,
             terminal_log,
             terminal_prompt,
             activity_status,
+            subagent_activities,
             current_model,
             permission_mode,
             context_usage,
@@ -1755,6 +1986,10 @@ pub fn get_claude_terminal_log(
     project_session_id: Option<String>,
     observer: tauri::State<'_, Arc<ClaudeObserverManager>>,
 ) -> Result<ClaudeTerminalLogResult, String> {
+    let max_lines = max_lines.unwrap_or(400).clamp(1, 2_000);
+    if let Some(result) = observer.terminal_log_for_tab(tab_id, max_lines) {
+        return Ok(result);
+    }
     let (log_dir, historical) = resolve_claude_log_dir(
         observer.inner(),
         tab_id,
@@ -1763,7 +1998,7 @@ pub fn get_claude_terminal_log(
     )?;
     let text = read_last_lines(
         &log_dir.join("terminal-output.txt"),
-        max_lines.unwrap_or(400).clamp(1, 2_000),
+        max_lines,
     )
     .map_err(|error| error.to_string())?;
     Ok(ClaudeTerminalLogResult {
@@ -1771,6 +2006,16 @@ pub fn get_claude_terminal_log(
         log_dir: log_dir.to_string_lossy().to_string(),
         historical,
     })
+}
+
+#[tauri::command]
+pub fn set_claude_log_output_enabled(
+    enabled: bool,
+    observer: tauri::State<'_, Arc<ClaudeObserverManager>>,
+) -> Result<(), String> {
+    crate::persistent_state::save_claude_log_output_enabled(enabled)?;
+    observer.set_log_output_enabled(enabled);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1805,6 +2050,15 @@ pub fn report_claude_observer_timeout(
             message,
         );
     }
+}
+
+#[tauri::command]
+pub fn record_claude_ui_error(
+    tab_id: u32,
+    message: String,
+    observer: tauri::State<'_, Arc<ClaudeObserverManager>>,
+) -> Result<(), String> {
+    observer.record_ui_error(tab_id, &message)
 }
 
 fn resolve_claude_log_dir(
@@ -2302,6 +2556,96 @@ fn normalize_prompt_for_match(value: &str) -> String {
         .to_string()
 }
 
+fn transcript_record_message_text(record: &Value) -> Option<&str> {
+    record
+        .get("message")?
+        .get("content")?
+        .as_str()
+}
+
+fn transcript_record_is_internal_user_prompt(record: &Value) -> bool {
+    if record.get("type").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    if record.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if record
+        .get("promptSource")
+        .or_else(|| record.get("prompt_source"))
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.eq_ignore_ascii_case("system"))
+    {
+        return true;
+    }
+    if record
+        .get("origin")
+        .and_then(|origin| origin.get("kind"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("task-notification"))
+    {
+        return true;
+    }
+    transcript_record_message_text(record).is_some_and(|text| {
+        text.trim_start()
+            .to_ascii_lowercase()
+            .starts_with("<task-notification")
+    })
+}
+
+fn transcript_user_prompt_is_internal(payload: &Value) -> bool {
+    let Some(path) = transcript_path_from_payload(payload) else {
+        return false;
+    };
+    let Ok(contents) = read_transcript_tail(&path) else {
+        return false;
+    };
+    let expected_prompt_id = payload
+        .get("prompt_id")
+        .or_else(|| payload.get("promptId"))
+        .and_then(Value::as_str);
+    let expected_text = event_prompt_text(payload).map(normalize_prompt_for_match);
+
+    for line in contents.lines().rev() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let record_prompt_id = record
+            .get("promptId")
+            .or_else(|| record.get("prompt_id"))
+            .and_then(Value::as_str);
+        let prompt_id_matches = expected_prompt_id
+            .zip(record_prompt_id)
+            .is_some_and(|(expected, actual)| expected == actual);
+        let text_matches = expected_text.as_ref().is_some_and(|expected| {
+            transcript_record_message_text(&record)
+                .map(normalize_prompt_for_match)
+                .is_some_and(|actual| actual == expected.as_str())
+        });
+        let record_matches = if expected_prompt_id.is_some() && record_prompt_id.is_some() {
+            prompt_id_matches
+        } else {
+            text_matches
+        };
+        if record_matches {
+            return transcript_record_is_internal_user_prompt(&record);
+        }
+    }
+    false
+}
+
+fn mark_internal_user_prompt(payload: &mut Value) {
+    if !transcript_user_prompt_is_internal(payload) {
+        return;
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("internal".to_string(), Value::Bool(true));
+    }
+}
+
 fn read_file_from_offset(path: &Path, offset: u64) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
     let length = file.metadata().map_err(|error| error.to_string())?.len();
@@ -2346,6 +2690,7 @@ fn parse_transcript_messages(contents: &str) -> Vec<HistoricalEvent> {
         };
         if record.get("isSidechain").and_then(Value::as_bool) == Some(true)
             || record.get("isMeta").and_then(Value::as_bool) == Some(true)
+            || transcript_record_is_internal_user_prompt(&record)
         {
             continue;
         }
@@ -2700,6 +3045,10 @@ fn detect_model_switch_confirm_prompt(lines: &[&str]) -> Option<ClaudeTerminalPr
 }
 
 fn detect_plan_approval_prompt(lines: &[&str]) -> Option<ClaudeTerminalPrompt> {
+    if let Some(prompt) = detect_modern_plan_approval_prompt(lines) {
+        return Some(prompt);
+    }
+
     let footer_index = lines
         .iter()
         .rposition(|line| is_terminal_selection_footer(line))?;
@@ -2764,6 +3113,102 @@ fn detect_plan_approval_prompt(lines: &[&str]) -> Option<ClaudeTerminalPrompt> {
         });
     }
     None
+}
+
+fn detect_modern_plan_approval_prompt(lines: &[&str]) -> Option<ClaudeTerminalPrompt> {
+    let title_index = lines.iter().rposition(|line| {
+        contains_ascii_case_insensitive(line, "ready to code?")
+            || contains_ascii_case_insensitive(line, "exit plan mode?")
+    })?;
+    let approval_index = (title_index..lines.len()).rev().find(|index| {
+        (contains_ascii_case_insensitive(lines[*index], "ready to execute")
+            && contains_ascii_case_insensitive(lines[*index], "would you like to proceed"))
+            || contains_ascii_case_insensitive(lines[*index], "claude wants to exit plan mode")
+    })?;
+
+    let approval_line = lines[approval_index];
+    let approval_lower = approval_line.to_ascii_lowercase();
+    let simple_exit_prompt = approval_lower.contains("claude wants to exit plan mode");
+    let approval_anchor = if simple_exit_prompt {
+        "claude wants to exit plan mode"
+    } else {
+        "would you like to proceed"
+    };
+    let approval_end = approval_lower
+        .rfind(approval_anchor)
+        .map(|index| index + approval_anchor.len())
+        .unwrap_or(approval_line.len());
+    let mut option_parts = Vec::new();
+    if approval_end < approval_line.len() {
+        option_parts.push(&approval_line[approval_end..]);
+    }
+    option_parts.extend_from_slice(&lines[approval_index + 1..]);
+    let collected = collect_numbered_options(&option_parts.join(" "));
+    let sequence_start = collected.iter().position(|(number, _, _)| *number == 1)?;
+    let mut sequential = Vec::new();
+    for (number, label, selected) in collected.into_iter().skip(sequence_start) {
+        if number != sequential.len() + 1 {
+            break;
+        }
+        sequential.push((label, selected));
+        if sequential.len() >= 6 {
+            break;
+        }
+    }
+    if sequential.len() < 2 {
+        return None;
+    }
+
+    let selected_index = sequential
+        .iter()
+        .position(|(_, selected)| *selected)
+        .unwrap_or(0);
+    let options = sequential
+        .into_iter()
+        .map(|(label, _)| normalize_modern_plan_option_label(&label))
+        .collect::<Vec<_>>();
+    if options.iter().any(|option| option.is_empty()) {
+        return None;
+    }
+
+    let prompt = if simple_exit_prompt {
+        "Exit plan mode? Claude wants to exit plan mode".to_string()
+    } else {
+        format!("{} {}", lines[title_index], approval_line)
+            .chars()
+            .take(360)
+            .collect::<String>()
+    };
+    Some(ClaudeTerminalPrompt::PlanApproval {
+        prompt,
+        options,
+        selected_index,
+    })
+}
+
+fn normalize_modern_plan_option_label(label: &str) -> String {
+    if contains_ascii_case_insensitive(label, "tell claude what to change") {
+        return "No, keep planning".to_string();
+    }
+
+    let lower = label.to_ascii_lowercase();
+    let mut end = label.len();
+    for suffix in [
+        "shift+tab to approve with this feedback",
+        "enter to confirm",
+        "esc to cancel",
+        "ctrl+g",
+    ] {
+        if let Some(index) = lower.find(suffix) {
+            end = end.min(index);
+        }
+    }
+    for border in ['─', '│', '╭', '╮', '╰', '╯'] {
+        if let Some(index) = label.find(border) {
+            end = end.min(index);
+        }
+    }
+    label[..end].trim().to_string()
 }
 
 fn detect_workspace_trust_prompt(lines: &[&str]) -> Option<ClaudeTerminalPrompt> {
@@ -3050,6 +3495,108 @@ fn detect_claude_activity_status(screen: &str) -> Option<DetectedClaudeActivityS
         })
 }
 
+fn detect_claude_subagent_activities(screen: &str) -> Vec<ClaudeSubagentActivityStatus> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let mut activities = Vec::new();
+    for line in lines.iter().skip(lines.len().saturating_sub(16)) {
+        for activity in parse_claude_subagent_activity_line(line) {
+            if let Some(index) =
+                activities
+                    .iter()
+                    .position(|existing: &ClaudeSubagentActivityStatus| {
+                        existing.agent_type == activity.agent_type
+                            && existing.description == activity.description
+                    })
+            {
+                activities[index] = activity;
+            } else {
+                activities.push(activity);
+            }
+        }
+    }
+    activities
+}
+
+fn parse_claude_subagent_activity_line(line: &str) -> Vec<ClaudeSubagentActivityStatus> {
+    let markers = line
+        .char_indices()
+        .filter_map(|(index, character)| matches!(character, '◯' | '●').then_some(index))
+        .collect::<Vec<_>>();
+    let mut activities = Vec::new();
+    for (marker_index, start) in markers.iter().copied().enumerate() {
+        let end = markers.get(marker_index + 1).copied().unwrap_or(line.len());
+        if let Some(activity) = parse_claude_subagent_activity_segment(&line[start..end]) {
+            activities.push(activity);
+        }
+    }
+    activities
+}
+
+fn parse_claude_subagent_activity_segment(segment: &str) -> Option<ClaudeSubagentActivityStatus> {
+    let segment = segment.trim();
+    let marker = segment.chars().next()?;
+    if !matches!(marker, '◯' | '●') {
+        return None;
+    }
+    let content = segment[marker.len_utf8()..].trim();
+    let (agent_type, details) = content.split_once(char::is_whitespace)?;
+    if agent_type.eq_ignore_ascii_case("main")
+        || agent_type.is_empty()
+        || agent_type.chars().count() > 48
+    {
+        return None;
+    }
+
+    let mut details = details.trim();
+    let mut token_direction = None;
+    let mut token_count = None;
+    if let Some((before_tokens, token_part)) = details.rsplit_once('·') {
+        if let Some((direction, count)) = parse_claude_activity_tokens(token_part.trim()) {
+            details = before_tokens.trim_end();
+            token_direction = Some(direction);
+            token_count = Some(count);
+        }
+    }
+
+    let words = details.split_whitespace().collect::<Vec<_>>();
+    let elapsed_start = words
+        .iter()
+        .rposition(|word| !is_claude_activity_elapsed_component(word))
+        .map_or(0, |index| index + 1);
+    if elapsed_start == 0 || elapsed_start >= words.len() {
+        return None;
+    }
+    let description = words[..elapsed_start].join(" ");
+    let elapsed = words[elapsed_start..].join(" ");
+    if description.is_empty()
+        || description.chars().count() > 160
+        || !is_claude_activity_elapsed(&elapsed)
+    {
+        return None;
+    }
+
+    Some(ClaudeSubagentActivityStatus {
+        agent_type: agent_type.to_string(),
+        description,
+        elapsed: Some(elapsed),
+        token_direction,
+        token_count,
+    })
+}
+
+fn is_claude_activity_elapsed_component(component: &str) -> bool {
+    let mut characters = component.chars();
+    let Some(unit) = characters.next_back() else {
+        return false;
+    };
+    matches!(unit, 'h' | 'm' | 's')
+        && characters
+            .as_str()
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        && !characters.as_str().is_empty()
+}
+
 fn is_claude_compaction_activity(status: &ClaudeActivityStatus) -> bool {
     status.label.eq_ignore_ascii_case("Compacting conversation")
 }
@@ -3072,38 +3619,35 @@ fn detect_claude_permission_mode(screen: &str) -> Option<String> {
         }
 
         if normalized.contains("bypass permissions") {
-            terminal_permission_mode_label(line)
+            Some("⏵⏵ bypass permissions".to_string())
         } else if normalized.contains("don't ask") || normalized.contains("dont ask") {
-            terminal_permission_mode_label(line)
+            Some("⏵⏵ don't ask".to_string())
         } else if normalized.contains("auto-accept edits") || normalized.contains("accept edits") {
-            terminal_permission_mode_label(line)
+            Some("⏵⏵ accept edits".to_string())
         } else if normalized.contains("plan mode") {
-            terminal_permission_mode_label(line)
+            Some("⏸ plan mode".to_string())
         } else if normalized.contains("auto mode") {
-            terminal_permission_mode_label(line)
+            Some("⏵⏵ auto mode".to_string())
         } else if normalized.contains("manual mode")
             || normalized.contains("default mode")
             || normalized.contains("ask permissions")
         {
-            terminal_permission_mode_label(line)
+            Some("⏸ manual mode".to_string())
         } else {
             None
         }
     })
 }
 
-fn terminal_permission_mode_label(line: &str) -> Option<String> {
-    let label = line
-        .trim()
-        .split_once("(shift+tab")
-        .or_else(|| line.trim().split_once("(shift + tab"))
-        .map(|(label, _)| label.trim())?;
-    let label = label
-        .strip_suffix(" on")
-        .or_else(|| label.strip_suffix(" ON"))
-        .unwrap_or(label)
-        .trim();
-    (!label.is_empty()).then(|| label.to_string())
+fn claude_permission_mode_from_hook_payload(payload: &Value) -> Option<String> {
+    match payload.get("permission_mode")?.as_str()? {
+        "bypassPermissions" => Some("⏵⏵ bypass permissions".to_string()),
+        "acceptEdits" => Some("⏵⏵ accept edits".to_string()),
+        "auto" => Some("⏵⏵ auto mode".to_string()),
+        "default" => Some("⏸ manual mode".to_string()),
+        "plan" => Some("⏸ plan mode".to_string()),
+        _ => None,
+    }
 }
 
 fn parse_claude_current_model_line(line: &str) -> Option<String> {
@@ -3284,6 +3828,22 @@ fn trim_value_for_ui(value: Value) -> Value {
     })
 }
 
+fn parse_claude_terminal_error_line(line: &str) -> Option<String> {
+    const MESSAGE: &str = "unable to connect to api";
+
+    let lower = line.to_ascii_lowercase();
+    let message_start = lower.find(MESSAGE)?;
+    let prefix = &line[..message_start];
+    if !prefix.chars().all(|character| {
+        character.is_whitespace()
+            || matches!(character, '✻' | '✽' | '✶' | '✳' | '*' | '·')
+    }) {
+        return None;
+    }
+
+    Some(line[message_start..].trim().to_string())
+}
+
 fn status_for_capture(capture: &CaptureState, available: bool) -> ClaudeObserverStatus {
     ClaudeObserverStatus {
         tab_id: capture.tab_id.unwrap_or_default(),
@@ -3292,9 +3852,13 @@ fn status_for_capture(capture: &CaptureState, available: bool) -> ClaudeObserver
         available,
         active: capture.active,
         degraded_reason: capture.log_error.clone(),
-        log_dir: Some(capture.log_dir.to_string_lossy().to_string()),
+        terminal_error: capture.terminal_error.clone(),
+        log_dir: capture
+            .log_output_enabled
+            .then(|| capture.log_dir.to_string_lossy().to_string()),
         terminal_prompt: capture.terminal_prompt.clone(),
         activity_status: capture.activity_status.clone(),
+        subagent_activities: capture.subagent_activities.clone(),
         current_model: capture.current_model.clone(),
         permission_mode: capture.permission_mode.clone(),
         context_usage: capture.context_usage.clone(),
@@ -3309,15 +3873,34 @@ fn unavailable_snapshot(tab_id: u32, reason: String) -> ClaudeObserverSnapshot {
         available: false,
         active: false,
         degraded_reason: Some(reason),
+        terminal_error: None,
         log_dir: None,
         events: Vec::new(),
         terminal_log: String::new(),
         terminal_prompt: None,
         activity_status: None,
+        subagent_activities: Vec::new(),
         current_model: None,
         permission_mode: Some("? for shortcuts".to_string()),
         context_usage: None,
     }
+}
+
+fn append_bounded_text(target: &mut String, text: &str, max_bytes: usize) {
+    target.push_str(text);
+    if target.len() <= max_bytes {
+        return;
+    }
+    let mut start = target.len() - max_bytes;
+    while start < target.len() && !target.is_char_boundary(start) {
+        start += 1;
+    }
+    target.drain(..start);
+}
+
+fn last_lines(text: &str, max_lines: usize) -> String {
+    let lines = text.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
 fn write_json_pretty(path: &Path, value: &Value) -> std::io::Result<()> {
@@ -3363,6 +3946,54 @@ fn read_last_lines(path: &Path, max_lines: usize) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_claude_api_connection_refused_terminal_error() {
+        assert_eq!(
+            parse_claude_terminal_error_line(
+                "  ✻ Unable to connect to API (ConnectionRefused)  "
+            ),
+            Some("Unable to connect to API (ConnectionRefused)".to_string())
+        );
+        assert_eq!(
+            parse_claude_terminal_error_line(
+                "Assistant output: Unable to connect to API (ConnectionRefused)"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn forensic_terminal_stream_exposes_api_connection_error_line() {
+        let mut capture = ScreenCapture::new(4, 80);
+        capture.process(
+            "\x1b[31m✻ Unable to connect to API (ConnectionRefused)\x1b[0m\r\n".as_bytes(),
+        );
+        let error = capture
+            .take_forensic_lines(true)
+            .iter()
+            .find_map(|line| parse_claude_terminal_error_line(line));
+
+        assert_eq!(
+            error,
+            Some("Unable to connect to API (ConnectionRefused)".to_string())
+        );
+
+        capture.reset_forensic_terminal_error_dedup();
+        capture.process("✻ Unable to connect to API (ConnectionRefused)\r\n".as_bytes());
+        assert!(capture
+            .take_forensic_lines(true)
+            .iter()
+            .any(|line| parse_claude_terminal_error_line(line).is_some()));
+    }
+
+    #[test]
+    fn in_memory_terminal_log_is_bounded_and_can_return_recent_lines() {
+        let mut log = String::new();
+        append_bounded_text(&mut log, "第一行\n第二行\n第三行\n", 25);
+        assert!(log.len() <= 25);
+        assert_eq!(last_lines(&log, 2), "第二行\n第三行");
+    }
 
     #[test]
     fn terminal_prompt_serializes_struct_variant_fields_as_camel_case() {
@@ -3520,6 +4151,43 @@ mod tests {
         assert_eq!(messages[0].payload["text"], "hello");
         assert_eq!(messages[1].event_name, "HistoricalAssistantMessage");
         assert_eq!(messages[1].payload["text"], "answer");
+    }
+
+    #[test]
+    fn transcript_parser_omits_task_notifications_and_system_prompts() {
+        let transcript = concat!(
+            r#"{"type":"user","timestamp":"2026-07-21T00:00:00Z","message":{"content":"hello"}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-07-21T00:00:01Z","promptSource":"system","origin":{"kind":"task-notification"},"message":{"content":"<task-notification><result>agent conclusion</result></task-notification>"}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-07-21T00:00:02Z","isMeta":true,"promptSource":"system","message":{"content":"Collect findings from agents agent-1 and agent-2."}}"#,
+        );
+        let messages = parse_transcript_messages(transcript);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].event_name, "HistoricalUserMessage");
+        assert_eq!(messages[0].payload["text"], "hello");
+    }
+
+    #[test]
+    fn user_prompt_hook_is_marked_internal_from_matching_transcript_record() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("session.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"user","promptId":"prompt-1","isMeta":true,"promptSource":"system","message":{"content":"Collect findings from agents agent-1 and agent-2."}}"#,
+        )
+        .expect("write transcript");
+        let mut payload = json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt_id": "prompt-1",
+            "prompt": "Collect findings from agents agent-1 and agent-2.",
+            "transcript_path": path,
+        });
+
+        mark_internal_user_prompt(&mut payload);
+
+        assert_eq!(payload["internal"], true);
     }
 
     #[test]
@@ -3783,12 +4451,12 @@ mod tests {
     fn detects_permission_mode_from_claude_footer() {
         assert_eq!(
             detect_claude_permission_mode("⏵⏵ plan mode on (shift+tab to cycle)").as_deref(),
-            Some("⏵⏵ plan mode")
+            Some("⏸ plan mode")
         );
         assert_eq!(
             detect_claude_permission_mode("⏵⏵ auto-accept edits on (shift + tab to cycle)")
                 .as_deref(),
-            Some("⏵⏵ auto-accept edits")
+            Some("⏵⏵ accept edits")
         );
         assert_eq!(
             detect_claude_permission_mode("⏵⏵ bypass permissions on (shift+tab to cycle)")
@@ -3796,6 +4464,36 @@ mod tests {
             Some("⏵⏵ bypass permissions")
         );
         assert_eq!(detect_claude_permission_mode("plan mode on"), None);
+    }
+
+    #[test]
+    fn detects_permission_mode_from_hook_payload_after_plan_exit() {
+        assert_eq!(
+            claude_permission_mode_from_hook_payload(&json!({ "permission_mode": "default" }))
+                .as_deref(),
+            Some("⏸ manual mode")
+        );
+        assert_eq!(
+            claude_permission_mode_from_hook_payload(
+                &json!({ "permission_mode": "bypassPermissions" })
+            )
+            .as_deref(),
+            Some("⏵⏵ bypass permissions")
+        );
+    }
+
+    #[test]
+    fn permission_mode_detection_ignores_agent_picker_redraw_borders() {
+        let screen = concat!(
+            "────────────────────────────────⏸ plan mode on (shift+tab to cycle) · ← for agents\n",
+            "❯ Main agent\n",
+            "  Plan agent\n",
+        );
+
+        assert_eq!(
+            detect_claude_permission_mode(screen).as_deref(),
+            Some("⏸ plan mode")
+        );
     }
 
     #[test]
@@ -3812,6 +4510,82 @@ mod tests {
                 prompt: "Plan complete. Ready to code?".to_string(),
                 options: vec!["Start coding".to_string(), "Keep planning".to_string()],
                 selected_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn detects_modern_inline_plan_approval_options_without_enter_footer() {
+        let screen = concat!(
+            "Ready to code?\n",
+            "Here is Claude's plan:\n",
+            "1. This numbered plan content must not be treated as an approval choice.\n",
+            "Claude has written up a plan and is ready to execute. Would you like to proceed?\n",
+            "❯ 1. Yes, and bypass permissions    2. Yes, manually approve edits    ",
+            "3. Tell Claude what to change    shift+tab to approve with this feedback\n",
+            "ctrl+g to edit in VS Code",
+        );
+
+        assert_eq!(
+            detect_terminal_prompt(screen),
+            Some(ClaudeTerminalPrompt::PlanApproval {
+                prompt: concat!(
+                    "Ready to code? ",
+                    "Claude has written up a plan and is ready to execute. Would you like to proceed?"
+                )
+                .to_string(),
+                options: vec![
+                    "Yes, and bypass permissions".to_string(),
+                    "Yes, manually approve edits".to_string(),
+                    "No, keep planning".to_string(),
+                ],
+                selected_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn detects_simple_exit_plan_mode_yes_no_prompt_from_real_terminal_layout() {
+        let screen = concat!(
+            "existing conversation text   Exit plan mode?   ",
+            "Claude wants to exit plan mode   ❯ 1. Yes   2. No",
+        );
+
+        assert_eq!(
+            detect_terminal_prompt(screen),
+            Some(ClaudeTerminalPrompt::PlanApproval {
+                prompt: "Exit plan mode? Claude wants to exit plan mode".to_string(),
+                options: vec!["Yes".to_string(), "No".to_string()],
+                selected_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn detects_dynamic_plan_approval_choice_selected_after_clear_context_option() {
+        let screen = concat!(
+            "Exit plan mode?\n",
+            "Claude has written up a plan and is ready to execute. Would you like to proceed?\n",
+            "1. Yes, clear context (82% used) and bypass permissions    ",
+            "2. Yes, and bypass permissions    ❯ 3. Yes, manually approve edits    ",
+            "4. No, keep planning    Enter to confirm · Esc to cancel",
+        );
+
+        assert_eq!(
+            detect_terminal_prompt(screen),
+            Some(ClaudeTerminalPrompt::PlanApproval {
+                prompt: concat!(
+                    "Exit plan mode? ",
+                    "Claude has written up a plan and is ready to execute. Would you like to proceed?"
+                )
+                .to_string(),
+                options: vec![
+                    "Yes, clear context (82% used) and bypass permissions".to_string(),
+                    "Yes, and bypass permissions".to_string(),
+                    "Yes, manually approve edits".to_string(),
+                    "No, keep planning".to_string(),
+                ],
+                selected_index: 2,
             })
         );
     }
@@ -3854,6 +4628,40 @@ mod tests {
         assert_eq!(status.token_direction.as_deref(), Some("↑"));
         assert_eq!(status.token_count.as_deref(), Some("1.2k"));
         assert_eq!(status.phase.as_deref(), Some("responding"));
+    }
+
+    #[test]
+    fn parses_subagent_activity_rows_with_live_tokens() {
+        let activities = parse_claude_subagent_activity_line(
+            "  ◯ general-purpose  Explore ClaudePanel streaming  5m 1s · ↓ 113.9k tokens",
+        );
+
+        assert_eq!(
+            activities,
+            vec![ClaudeSubagentActivityStatus {
+                agent_type: "general-purpose".to_string(),
+                description: "Explore ClaudePanel streaming".to_string(),
+                elapsed: Some("5m 1s".to_string()),
+                token_direction: Some("↓".to_string()),
+                token_count: Some("113.9k".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn detects_subagent_activity_when_footer_and_main_agent_share_the_row() {
+        let screen = concat!(
+            "footer · ← for agents   ● main   ◯ general-purpose  Explore ClaudePanel streaming  15s · ↓ 4.9k tokens\n",
+            "  ◯ general-purpose  Explore view mode and UI  1s",
+        );
+
+        let activities = detect_claude_subagent_activities(screen);
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities[0].description, "Explore ClaudePanel streaming");
+        assert_eq!(activities[0].token_count.as_deref(), Some("4.9k"));
+        assert_eq!(activities[1].description, "Explore view mode and UI");
+        assert_eq!(activities[1].elapsed.as_deref(), Some("1s"));
+        assert_eq!(activities[1].token_count, None);
     }
 
     #[test]

@@ -133,8 +133,9 @@
         class="app-panel"
       >
         <ProjectPanel
+          ref="projectPanelRef"
           :cli-kind="workspaceCliKind"
-          @open-settings="showSettings = !showSettings"
+          @open-settings="toggleSettings($event)"
           @left-width-change="sharedSidebarHeaderWidth = $event + 5"
         />
       </div>
@@ -252,21 +253,15 @@
       </section>
     </div>
 
-    <div v-if="appReady && showSettings" class="settings-popover">
+    <div
+      v-if="appReady && showSettings"
+      class="settings-popover"
+      :style="settingsPopoverStyle"
+    >
       <div ref="settingsMenuRef" class="settings-dropdown__menu">
         <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'theme' }" type="button" :aria-expanded="activeSettingsSubmenu === 'theme'" @click="toggleSettingsSubmenu('theme', $event)">
           <span>主题</span>
           <span class="settings-dropdown__group-value">{{ theme === 'light' ? '浅色' : '深色' }}</span>
-          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
-        </button>
-        <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'project-drop-path' }" type="button" :aria-expanded="activeSettingsSubmenu === 'project-drop-path'" @click="toggleSettingsSubmenu('project-drop-path', $event)">
-          <span>项目终端拖入文件</span>
-          <span class="settings-dropdown__group-value">{{ claudeStore.projectDropPathMode === 'relative' ? '相对路径' : '仅文件名' }}</span>
-          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
-        </button>
-        <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'busy-input' }" type="button" :aria-expanded="activeSettingsSubmenu === 'busy-input'" @click="toggleSettingsSubmenu('busy-input', $event)">
-          <span>Claude 运行中消息</span>
-          <span class="settings-dropdown__group-value">{{ claudeObserverStore.busyInputMode === 'native' ? '执行间隙插入' : '完全停止后发送' }}</span>
           <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
         </button>
         <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'font-size' }" type="button" :aria-expanded="activeSettingsSubmenu === 'font-size'" @click="toggleSettingsSubmenu('font-size', $event)">
@@ -278,6 +273,48 @@
           <span>前端入口排序</span>
           <span class="settings-dropdown__group-value">界面布局</span>
           <span class="settings-dropdown__chevron">›</span>
+        </button>
+        <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'project-drop-path' }" type="button" :aria-expanded="activeSettingsSubmenu === 'project-drop-path'" @click="toggleSettingsSubmenu('project-drop-path', $event)">
+          <span>项目终端拖入文件</span>
+          <span class="settings-dropdown__group-value">{{ claudeStore.projectDropPathMode === 'relative' ? '相对路径' : '仅文件名' }}</span>
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
+        </button>
+        <button v-if="showClaudeSettings" class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'busy-input' }" type="button" :aria-expanded="activeSettingsSubmenu === 'busy-input'" @click="toggleSettingsSubmenu('busy-input', $event)">
+          <span>Claude 运行中消息</span>
+          <span class="settings-dropdown__group-value">{{ claudeObserverStore.busyInputMode === 'native' ? '执行间隙插入' : '完全停止后发送' }}</span>
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
+        </button>
+        <button
+          v-if="showClaudeViewSettings"
+          class="settings-dropdown__group-trigger"
+          :class="{ 'is-open': activeSettingsSubmenu === 'claude-view' }"
+          type="button"
+          :aria-expanded="activeSettingsSubmenu === 'claude-view'"
+          @click="toggleSettingsSubmenu('claude-view', $event)"
+        >
+          <span>Claude 界面</span>
+          <span class="settings-dropdown__group-value">{{ activeClaudeViewLabel }}</span>
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
+        </button>
+        <button
+          v-if="showClaudeSettings"
+          class="settings-dropdown__group-trigger"
+          type="button"
+          role="switch"
+          :aria-checked="claudeViewModeStore.logOutputEnabled"
+          @click="toggleClaudeLogOutput"
+        >
+          <span>Claude 日志输出</span>
+          <span class="settings-dropdown__group-value">
+            {{ claudeViewModeStore.logOutputEnabled ? '已开启' : '已关闭' }}
+          </span>
+          <span
+            class="settings-dropdown__switch"
+            :class="{ 'is-on': claudeViewModeStore.logOutputEnabled }"
+            aria-hidden="true"
+          >
+            <span />
+          </span>
         </button>
       </div>
 
@@ -292,6 +329,27 @@
           <button class="settings-dropdown__item" :class="{ active: theme === 'light' }" type="button" role="option" :aria-selected="theme === 'light'" @click="setTheme('light')"><span class="settings-dropdown__check">{{ theme === 'light' ? '✓' : '' }}</span>浅色</button>
           <button class="settings-dropdown__item" :class="{ active: theme === 'dark' }" type="button" role="option" :aria-selected="theme === 'dark'" @click="setTheme('dark')"><span class="settings-dropdown__check">{{ theme === 'dark' ? '✓' : '' }}</span>深色</button>
         </div>
+        <div v-else-if="activeSettingsSubmenu === 'claude-view'" class="settings-dropdown__options" role="listbox" aria-label="Claude 界面">
+          <button
+            v-for="option in claudeViewOptions"
+            :key="option.value"
+            class="settings-dropdown__item"
+            :class="{ active: activeClaudeView === option.value }"
+            type="button"
+            role="option"
+            :aria-selected="activeClaudeView === option.value"
+            @click="setClaudeView(option.value)"
+          >
+            <span class="settings-dropdown__check">{{ activeClaudeView === option.value ? '✓' : '' }}</span>
+            <span class="settings-dropdown__item-label">{{ option.label }}</span>
+            <span
+              v-if="claudeViewModeStore.pendingRestartView === option.value"
+              class="settings-dropdown__meta"
+            >
+              重启后
+            </span>
+          </button>
+        </div>
         <div v-else-if="activeSettingsSubmenu === 'project-drop-path'" class="settings-dropdown__options" role="listbox" aria-label="项目终端拖入文件">
           <button class="settings-dropdown__item" :class="{ active: claudeStore.projectDropPathMode === 'relative' }" type="button" role="option" :aria-selected="claudeStore.projectDropPathMode === 'relative'" @click="setProjectDropPathMode('relative')"><span class="settings-dropdown__check">{{ claudeStore.projectDropPathMode === 'relative' ? '✓' : '' }}</span>相对路径</button>
           <button class="settings-dropdown__item" :class="{ active: claudeStore.projectDropPathMode === 'filename' }" type="button" role="option" :aria-selected="claudeStore.projectDropPathMode === 'filename'" @click="setProjectDropPathMode('filename')"><span class="settings-dropdown__check">{{ claudeStore.projectDropPathMode === 'filename' ? '✓' : '' }}</span>仅文件名</button>
@@ -300,7 +358,7 @@
           <button class="settings-dropdown__item settings-dropdown__item--described" :class="{ active: claudeObserverStore.busyInputMode === 'native' }" type="button" role="option" :aria-selected="claudeObserverStore.busyInputMode === 'native'" @click="setClaudeBusyInputMode('native')"><span class="settings-dropdown__check">{{ claudeObserverStore.busyInputMode === 'native' ? '✓' : '' }}</span><span class="settings-dropdown__item-copy"><span>执行间隙插入</span><small>交给 Claude Code 原生等待队列</small></span></button>
           <button class="settings-dropdown__item settings-dropdown__item--described" :class="{ active: claudeObserverStore.busyInputMode === 'after-stop' }" type="button" role="option" :aria-selected="claudeObserverStore.busyInputMode === 'after-stop'" @click="setClaudeBusyInputMode('after-stop')"><span class="settings-dropdown__check">{{ claudeObserverStore.busyInputMode === 'after-stop' ? '✓' : '' }}</span><span class="settings-dropdown__item-copy"><span>完全停止后发送</span><small>当前轮次结束后再提交</small></span></button>
         </div>
-        <div v-else class="settings-dropdown__options settings-dropdown__options--font" aria-label="字体大小">
+        <div v-else-if="activeSettingsSubmenu === 'font-size'" class="settings-dropdown__options settings-dropdown__options--font" aria-label="字体大小">
           <div class="settings-dropdown__font-row"><span>终端字体</span><div class="font-size-row"><button class="font-size-btn" type="button" :disabled="terminalStore.fontSize <= 6" aria-label="减小终端字体" @click="terminalStore.setFontSize(terminalStore.fontSize - 1)">−</button><span class="font-size-value">{{ terminalStore.fontSize }}</span><button class="font-size-btn" type="button" :disabled="terminalStore.fontSize >= 28" aria-label="增大终端字体" @click="terminalStore.setFontSize(terminalStore.fontSize + 1)">+</button></div></div>
           <div class="settings-dropdown__font-row"><span>APP 字体</span><div class="font-size-row"><button class="font-size-btn" type="button" :disabled="appFontSize <= APP_FONT_MIN" aria-label="减小 APP 字体" @click="setAppFontSize(-1)">−</button><span class="font-size-value">{{ appFontSize }}px</span><button class="font-size-btn" type="button" :disabled="appFontSize >= APP_FONT_MAX" aria-label="增大 APP 字体" @click="setAppFontSize(1)">+</button></div></div>
           <div class="settings-dropdown__font-row"><span>Markdown 字体</span><div class="font-size-row"><button class="font-size-btn" type="button" :disabled="mdFontSize <= MD_FONT_MIN" aria-label="减小 Markdown 字体" @click="setMdFontSize(mdFontSize - 1)">−</button><span class="font-size-value">{{ mdFontSize }}px</span><button class="font-size-btn" type="button" :disabled="mdFontSize >= MD_FONT_MAX" aria-label="增大 Markdown 字体" @click="setMdFontSize(mdFontSize + 1)">+</button></div></div>
@@ -362,6 +420,7 @@ import OrchestrationManager from './components/orchestration/OrchestrationManage
 import TopBarOrderModal from './components/common/TopBarOrderModal.vue'
 import { useClaudeStore } from './stores/claude'
 import { useClaudeObserverStore } from './stores/claudeObserver'
+import { useClaudeViewModeStore, type ClaudeView } from './stores/claudeViewMode'
 import { useTerminalStore } from './stores/terminal'
 import { useMarkdownFontSize, MD_FONT_MIN, MD_FONT_MAX } from './composables/useMarkdownFontSize'
 import { useSettingsPopover } from './composables/useSettingsPopover'
@@ -388,6 +447,11 @@ type DependencyStatus = 'installed' | 'missing' | 'unsupported' | 'error'
 type DependencyGateState = 'checking' | 'missing' | 'unsupported' | 'error' | 'installing' | 'restart_required' | 'ready'
 type TitleBarStyle = 'macos' | 'windows'
 
+const claudeViewOptions: Array<{ value: ClaudeView; label: string }> = [
+  { value: 'conversation', label: '界面' },
+  { value: 'terminal', label: '终端' },
+]
+
 interface DependencyCheckResult {
   dependency: DependencyName
   status: DependencyStatus
@@ -405,6 +469,7 @@ interface DependencyInstallResult {
 const mainTab = ref<MainTab>('config')
 const claudeStore = useClaudeStore()
 const claudeObserverStore = useClaudeObserverStore()
+const claudeViewModeStore = useClaudeViewModeStore()
 const terminalStore = useTerminalStore()
 const projectStore = useProjectStore()
 const cliRuntimeStore = useCliRuntimeStore()
@@ -424,6 +489,7 @@ const titleBarRestartPending = computed(() => (
   preferredTitleBarStyle.value !== appliedTitleBarStyle.value
 ))
 const terminalManagerRef = ref<InstanceType<typeof TerminalManager> | null>(null)
+const projectPanelRef = ref<InstanceType<typeof ProjectPanel> | null>(null)
 const topBarOrderModalOpen = ref(false)
 const sharedSidebarHeaderWidth = ref(285)
 const dependencyState = ref<DependencyGateState>('checking')
@@ -447,6 +513,23 @@ const activeCliStatus = computed(() => cliRuntimeStore.statuses[activeCliKind.va
 const workspaceCliKind = computed<CliKind>(() => activeCliKind.value)
 const workspaceCliStatus = computed(() => cliRuntimeStore.statuses[workspaceCliKind.value] ?? null)
 const activeCliLabel = computed(() => CLI_DESCRIPTORS[activeCliKind.value].label)
+const settingsCliKind = computed<CliKind | null>(() => {
+  if (workspaceMode.value === 'config') return activeCliKind.value
+  return isCliKind(mainTab.value) ? mainTab.value : null
+})
+const showClaudeSettings = computed(() => settingsCliKind.value === 'claude')
+const showClaudeViewSettings = computed(() => showClaudeSettings.value)
+const activeClaudeView = computed<ClaudeView>(() => (
+  claudeViewModeStore.runtimeView
+))
+function claudeViewLabel(view: ClaudeView) {
+  return claudeViewOptions.find(option => option.value === view)?.label ?? '界面'
+}
+const activeClaudeViewLabel = computed(() => {
+  const current = claudeViewLabel(activeClaudeView.value)
+  const pending = claudeViewModeStore.pendingRestartView
+  return pending ? `${current} · 重启后${claudeViewLabel(pending)}` : current
+})
 const cliWorkspacePreparing = computed(() => workspaceMode.value === 'project'
   && cliWorkspacePreparation.value?.kind === activeCliKind.value)
 const cliGateVisible = computed(() => appReady.value
@@ -740,9 +823,21 @@ function requestRestartAfterManualInstall() {
 }
 
 // ── Theme ──────────────────────────────────────────────────────────────────
-const { showSettings } = useSettingsPopover()
+const {
+  showSettings,
+  settingsAnchorLeft,
+  settingsAnchorBottom,
+  settingsMenuMaxHeight,
+  toggleSettings,
+  updateSettingsAnchor,
+} = useSettingsPopover()
+const settingsPopoverStyle = computed(() => ({
+  left: `${settingsAnchorLeft.value}px`,
+  bottom: `${settingsAnchorBottom.value}px`,
+  '--settings-menu-max-height': `${settingsMenuMaxHeight.value}px`,
+}))
 const theme = ref<'light' | 'dark'>('light')
-type SettingsSubmenu = 'theme' | 'project-drop-path' | 'busy-input' | 'font-size'
+type SettingsSubmenu = 'theme' | 'claude-view' | 'project-drop-path' | 'busy-input' | 'font-size'
 const activeSettingsSubmenu = ref<SettingsSubmenu | null>(null)
 const settingsMenuRef = ref<HTMLElement | null>(null)
 const settingsSubmenuTop = ref(0)
@@ -772,6 +867,16 @@ watch(showSettings, (visible) => {
   if (!visible) activeSettingsSubmenu.value = null
 })
 
+watch(showClaudeSettings, (visible) => {
+  if (
+    !visible
+    && (activeSettingsSubmenu.value === 'claude-view'
+      || activeSettingsSubmenu.value === 'busy-input')
+  ) {
+    activeSettingsSubmenu.value = null
+  }
+})
+
 function applyTheme(t: 'light' | 'dark') {
   theme.value = t
   document.documentElement.setAttribute('data-theme', t)
@@ -784,6 +889,33 @@ function applyTheme(t: 'light' | 'dark') {
 function setTheme(t: 'light' | 'dark') {
   applyTheme(t)
   showSettings.value = false
+}
+
+async function setClaudeView(view: ClaudeView) {
+  if (!showClaudeViewSettings.value) return
+  try {
+    await claudeViewModeStore.save(view)
+    if (!claudeViewModeStore.structuredCaptureEnabled && view !== 'terminal') {
+      projectStore.statusMessage = `已设置为${claudeViewLabel(view)}界面模式；请关闭并重新启动 App 后激活相关功能。`
+    } else if (projectPanelRef.value?.showClaudeViewControls === true) {
+      await projectPanelRef.value.selectClaudeView(view)
+    } else {
+      claudeViewModeStore.setRuntimeView(view)
+    }
+    showSettings.value = false
+  } catch (error) {
+    projectStore.statusMessage = `Claude 启动视图保存失败：${String(error)}`
+  }
+}
+
+async function toggleClaudeLogOutput() {
+  const enabled = !claudeViewModeStore.logOutputEnabled
+  try {
+    await claudeViewModeStore.setLogOutputEnabled(enabled)
+    projectStore.statusMessage = `Claude 日志输出已${enabled ? '开启' : '关闭'}。`
+  } catch (error) {
+    projectStore.statusMessage = `Claude 日志输出设置保存失败：${String(error)}`
+  }
 }
 
 function setProjectDropPathMode(mode: 'filename' | 'relative') {
@@ -879,6 +1011,10 @@ function onDocumentClick(e: MouseEvent) {
   if (!target.closest('.settings-popover') && !target.closest('.settings-entry')) {
     showSettings.value = false
   }
+}
+
+function onWindowResize() {
+  updateSettingsAnchor()
 }
 
 async function openCliTab(kind: CliKind, forceCheck = false) {
@@ -1147,6 +1283,7 @@ async function initializeReadyApp() {
 onMounted(async () => {
   loadTheme()
   loadAppFontSize()
+  await claudeViewModeStore.load()
   await claudeObserverStore.loadBusyInputMode()
   await loadTitleBarStyle()
   await topBarStore.loadOrder()
@@ -1160,6 +1297,7 @@ onMounted(async () => {
   }
 
   window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('resize', onWindowResize)
   document.addEventListener('click', onDocumentClick)
   unlistenClaudeSessionLifecycle = await listen<ClaudeAgentEvent>('claude_agent_event', (event) => {
     projectStore.handleClaudeSessionLifecycleEvent(event.payload).catch((error) => {
@@ -1215,6 +1353,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('resize', onWindowResize)
   document.removeEventListener('click', onDocumentClick)
   unlistenClaudeSessionLifecycle?.()
   unlistenClaudeHistory?.()
@@ -1503,16 +1642,14 @@ onBeforeUnmount(() => {
 }
 
 .settings-popover {
-  position: absolute;
-  left: 8px;
-  bottom: 34px;
+  position: fixed;
   z-index: 1000;
   animation: dropdown-in 0.12s ease;
 }
 
 .settings-dropdown__menu,
 .settings-dropdown__submenu {
-  background: var(--card-bg-gradient);
+  background-color: var(--card);
   border: 1px solid var(--input-border);
   border-radius: 10px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
@@ -1526,7 +1663,7 @@ onBeforeUnmount(() => {
 .settings-dropdown__menu {
   display: flex;
   width: 270px;
-  max-height: calc(100vh - 44px);
+  max-height: var(--settings-menu-max-height, calc(100vh - 44px));
   flex-direction: column;
   padding: 6px;
   overflow-y: auto;
@@ -1614,6 +1751,35 @@ onBeforeUnmount(() => {
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.settings-dropdown__switch {
+  display: flex;
+  width: 28px;
+  height: 16px;
+  flex: 0 0 auto;
+  align-items: center;
+  padding: 2px;
+  border-radius: 999px;
+  background: var(--separator);
+  transition: background-color 0.15s ease;
+}
+
+.settings-dropdown__switch > span {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--app-bg-gradient);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 0.15s ease;
+}
+
+.settings-dropdown__switch.is-on {
+  background: var(--primary);
+}
+
+.settings-dropdown__switch.is-on > span {
+  transform: translateX(12px);
 }
 
 .settings-dropdown__options {

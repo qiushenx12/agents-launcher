@@ -144,7 +144,7 @@
     </div>
 
     <footer class="project-sidebar__footer">
-      <button class="settings-entry" @click="emit('open-settings')">⚙ <span>设置</span></button>
+      <button class="settings-entry" @click="emit('open-settings', $event)">⚙ <span>设置</span></button>
     </footer>
   </aside>
 </template>
@@ -160,7 +160,7 @@ import { CLI_DESCRIPTORS } from '@/types/cli'
 
 const store = useProjectStore()
 const emit = defineEmits<{
-  (event: 'open-settings'): void
+  (event: 'open-settings', mouseEvent: MouseEvent): void
 }>()
 const projectOptionsOpen = ref(false)
 const openMenuProjectId = ref<string | null>(null)

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  claudePermissionModeLabelFromHookEvent,
   claudeObservedModelSwitchApplied,
   parseClaudeModelCommandResult,
+  pendingClaudeExitPlanModePrompt,
   reduceClaudeAgentEvents,
 } from '../src/utils/claudeObserverEvents.ts'
 import type { ClaudeAgentEvent } from '../src/types/claudeObserver.ts'
@@ -42,6 +44,22 @@ test('duplicate hook delivery is ignored by event id', () => {
   assert.equal(reduced.items[0].text, 'hello')
 })
 
+test('internal scheduled prompts and task notifications are not rendered as user messages', () => {
+  const reduced = reduceClaudeAgentEvents([
+    event('1', 'UserPromptSubmit', {
+      prompt: 'Collect findings from agents agent-1 and agent-2.',
+      internal: true,
+    }),
+    event('2', 'HistoricalUserMessage', {
+      text: '<task-notification><result>private agent conclusion</result></task-notification>',
+      historical: true,
+    }),
+    event('3', 'UserPromptSubmit', { prompt: 'actual user message' }),
+  ])
+
+  assert.deepEqual(reduced.items.map(item => item.text), ['actual user message'])
+})
+
 test('replayed MessageDisplay index is not appended twice', () => {
   const reduced = reduceClaudeAgentEvents([
     event('1', 'MessageDisplay', { message_id: 'message-1', index: 0, final: false, delta: '一次' }),
@@ -70,6 +88,139 @@ test('tool start and result become one completed card', () => {
   assert.equal(reduced.items[0].toolName, 'Bash')
   assert.equal(reduced.items[0].state, 'success')
   assert.deepEqual(reduced.items[0].toolResult, { stdout: 'ok' })
+})
+
+test('subagent tool calls are aggregated into one live agent card', () => {
+  const reduced = reduceClaudeAgentEvents([
+    event('1', 'PreToolUse', {
+      tool_use_id: 'agent-tool-1',
+      tool_name: 'Agent',
+      tool_input: {
+        description: 'Explore Claude terminal streaming',
+        subagent_type: 'Explore',
+      },
+    }),
+    event('2', 'SubagentStart', {
+      agent_id: 'agent-1',
+      agent_type: 'Explore',
+    }),
+    event('3', 'PreToolUse', {
+      agent_id: 'agent-1',
+      tool_use_id: 'read-1',
+      tool_name: 'Read',
+      tool_input: { file_path: 'src/one.ts' },
+    }),
+    event('4', 'PostToolUse', {
+      agent_id: 'agent-1',
+      tool_use_id: 'read-1',
+      tool_name: 'Read',
+    }),
+    event('5', 'PreToolUse', {
+      agent_id: 'agent-1',
+      tool_use_id: 'grep-1',
+      tool_name: 'Grep',
+      tool_input: { pattern: 'SubagentStart', path: 'src' },
+    }),
+  ])
+
+  assert.equal(reduced.items.length, 1)
+  assert.equal(reduced.items[0].toolName, 'Agent')
+  assert.equal(reduced.items[0].subagentId, 'agent-1')
+  assert.equal(reduced.items[0].subagentDescription, 'Explore Claude terminal streaming')
+  assert.equal(reduced.items[0].subagentTotalToolUseCount, 2)
+  assert.deepEqual(reduced.items[0].subagentTools?.map(tool => ({
+    name: tool.toolName,
+    state: tool.state,
+  })), [
+    { name: 'Read', state: 'success' },
+    { name: 'Grep', state: 'running' },
+  ])
+})
+
+test('concurrent subagent tool calls stay attached to their own agent cards', () => {
+  const reduced = reduceClaudeAgentEvents([
+    event('1', 'PreToolUse', {
+      tool_use_id: 'agent-tool-1', tool_name: 'Agent',
+      tool_input: { description: 'First agent', subagent_type: 'Explore' },
+    }),
+    event('2', 'SubagentStart', { agent_id: 'agent-1', agent_type: 'Explore' }),
+    event('3', 'PreToolUse', {
+      tool_use_id: 'agent-tool-2', tool_name: 'Agent',
+      tool_input: { description: 'Second agent', subagent_type: 'general-purpose' },
+    }),
+    event('4', 'SubagentStart', { agent_id: 'agent-2', agent_type: 'general-purpose' }),
+    event('5', 'PreToolUse', {
+      agent_id: 'agent-2', tool_use_id: 'read-2', tool_name: 'Read',
+      tool_input: { file_path: 'second.ts' },
+    }),
+    event('6', 'PreToolUse', {
+      agent_id: 'agent-1', tool_use_id: 'grep-1', tool_name: 'Grep',
+      tool_input: { pattern: 'first' },
+    }),
+  ])
+
+  assert.equal(reduced.items.length, 2)
+  assert.equal(reduced.items[0].subagentTools?.[0].toolName, 'Grep')
+  assert.equal(reduced.items[1].subagentTools?.[0].toolName, 'Read')
+})
+
+test('completed agent response preserves the reported total tool count', () => {
+  const reduced = reduceClaudeAgentEvents([
+    event('1', 'PreToolUse', {
+      tool_use_id: 'agent-tool-1', tool_name: 'Agent',
+      tool_input: { description: 'Historical agent' },
+    }),
+    event('2', 'PostToolUse', {
+      tool_use_id: 'agent-tool-1', tool_name: 'Agent',
+      tool_response: {
+        agentId: 'agent-1',
+        agentType: 'Explore',
+        totalToolUseCount: 11,
+      },
+    }),
+  ])
+
+  assert.equal(reduced.items[0].state, 'success')
+  assert.equal(reduced.items[0].subagentId, 'agent-1')
+  assert.equal(reduced.items[0].subagentTotalToolUseCount, 11)
+})
+
+test('async launched agent remains running and is marked backgrounded until SubagentStop', () => {
+  const launched = reduceClaudeAgentEvents([
+    event('1', 'PreToolUse', {
+      tool_use_id: 'agent-tool-1', tool_name: 'Agent',
+      tool_input: { description: 'Explore ClaudePanel streaming', subagent_type: 'general-purpose' },
+    }),
+    event('2', 'SubagentStart', { agent_id: 'agent-1', agent_type: 'general-purpose' }),
+    event('3', 'PostToolUse', {
+      tool_use_id: 'agent-tool-1', tool_name: 'Agent',
+      tool_response: {
+        agentId: 'agent-1',
+        description: 'Explore ClaudePanel streaming',
+        isAsync: true,
+        status: 'async_launched',
+      },
+    }),
+  ])
+
+  assert.equal(launched.items[0].state, 'running')
+  assert.equal(launched.items[0].subagentRunMode, 'background')
+
+  const stopped = reduceClaudeAgentEvents([
+    event('1', 'PreToolUse', {
+      tool_use_id: 'agent-tool-1', tool_name: 'Agent',
+      tool_input: { description: 'Explore ClaudePanel streaming', subagent_type: 'general-purpose' },
+    }),
+    event('2', 'SubagentStart', { agent_id: 'agent-1', agent_type: 'general-purpose' }),
+    event('3', 'PostToolUse', {
+      tool_use_id: 'agent-tool-1', tool_name: 'Agent',
+      tool_response: { agentId: 'agent-1', isAsync: true, status: 'async_launched' },
+    }),
+    event('4', 'SubagentStop', { agent_id: 'agent-1', agent_type: 'general-purpose' }),
+  ])
+
+  assert.equal(stopped.items[0].state, 'success')
+  assert.equal(stopped.items[0].subagentRunMode, 'background')
 })
 
 test('AskUserQuestion becomes an inline waiting card and resumes after its result', () => {
@@ -144,6 +295,74 @@ test('AskUserQuestion permission request does not duplicate its inline question 
   assert.equal(reduced.items.length, 1)
   assert.equal(reduced.items[0].kind, 'tool')
   assert.equal(reduced.items[0].state, 'waiting')
+})
+
+test('ExitPlanMode permission becomes an interface prompt instead of a terminal-only card', () => {
+  const events = [
+    event('1', 'PreToolUse', {
+      tool_use_id: 'exit-plan-1',
+      tool_name: 'ExitPlanMode',
+      permission_mode: 'plan',
+    }),
+    event('2', 'PermissionRequest', {
+      tool_name: 'ExitPlanMode',
+      permission_mode: 'plan',
+    }),
+  ]
+  const pending = pendingClaudeExitPlanModePrompt(events)
+  const reduced = reduceClaudeAgentEvents(events)
+
+  assert.equal(pending?.sequence, 2)
+  assert.deepEqual(pending?.prompt.options, ['Yes', 'No'])
+  assert.equal(reduced.runState, 'permission')
+  assert.equal(reduced.items.some(item => item.kind === 'permission'), false)
+  assert.equal(reduced.items[0].toolName, 'ExitPlanMode')
+})
+
+test('ExitPlanMode completion clears the fallback prompt and reports the resulting mode', () => {
+  const events = [
+    event('1', 'PreToolUse', {
+      tool_use_id: 'exit-plan-1', tool_name: 'ExitPlanMode', permission_mode: 'plan',
+    }),
+    event('2', 'PermissionRequest', { tool_name: 'ExitPlanMode', permission_mode: 'plan' }),
+    event('3', 'PostToolUse', {
+      tool_use_id: 'exit-plan-1', tool_name: 'ExitPlanMode', permission_mode: 'default',
+    }),
+  ]
+
+  assert.equal(pendingClaudeExitPlanModePrompt(events), undefined)
+  assert.equal(claudePermissionModeLabelFromHookEvent(events[2]), '⏸ manual mode')
+  assert.equal(claudePermissionModeLabelFromHookEvent(event('4', 'PostToolUse', {
+    tool_name: 'ExitPlanMode', permission_mode: 'bypassPermissions',
+  })), '⏵⏵ bypass permissions')
+})
+
+test('a submitted question stays completed when ExitPlanMode immediately keeps the run in permission', () => {
+  const reduced = reduceClaudeAgentEvents([
+    event('1', 'PreToolUse', {
+      tool_use_id: 'question-1',
+      tool_name: 'AskUserQuestion',
+      tool_input: {
+        questions: [{
+          question: 'Choose a mode',
+          options: [{ label: 'A' }, { label: 'B' }],
+        }],
+      },
+    }),
+    event('2', 'PostToolUse', {
+      tool_use_id: 'question-1',
+      tool_name: 'AskUserQuestion',
+      tool_response: { answers: { 'Choose a mode': 'A' } },
+    }),
+    event('3', 'PreToolUse', {
+      tool_use_id: 'exit-plan-1', tool_name: 'ExitPlanMode', permission_mode: 'plan',
+    }),
+    event('4', 'PermissionRequest', { tool_name: 'ExitPlanMode', permission_mode: 'plan' }),
+  ])
+
+  assert.equal(reduced.runState, 'permission')
+  assert.equal(reduced.items[0].toolName, 'AskUserQuestion')
+  assert.equal(reduced.items[0].state, 'success')
 })
 
 test('out-of-order snapshot and live events reduce by backend sequence', () => {
