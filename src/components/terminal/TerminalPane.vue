@@ -15,6 +15,7 @@ import {
   blocksLegacyMultilineShortcut,
   terminalShortcutInput,
 } from '@/utils/terminalKeyboard'
+import { terminalFontFamily } from '@/utils/platformFonts'
 import { usePlatform } from '@/composables/usePlatform'
 
 const props = defineProps<{
@@ -65,12 +66,7 @@ function initTerminal() {
   const cliKind = store.tabs.find(tab => tab.id === props.tabId)?.cliKind ?? 'claude'
   initialized.value = true
   term = new Terminal({
-    // Keep the primary terminal font monospace, but explicitly provide the
-    // Windows symbol/emoji fallback used by the WebView renderer. Cascadia
-    // Code/Mono and Consolas do not contain U+2731 (✱). Prefer the narrower
-    // Arial Unicode MS fallback before Segoe's wider symbol glyphs so xterm
-    // is less likely to clip the character inside a single terminal cell.
-    fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, "Arial Unicode MS", "Segoe UI Symbol", "Segoe UI Emoji", monospace',
+    fontFamily: terminalFontFamily,
     fontSize: store.fontSize,
     cursorBlink: cliKind !== 'codex',
     allowTransparency: false,
