@@ -1233,7 +1233,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  background-color: var(--bg);
+  background: var(--app-bg-gradient);
   position: relative;
 }
 
@@ -1248,7 +1248,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: flex-start;
   padding: 0 8px 0 0;
-  background-color: var(--card);
+  background: var(--card-bg-gradient);
   user-select: none;
 }
 
@@ -1512,7 +1512,7 @@ onBeforeUnmount(() => {
 
 .settings-dropdown__menu,
 .settings-dropdown__submenu {
-  background-color: var(--card);
+  background: var(--card-bg-gradient);
   border: 1px solid var(--input-border);
   border-radius: 10px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
@@ -1744,6 +1744,7 @@ onBeforeUnmount(() => {
   flex: 1;
   overflow: hidden;
   position: relative;
+  background: var(--app-bg-gradient);
 }
 
 .app-panel {

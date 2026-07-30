@@ -78,7 +78,7 @@ watch(leftWidth, (width) => {
   display: flex;
   height: 100%;
   overflow: hidden;
-  background-color: var(--bg);
+  background: var(--bg);
 }
 
 .claude-panel__sidebar-shell {
@@ -105,7 +105,7 @@ watch(leftWidth, (width) => {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  background-color: var(--bg);
+  background: var(--app-bg-gradient);
   padding: 12px;
   gap: 8px;
   min-width: 0;

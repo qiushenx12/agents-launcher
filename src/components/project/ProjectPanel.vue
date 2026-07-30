@@ -27,7 +27,7 @@
             @open-settings="emit('open-settings')"
           />
           <div
-            class="project-panel__divider"
+            class="project-panel__divider project-panel__divider--left"
             :class="{ 'project-panel__divider--dragging': sharedLeftSidebarDragging }"
             @mousedown="startSharedLeftSidebarResize"
           />
@@ -514,6 +514,20 @@ watch(() => props.cliKind, (kind) => {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* The left resize hit area sits between the sidebar and the module toolbar.
+   Keep its right half filled with the toolbar surface so that the two bars
+   meet cleanly instead of exposing a dark gap at their junction. */
+.project-panel__divider--left::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 50%;
+  height: 38px;
+  pointer-events: none;
+  background: var(--chrome-bridge-bg);
 }
 
 .project-panel__divider::after {

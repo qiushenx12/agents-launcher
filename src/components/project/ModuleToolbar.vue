@@ -126,7 +126,7 @@ function toggleTopSidebar() {
   gap: 8px;
   padding: 0 10px;
   border-bottom: 1px solid var(--separator);
-  background: var(--card);
+  background: var(--card-bg-gradient);
 }
 
 .module-toolbar__title {

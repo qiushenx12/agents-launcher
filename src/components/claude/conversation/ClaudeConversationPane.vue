@@ -2752,41 +2752,41 @@ defineExpose({ appendDroppedFiles })
 }
 
 [data-theme="dark"] .claude-conversation {
-  --claude-page-bg: #080a0d;
-  --claude-surface-bg: #101318;
-  --claude-elevated-bg: #161a20;
-  --claude-border-color: #252b33;
-  --claude-field-bg: #141920;
-  --claude-field-border: #36404c;
-  --claude-copy-bg: #1a2028;
-  --claude-copy-hover-bg: #202b37;
-  --claude-copy-border: #36404c;
-  --claude-copy-shadow: rgba(0, 0, 0, 0.5);
-  --claude-jump-bg: #111418;
-  --claude-jump-hover-bg: #1a2027;
-  --claude-jump-border: #2a3038;
-  --claude-jump-shadow: rgba(0, 0, 0, 0.52);
-  --claude-shadow-soft: rgba(0, 0, 0, 0.38);
-  --claude-shadow-medium: rgba(0, 0, 0, 0.48);
-  --claude-composer-bg: #292d32;
-  --claude-composer-border: #454b53;
-  --claude-composer-border-hover: #59616b;
-  --claude-composer-border-focus: #6a737d;
+  --claude-page-bg: #1b1f24;
+  --claude-surface-bg: #252a31;
+  --claude-elevated-bg: #2b3139;
+  --claude-border-color: #373e48;
+  --claude-field-bg: #2a3038;
+  --claude-field-border: #48515d;
+  --claude-copy-bg: #303741;
+  --claude-copy-hover-bg: #37414d;
+  --claude-copy-border: #48515d;
+  --claude-copy-shadow: rgba(0, 0, 0, 0.34);
+  --claude-jump-bg: #292e35;
+  --claude-jump-hover-bg: #343b44;
+  --claude-jump-border: #414954;
+  --claude-jump-shadow: rgba(0, 0, 0, 0.36);
+  --claude-shadow-soft: rgba(0, 0, 0, 0.28);
+  --claude-shadow-medium: rgba(0, 0, 0, 0.36);
+  --claude-composer-bg: #30353c;
+  --claude-composer-border: #525a65;
+  --claude-composer-border-hover: #626c78;
+  --claude-composer-border-focus: #747e8a;
   --claude-composer-ring: rgba(210, 216, 224, 0.10);
   --claude-send-bg: #c6c9ce;
   --claude-send-ready-bg: #f4f5f6;
   --claude-send-color: #17191c;
   --claude-activity-color: #e7835f;
-  --claude-activity-bg: rgba(21, 25, 31, 0.96);
-  --claude-activity-border: #303740;
-  --claude-activity-shadow: rgba(0, 0, 0, 0.46);
-  --claude-table-border: #3b444f;
-  --claude-table-bg: #0f1318;
-  --claude-table-header-bg: #1a2027;
-  --claude-table-stripe-bg: #14191f;
-  --claude-queue-bg: #1b1f24;
-  --claude-queue-border: #343a43;
-  --claude-queue-hover-bg: #252b32;
+  --claude-activity-bg: rgba(37, 42, 49, 0.96);
+  --claude-activity-border: #414954;
+  --claude-activity-shadow: rgba(0, 0, 0, 0.32);
+  --claude-table-border: #48515d;
+  --claude-table-bg: #22272d;
+  --claude-table-header-bg: #2c323a;
+  --claude-table-stripe-bg: #272c33;
+  --claude-queue-bg: #2a3037;
+  --claude-queue-border: #444c57;
+  --claude-queue-hover-bg: #343b44;
 }
 
 .tool-card__state {
@@ -3707,8 +3707,23 @@ defineExpose({ appendDroppedFiles })
   position: relative;
   flex: 0 0 auto;
   padding: var(--claude-block-padding) clamp(18px, 6vw, 84px);
-  border-top: 1px solid var(--claude-border-color);
-  background: var(--claude-page-bg);
+  border-top: 0;
+  background: transparent;
+}
+
+/* Fade the last lines of history into the fixed page color.  This layer is
+   attached to the composer so it stays above the scrolling content while
+   leaving the conversation background itself completely flat. */
+.claude-composer::before {
+  content: '';
+  position: absolute;
+  top: -72px;
+  right: 0;
+  left: 0;
+  z-index: 1;
+  height: 72px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent 0%, var(--claude-page-bg) 100%);
 }
 
 .claude-composer__topbar {
@@ -3795,6 +3810,8 @@ defineExpose({ appendDroppedFiles })
 
 .claude-prompt-queue {
   display: grid;
+  position: relative;
+  z-index: 1;
   gap: 6px;
   width: var(--claude-content-width);
   max-height: 194px;
@@ -3907,6 +3924,7 @@ defineExpose({ appendDroppedFiles })
 
 .claude-composer__input-area {
   position: relative;
+  z-index: 1;
   width: var(--claude-content-width);
   margin: 0 auto;
 }
@@ -4631,6 +4649,8 @@ defineExpose({ appendDroppedFiles })
 }
 
 .claude-composer__footer {
+  position: relative;
+  z-index: 1;
   width: var(--claude-content-width);
   margin: 7px auto 0;
   display: flex;
