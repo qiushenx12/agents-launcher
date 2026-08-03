@@ -197,12 +197,12 @@ function clampRight(value: number) {
 }
 
 function clampTop(value: number) {
-  const max = Math.max(MIN_TOP, availableVerticalSidebarHeight() - 320)
+  const max = Math.max(MIN_TOP, availableVerticalSidebarHeight() - 160)
   return Math.max(MIN_TOP, Math.min(max, value))
 }
 
 function clampBottom(value: number) {
-  const max = Math.max(MIN_BOTTOM, availableVerticalSidebarHeight() - 320)
+  const max = Math.max(MIN_BOTTOM, availableVerticalSidebarHeight() - 160)
   return Math.max(MIN_BOTTOM, Math.min(max, value))
 }
 

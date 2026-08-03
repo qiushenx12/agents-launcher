@@ -98,28 +98,32 @@
               <div
                 v-for="session in sessionsForProject(project.id)"
                 :key="session.id"
-                class="session-row"
-                :class="{
-                  active: session.id === store.activeSessionId,
-                  'session-row--closeable': sessionIsCloseable(session.id),
-                }"
-                @click="store.activateSession(session.id)"
-                @contextmenu.prevent="renameSession(session.id)"
+                class="session-row-wrap"
               >
-                <span class="session-row__status" :class="sessionStatus(session.id)" />
-                <span class="session-row__name">{{ displaySessionName(session.name) }}</span>
-                <span class="session-row__meta">
-                  <span class="session-row__time">{{ formatRelativeTime(session.updatedAt) }}</span>
-                  <button
-                    v-if="sessionIsCloseable(session.id)"
-                    type="button"
-                    class="session-row__close"
-                    title="关闭终端"
-                    @click.stop="store.closeSessionTerminal(session.id)"
-                  >
-                    ×
-                  </button>
-                </span>
+                <div
+                  class="session-row"
+                  :class="{
+                    active: session.id === store.activeSessionId,
+                    'session-row--closeable': sessionIsCloseable(session.id),
+                  }"
+                  @click="store.activateSession(session.id)"
+                  @contextmenu.prevent.stop="openSessionActions(session.id, $event)"
+                >
+                  <span class="session-row__status" :class="sessionStatus(session.id)" />
+                  <span class="session-row__name">{{ displaySessionName(session.name) }}</span>
+                  <span class="session-row__meta">
+                    <span class="session-row__time">{{ formatRelativeTime(session.updatedAt) }}</span>
+                    <button
+                      v-if="sessionIsCloseable(session.id)"
+                      type="button"
+                      class="session-row__close"
+                      title="关闭终端"
+                      @click.stop="store.closeSessionTerminal(session.id)"
+                    >
+                      ×
+                    </button>
+                  </span>
+                </div>
               </div>
               <button
                 v-if="showSessionToggle(project.id)"
@@ -143,6 +147,48 @@
       </button>
     </div>
 
+    <Teleport to="body">
+      <div
+        v-if="openSessionMenuSession"
+        ref="sessionMenuRef"
+        class="session-actions-menu"
+        :style="{
+          top: `${sessionMenuPosition.top}px`,
+          left: `${sessionMenuPosition.left}px`,
+        }"
+        @click.stop
+      >
+        <button
+          v-if="openSessionMenuSession.cliKind === 'claude'"
+          type="button"
+          class="session-actions-menu__item"
+          @click="openSessionInPowerShell(openSessionMenuSession.id)"
+        >
+          <span aria-hidden="true">&gt;_</span>
+          从终端打开
+        </button>
+        <button
+          v-if="openSessionMenuSession.cliKind === 'claude'"
+          type="button"
+          class="session-actions-menu__item"
+          :disabled="!canCopySessionLaunchCommand(openSessionMenuSession.id)"
+          :title="canCopySessionLaunchCommand(openSessionMenuSession.id) ? '复制 Claude 恢复命令' : '当前会话还没有可用的 Claude 会话 ID'"
+          @click="copySessionLaunchCommand(openSessionMenuSession.id)"
+        >
+          <span aria-hidden="true">↗</span>
+          复制启动命令
+        </button>
+        <button
+          type="button"
+          class="session-actions-menu__item"
+          @click="renameSession(openSessionMenuSession.id)"
+        >
+          <span aria-hidden="true">✎</span>
+          重命名
+        </button>
+      </div>
+    </Teleport>
+
     <footer class="project-sidebar__footer">
       <button class="settings-entry" @click="emit('open-settings', $event)">⚙ <span>设置</span></button>
     </footer>
@@ -164,6 +210,14 @@ const emit = defineEmits<{
 }>()
 const projectOptionsOpen = ref(false)
 const openMenuProjectId = ref<string | null>(null)
+const openSessionMenuId = ref<string | null>(null)
+const sessionMenuRef = ref<HTMLElement | null>(null)
+const sessionMenuAnchor = ref<{ top: number; bottom: number; right: number } | null>(null)
+const sessionMenuPosition = ref({ top: 0, left: 0 })
+const openSessionMenuSession = computed(() => {
+  if (!openSessionMenuId.value) return null
+  return store.sessions.find((session) => session.id === openSessionMenuId.value) ?? null
+})
 const projectListExpanded = ref(true)
 const sidebarRef = ref<HTMLElement | null>(null)
 const currentTime = ref(Date.now())
@@ -242,11 +296,15 @@ onMounted(() => {
     currentTime.value = Date.now()
   }, 10_000)
   document.addEventListener('click', closeProjectActionsOnOutsideClick)
+  document.addEventListener('scroll', updateSessionMenuPosition, true)
+  window.addEventListener('resize', updateSessionMenuPosition)
 })
 
 onUnmounted(() => {
   if (relativeTimeTimer) window.clearInterval(relativeTimeTimer)
   document.removeEventListener('click', closeProjectActionsOnOutsideClick)
+  document.removeEventListener('scroll', updateSessionMenuPosition, true)
+  window.removeEventListener('resize', updateSessionMenuPosition)
 })
 
 watch(() => store.sessions, () => {
@@ -383,6 +441,7 @@ async function onProjectRowClick(projectId: string) {
 function toggleProjectOptions() {
   projectOptionsOpen.value = !projectOptionsOpen.value
   openMenuProjectId.value = null
+  openSessionMenuId.value = null
 }
 
 async function setProjectSortMode(mode: ProjectSortMode) {
@@ -392,6 +451,51 @@ async function setProjectSortMode(mode: ProjectSortMode) {
 
 function toggleProjectActions(projectId: string) {
   openMenuProjectId.value = openMenuProjectId.value === projectId ? null : projectId
+  openSessionMenuId.value = null
+}
+
+function updateSessionMenuPosition() {
+  const anchor = sessionMenuAnchor.value
+  if (!anchor) return
+
+  const menu = sessionMenuRef.value
+  const menuWidth = menu?.offsetWidth || 210
+  const menuHeight = menu?.offsetHeight || 84
+  const viewportMargin = 8
+  const gap = 4
+  const preferredLeft = anchor.right - menuWidth - 6
+  const maxLeft = Math.max(viewportMargin, window.innerWidth - menuWidth - viewportMargin)
+  const left = Math.min(Math.max(viewportMargin, preferredLeft), maxLeft)
+  const belowTop = anchor.bottom + gap
+  const aboveTop = anchor.top - menuHeight - gap
+  const fitsBelow = belowTop + menuHeight <= window.innerHeight - viewportMargin
+  const fitsAbove = aboveTop >= viewportMargin
+  const top = fitsBelow
+    ? belowTop
+    : fitsAbove
+      ? aboveTop
+      : Math.max(viewportMargin, window.innerHeight - menuHeight - viewportMargin)
+
+  sessionMenuPosition.value = { top, left }
+}
+
+function openSessionActions(sessionId: string, event: MouseEvent) {
+  const session = store.sessions.find((item) => item.id === sessionId)
+  if (!session) return
+
+  const row = event.currentTarget as HTMLElement | null
+  const rowBounds = row?.getBoundingClientRect()
+  if (!rowBounds) return
+
+  projectOptionsOpen.value = false
+  openMenuProjectId.value = null
+  sessionMenuAnchor.value = {
+    top: rowBounds.top,
+    bottom: rowBounds.bottom,
+    right: rowBounds.right,
+  }
+  openSessionMenuId.value = sessionId
+  void nextTick(updateSessionMenuPosition)
 }
 
 function closeProjectActionsOnOutsideClick(event: MouseEvent) {
@@ -403,9 +507,17 @@ function closeProjectActionsOnOutsideClick(event: MouseEvent) {
   ) {
     projectOptionsOpen.value = false
   }
-  if (!openMenuProjectId.value) return
-  if (target?.closest('.project-actions-menu') || target?.closest('.project-row__actions')) return
-  openMenuProjectId.value = null
+  if (openMenuProjectId.value) {
+    if (target?.closest('.project-actions-menu') || target?.closest('.project-row__actions')) return
+    openMenuProjectId.value = null
+  }
+
+  if (
+    openSessionMenuId.value
+    && !target?.closest('.session-actions-menu')
+  ) {
+    openSessionMenuId.value = null
+  }
 }
 
 async function renameProject(projectId: string) {
@@ -417,10 +529,84 @@ async function renameProject(projectId: string) {
 }
 
 async function renameSession(sessionId: string) {
+  openSessionMenuId.value = null
   const session = store.sessions.find((item) => item.id === sessionId)
   if (!session) return
   const name = window.prompt('重命名会话', session.name)
   if (name) await store.renameSession(sessionId, name)
+}
+
+function sessionLaunchCommand(sessionId: string) {
+  const session = store.sessions.find((item) => item.id === sessionId)
+  if (!session || session.cliKind !== 'claude') return null
+
+  const project = store.projects.find((item) => item.id === session.projectId)
+  const nativeSessionId = session.nativeSessionId ?? session.claudeSessionId
+  if (!project || !nativeSessionId) return null
+
+  const quotePowerShellArg = (value: string) => `'${value.replace(/'/g, "''")}'`
+  return `Set-Location -LiteralPath ${quotePowerShellArg(project.path)}; claude -r ${quotePowerShellArg(nativeSessionId)}`
+}
+
+async function openSessionInPowerShell(sessionId: string) {
+  const command = sessionLaunchCommand(sessionId)
+  const session = store.sessions.find((item) => item.id === sessionId)
+  const project = session && store.projects.find((item) => item.id === session.projectId)
+  if (!command || !session || !project || session.cliKind !== 'claude') return
+
+  try {
+    await invoke('launch_claude', {
+      exe: 'powershell.exe',
+      envVars: {},
+      args: ['-NoLogo', '-NoExit', '-Command', command],
+      cwd: project.path,
+    })
+    store.statusMessage = '已打开 PowerShell 并恢复 Claude 会话'
+    openSessionMenuId.value = null
+  } catch (error) {
+    console.error('Failed to open Claude session in PowerShell:', error)
+    store.statusMessage = `打开 PowerShell 失败：${String(error)}`
+  }
+}
+
+function canCopySessionLaunchCommand(sessionId: string) {
+  return !!sessionLaunchCommand(sessionId)
+}
+
+async function writeClipboardText(text: string) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return
+    }
+  } catch {
+    // Fall back to the legacy WebView clipboard path below.
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', '')
+  textarea.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  const copied = document.execCommand('copy')
+  textarea.remove()
+  if (!copied) throw new Error('Clipboard write failed')
+}
+
+async function copySessionLaunchCommand(sessionId: string) {
+  const command = sessionLaunchCommand(sessionId)
+  if (!command) return
+
+  try {
+    await writeClipboardText(command)
+    store.statusMessage = 'Claude 启动命令已复制，可粘贴到终端回复会话'
+    openSessionMenuId.value = null
+  } catch (error) {
+    console.error('Failed to copy Claude session launch command:', error)
+    store.statusMessage = '启动命令复制失败，请重试'
+  }
 }
 
 async function removeProject(projectId: string) {
@@ -763,6 +949,54 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   min-height: 0;
   overflow: hidden;
   padding: 2px 0 6px 20px;
+}
+
+.session-row-wrap {
+  position: relative;
+}
+
+.session-actions-menu {
+  position: fixed;
+  z-index: 3000;
+  width: 196px;
+  min-width: 196px;
+  padding: 6px;
+  border: 1px solid var(--separator);
+  border-radius: var(--radius);
+  background-color: var(--card);
+  opacity: 1;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
+}
+
+.session-actions-menu__item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-base);
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-actions-menu__item span {
+  width: 16px;
+  flex: 0 0 16px;
+  color: var(--primary);
+  text-align: center;
+}
+
+.session-actions-menu__item:hover:not(:disabled) {
+  background: var(--tab-bg);
+}
+
+.session-actions-menu__item:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .session-list-enter-from,
