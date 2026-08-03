@@ -42,3 +42,9 @@ Thumbs.db
 # Local-only tools / assets
 claude-code-2-1-112/
 截图/
+
+# Local workspace data (work logs, agent state)
+.workbuddy/
+
+# Local OS shortcuts
+*.lnk
