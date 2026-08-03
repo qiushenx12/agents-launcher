@@ -203,8 +203,10 @@ import type { Project, ProjectSession, ProjectSortMode } from '@/stores/project'
 import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import { useDragReorder } from '@/composables/useDragReorder'
 import { CLI_DESCRIPTORS } from '@/types/cli'
+import { usePlatform } from '@/composables/usePlatform'
 
 const store = useProjectStore()
+const { isMacOS } = usePlatform()
 const emit = defineEmits<{
   (event: 'open-settings', mouseEvent: MouseEvent): void
 }>()
@@ -544,16 +546,50 @@ function sessionLaunchCommand(sessionId: string) {
   const nativeSessionId = session.nativeSessionId ?? session.claudeSessionId
   if (!project || !nativeSessionId) return null
 
+  if (isMacOS.value) {
+    // macOS default shell is zsh/bash: cd into the project then resume the claude session
+    const quoteUnixArg = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+    return `cd ${quoteUnixArg(project.path)} && claude -r ${quoteUnixArg(nativeSessionId)}`
+  }
+
   const quotePowerShellArg = (value: string) => `'${value.replace(/'/g, "''")}'`
   return `Set-Location -LiteralPath ${quotePowerShellArg(project.path)}; claude -r ${quotePowerShellArg(nativeSessionId)}`
 }
 
 async function openSessionInPowerShell(sessionId: string) {
-  const command = sessionLaunchCommand(sessionId)
   const session = store.sessions.find((item) => item.id === sessionId)
   const project = session && store.projects.find((item) => item.id === session.projectId)
-  if (!command || !session || !project || session.cliKind !== 'claude') return
+  if (!session || !project || session.cliKind !== 'claude') return
 
+  if (isMacOS.value) {
+    const command = sessionLaunchCommand(sessionId)
+    if (!command) return
+    try {
+      // Escape for embedding inside an AppleScript double-quoted string.
+      const appleScriptCommand = command.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+      await invoke('launch_claude', {
+        exe: 'osascript',
+        envVars: {},
+        args: [
+          '-e', 'tell application "Terminal"',
+          // Bring Terminal to the front so the new window is visible immediately.
+          '-e', 'activate',
+          '-e', `do script "${appleScriptCommand}"`,
+          '-e', 'end tell',
+        ],
+        cwd: project.path,
+      })
+      store.statusMessage = '已打开 Terminal 并恢复 Claude 会话'
+      openSessionMenuId.value = null
+    } catch (error) {
+      console.error('Failed to open Claude session in Terminal:', error)
+      store.statusMessage = `打开 Terminal 失败：${String(error)}`
+    }
+    return
+  }
+
+  const command = sessionLaunchCommand(sessionId)
+  if (!command) return
   try {
     await invoke('launch_claude', {
       exe: 'powershell.exe',
