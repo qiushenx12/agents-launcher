@@ -4,17 +4,17 @@ This file provides repository-specific guidance for coding agents working on Age
 
 ## Project Overview
 
-Agents Launcher is a Windows desktop workspace for **Claude Code**, **Codex**, and **OpenCode**. It combines CLI-specific configuration profiles, project and session discovery, embedded PTY terminals, file tools, inter-tab communication, and local orchestration features.
+Agents Launcher is a Windows and macOS desktop workspace for **Claude Code**, **Codex**, and **OpenCode**. It combines CLI-specific configuration profiles, project and session discovery, embedded PTY terminals, file tools, inter-tab communication, and local orchestration features.
 
 - **Frontend:** Vue 3 Composition API, Pinia, TypeScript, Vite, xterm.js
 - **Backend:** Rust and Tauri 2 commands/events
-- **Target platform:** Windows only
+- **Target platforms:** Windows (primary) and macOS (supported via `src-tauri/tauri.macos.conf.json` and `build-macos.command`)
 - **Package manager:** npm
 - **Application data:** `%APPDATA%\ClaudeEnvManager\`
 - **Claude capture logs (when “Claude 日志输出” is enabled):** `%APPDATA%\ClaudeEnvManager\terminal_logs\claude\<capture-id>\`
 - **Claude conversation UI error log:** `%APPDATA%\ClaudeEnvManager\terminal_logs\claude\ui-errors.jsonl`
 
-The backend depends on Windows APIs through the `winreg` and `windows` crates. Do not assume that the Rust project can compile or run on another platform.
+The backend also compiles and runs on macOS. Windows-only APIs (`winreg`, `windows` crates) are gated behind `[target.'cfg(windows)']` in `src-tauri/Cargo.toml`, and macOS-specific code (e.g. `objc2`, `objc2-app-kit`) behind `cfg(target_os = "macos")`. Keep every platform-specific call behind the matching `cfg` gate so both platforms keep compiling, and use the frontend `usePlatform` composable (`isMacOS`) for platform branching in Vue/TS code.
 
 ## Working Commands
 
