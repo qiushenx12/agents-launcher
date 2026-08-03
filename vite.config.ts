@@ -3,10 +3,14 @@ import vue from "@vitejs/plugin-vue";
 import path from "path";
 
 const host = process.env.TAURI_DEV_HOST;
+const tauriPlatform = process.env.TAURI_ENV_PLATFORM || "";
 
 export default defineConfig({
   plugins: [vue()],
   clearScreen: false,
+  define: {
+    __AGENTS_LAUNCHER_PLATFORM__: JSON.stringify(tauriPlatform),
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),

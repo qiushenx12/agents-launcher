@@ -78,7 +78,8 @@ watch(leftWidth, (width) => {
   display: flex;
   height: 100%;
   overflow: hidden;
-  background: var(--bg);
+  background: var(--app-bg-gradient);
+  background-attachment: fixed;
 }
 
 .claude-panel__sidebar-shell {
@@ -106,6 +107,7 @@ watch(leftWidth, (width) => {
   display: flex;
   flex-direction: column;
   background: var(--app-bg-gradient);
+  background-attachment: fixed;
   padding: 12px;
   gap: 8px;
   min-width: 0;

@@ -26,7 +26,7 @@
   --terminal-bg: #1E1E1E;
   --terminal-fg: #F0F0F0;
   --font-base: "Microsoft YaHei UI", system-ui, sans-serif;
-  --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  --font-mono: "SFMono-Regular", Menlo, Monaco, monospace;
   --font-size-base: 13px;
   --font-size-title: 14px;
   --font-size-small: 12px;
