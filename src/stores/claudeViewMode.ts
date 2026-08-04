@@ -9,6 +9,12 @@ function normalizeClaudeView(value: string): ClaudeView {
   return 'terminal'
 }
 
+// Release builds always run the terminal view: the conversation view and its
+// settings entry are dev-only, so a persisted non-terminal preference would
+// otherwise activate a mode with no UI left to switch back. The coercion is
+// in-memory only; the persisted value stays untouched for dev builds.
+const FORCE_TERMINAL_VIEW = !import.meta.env.DEV
+
 export const useClaudeViewModeStore = defineStore('claude-view-mode', () => {
   const startupView = ref<ClaudeView>('terminal')
   const savedView = ref<ClaudeView>('terminal')
@@ -34,7 +40,7 @@ export const useClaudeViewModeStore = defineStore('claude-view-mode', () => {
           invoke<string>('load_claude_startup_view'),
           invoke<boolean>('load_claude_log_output_enabled'),
         ])
-        const view = normalizeClaudeView(viewValue)
+        const view = FORCE_TERMINAL_VIEW ? 'terminal' : normalizeClaudeView(viewValue)
         startupView.value = view
         savedView.value = view
         runtimeView.value = view
@@ -55,7 +61,7 @@ export const useClaudeViewModeStore = defineStore('claude-view-mode', () => {
   }
 
   function setRuntimeView(view: ClaudeView) {
-    runtimeView.value = view
+    runtimeView.value = FORCE_TERMINAL_VIEW ? 'terminal' : view
   }
 
   async function setLogOutputEnabled(enabled: boolean) {

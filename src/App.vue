@@ -279,13 +279,13 @@
           <span class="settings-dropdown__group-value">{{ claudeStore.projectDropPathMode === 'relative' ? '相对路径' : '仅文件名' }}</span>
           <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
         </button>
-        <button v-if="showClaudeSettings" class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'busy-input' }" type="button" :aria-expanded="activeSettingsSubmenu === 'busy-input'" @click="toggleSettingsSubmenu('busy-input', $event)">
+        <button v-if="showDevOnlyClaudeSettings && showClaudeSettings" class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'busy-input' }" type="button" :aria-expanded="activeSettingsSubmenu === 'busy-input'" @click="toggleSettingsSubmenu('busy-input', $event)">
           <span>Claude 运行中消息</span>
           <span class="settings-dropdown__group-value">{{ claudeObserverStore.busyInputMode === 'native' ? '执行间隙插入' : '完全停止后发送' }}</span>
           <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
         </button>
         <button
-          v-if="showClaudeViewSettings"
+          v-if="showDevOnlyClaudeSettings && showClaudeViewSettings"
           class="settings-dropdown__group-trigger"
           :class="{ 'is-open': activeSettingsSubmenu === 'claude-view' }"
           type="button"
@@ -297,7 +297,7 @@
           <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
         </button>
         <button
-          v-if="showClaudeSettings"
+          v-if="showDevOnlyClaudeSettings && showClaudeSettings"
           class="settings-dropdown__group-trigger"
           type="button"
           role="switch"
@@ -471,6 +471,10 @@ const settingsCliKind = computed<CliKind | null>(() => {
   if (workspaceMode.value === 'config') return activeCliKind.value
   return isCliKind(mainTab.value) ? mainTab.value : null
 })
+// Experimental Claude settings (busy input, view mode, log output) still have known
+// issues, so they are dev-only for now: visible under dev.py (vite dev), hidden in
+// build.py release builds where import.meta.env.DEV is false.
+const showDevOnlyClaudeSettings = import.meta.env.DEV
 const showClaudeSettings = computed(() => settingsCliKind.value === 'claude')
 const showClaudeViewSettings = computed(() => showClaudeSettings.value)
 const activeClaudeView = computed<ClaudeView>(() => (
