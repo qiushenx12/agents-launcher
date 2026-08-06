@@ -24,7 +24,8 @@ use crate::{env_applier, registry};
 
 const CODEX_STATE_VERSION: u32 = 1;
 const CODEX_STATE_KEY: &str = "codex";
-const MANAGED_PROFILE_PREFIX: &str = "cc-launcher-";
+const MANAGED_PROFILE_PREFIX: &str = "agents-launcher-";
+const LEGACY_MANAGED_PROFILE_PREFIX: &str = "cc-launcher-";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +33,86 @@ pub enum CodexAuthMode {
     Official,
     Custom,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningLevel {
+    pub effort: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTruncationPolicy {
+    pub mode: String,
+    pub limit: u64,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelDefinition {
+    pub slug: String,
+    #[serde(default, rename = "displayName", alias = "display_name")]
+    pub display_name: String,
+    #[serde(
+        default = "default_input_modalities",
+        rename = "inputModalities",
+        alias = "input_modalities"
+    )]
+    pub input_modalities: Vec<String>,
+    #[serde(
+        default,
+        rename = "supportsImageDetailOriginal",
+        alias = "supports_image_detail_original"
+    )]
+    pub supports_image_detail_original: bool,
+    #[serde(rename = "contextWindow", alias = "context_window")]
+    pub context_window: u64,
+    #[serde(rename = "maxContextWindow", alias = "max_context_window")]
+    pub max_context_window: u64,
+    #[serde(
+        default = "default_effective_context_window_percent",
+        rename = "effectiveContextWindowPercent",
+        alias = "effective_context_window_percent"
+    )]
+    pub effective_context_window_percent: u8,
+    #[serde(default, rename = "truncationPolicy", alias = "truncation_policy")]
+    pub truncation_policy: Option<CodexTruncationPolicy>,
+    #[serde(default, rename = "defaultReasoningLevel", alias = "default_reasoning_level")]
+    pub default_reasoning_level: String,
+    #[serde(
+        default,
+        rename = "supportedReasoningLevels",
+        alias = "supported_reasoning_levels"
+    )]
+    pub supported_reasoning_levels: Vec<CodexReasoningLevel>,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelCatalog {
+    #[serde(default)]
+    pub models: Vec<CodexModelDefinition>,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+fn default_effective_context_window_percent() -> u8 {
+    95
+}
+
+fn default_input_modalities() -> Vec<String> {
+    vec!["text".to_string()]
+}
+
+const DEEPSEEK_MODEL_CATALOG_TEMPLATE: &str = include_str!("../../src/deepseekModelsTemplate.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +141,8 @@ pub struct CodexProfile {
     pub has_stored_api_key: bool,
     #[serde(default)]
     pub managed_profile_name: String,
+    #[serde(default)]
+    pub model_catalog: Option<CodexModelCatalog>,
     #[serde(default, flatten)]
     pub extra: Map<String, Value>,
 }
@@ -83,8 +166,30 @@ struct CodexProfileState {
     global_profile_id: Option<String>,
     #[serde(default)]
     managed_global_provider_id: Option<String>,
+    #[serde(default)]
+    managed_global_model_catalog: Option<ManagedGlobalModelCatalogState>,
+    #[serde(default)]
+    managed_profile_model_catalogs: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    managed_model_catalogs: BTreeMap<String, ManagedModelCatalogState>,
     #[serde(default, flatten)]
     extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ManagedModelCatalogState {
+    path: String,
+    #[serde(default)]
+    previous_bytes: Option<Vec<u8>>,
+    applied_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ManagedGlobalModelCatalogState {
+    previous_value: Option<String>,
+    applied_value: String,
 }
 
 fn default_state_version() -> u32 {
@@ -98,6 +203,9 @@ impl Default for CodexProfileState {
             profiles: Vec::new(),
             global_profile_id: None,
             managed_global_provider_id: None,
+            managed_global_model_catalog: None,
+            managed_profile_model_catalogs: BTreeMap::new(),
+            managed_model_catalogs: BTreeMap::new(),
             extra: Map::new(),
         }
     }
@@ -257,6 +365,55 @@ fn managed_profile_path(profile_id: &str) -> Result<PathBuf, String> {
     Ok(codex_home()?.join(format!("{}.config.toml", managed_profile_name(profile_id))))
 }
 
+fn legacy_managed_profile_path_at(codex_home: &Path, profile_id: &str) -> PathBuf {
+    codex_home.join(format!(
+        "{}{}.config.toml",
+        LEGACY_MANAGED_PROFILE_PREFIX,
+        profile_id.trim_start_matches("profile-")
+    ))
+}
+
+fn migrate_legacy_managed_profile(profile_id: &str, target: &Path) -> Result<(), String> {
+    migrate_legacy_managed_profile_at(profile_id, target, &codex_home()?)
+}
+
+fn migrate_legacy_managed_profile_at(
+    profile_id: &str,
+    target: &Path,
+    codex_home: &Path,
+) -> Result<(), String> {
+    if target.exists() {
+        return Ok(());
+    }
+    let legacy = legacy_managed_profile_path_at(codex_home, profile_id);
+    if !legacy.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(&legacy)
+        .map_err(|error| format!("无法读取旧版 CodeX profile {}：{error}", legacy.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("旧版 CodeX profile 不是 UTF-8：{error}"))?;
+    DocumentMut::from_str(text)
+        .map_err(|error| format!("旧版 CodeX profile 无法解析：{error}"))?;
+    write_toml_atomic(target, &bytes)?;
+    let migrated = fs::read(target)
+        .map_err(|error| format!("无法回读迁移后的 CodeX profile：{error}"))?;
+    if migrated != bytes {
+        return Err("旧版 CodeX profile 迁移后回读不一致".to_string());
+    }
+    remove_if_exists(&legacy)?;
+    remove_transaction_sidecars(&legacy)?;
+    Ok(())
+}
+
+fn managed_model_catalog_path(profile_id: &str) -> Result<PathBuf, String> {
+    Ok(managed_model_catalog_path_at(&codex_home()?, profile_id))
+}
+
+fn managed_model_catalog_path_at(codex_home: &Path, profile_id: &str) -> PathBuf {
+    codex_home.join(format!("{}.models.json", managed_profile_name(profile_id)))
+}
+
 #[cfg(windows)]
 fn credential_path(profile_id: &str) -> Result<PathBuf, String> {
     Ok(credentials_dir()?.join(format!("{profile_id}.bin")))
@@ -304,6 +461,231 @@ fn save_profile_state(state: &CodexProfileState) -> Result<(), String> {
     write_json_atomic(&profiles_path()?, &json, "CodeX 方案索引")
 }
 
+fn validate_model_slug(slug: &str) -> Result<(), String> {
+    if slug.is_empty()
+        || !slug.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(format!("模型 slug '{}' 含有不支持的字符", slug));
+    }
+    Ok(())
+}
+
+fn normalize_model_catalog(
+    mut catalog: CodexModelCatalog,
+) -> Result<CodexModelCatalog, String> {
+    if catalog.models.is_empty() {
+        return Err("第三方模型目录至少需要配置一个模型".to_string());
+    }
+
+    let template_catalog: CodexModelCatalog = serde_json::from_str(DEEPSEEK_MODEL_CATALOG_TEMPLATE)
+        .map_err(|error| format!("DeepSeek models.json template parse failed: {error}"))?;
+    for (key, value) in template_catalog.extra {
+        catalog.extra.entry(key).or_insert(value);
+    }
+
+    let mut slugs = HashSet::new();
+    for model in &mut catalog.models {
+        model.slug = model.slug.trim().to_string();
+        validate_model_slug(&model.slug)?;
+        if !slugs.insert(model.slug.clone()) {
+            return Err(format!("模型 slug '{}' 重复", model.slug));
+        }
+        let template = template_catalog
+            .models
+            .iter()
+            .find(|template| template.slug == model.slug)
+            .or_else(|| template_catalog.models.first())
+            .ok_or_else(|| "DeepSeek models.json template has no models".to_string())?;
+        if model.display_name.trim().is_empty() {
+            model.display_name = if model.slug == template.slug {
+                template.display_name.clone()
+            } else {
+                model.slug.clone()
+            };
+        } else {
+            model.display_name = model.display_name.trim().to_string();
+        }
+        let mut modalities = Vec::with_capacity(model.input_modalities.len() + 1);
+        for modality in model.input_modalities.drain(..) {
+            let modality = modality.trim().to_ascii_lowercase();
+            if !modality.is_empty() && !modalities.contains(&modality) {
+                modalities.push(modality);
+            }
+        }
+        if !modalities.iter().any(|modality| modality == "text") {
+            modalities.insert(0, "text".to_string());
+        }
+        model.input_modalities = modalities;
+        if model.context_window == 0 {
+            return Err(format!("模型 '{}' 的 context_window 必须大于 0", model.slug));
+        }
+        if model.max_context_window < model.context_window {
+            return Err(format!(
+                "模型 '{}' 的 max_context_window 不能小于 context_window",
+                model.slug
+            ));
+        }
+        if !(1..=100).contains(&model.effective_context_window_percent) {
+            return Err(format!(
+                "模型 '{}' 的 effective_context_window_percent 必须在 1 到 100 之间",
+                model.slug
+            ));
+        }
+        if model.truncation_policy.is_none() {
+            model.truncation_policy = template.truncation_policy.clone();
+        }
+        if let Some(policy) = model.truncation_policy.as_mut() {
+            policy.mode = policy.mode.trim().to_string();
+            if policy.mode.is_empty() || policy.limit == 0 {
+                return Err(format!("模型 '{}' 的 truncation_policy 无效", model.slug));
+            }
+            let effective_limit = (model.context_window as u128)
+                * (model.effective_context_window_percent as u128)
+                / 100;
+            if policy.limit as u128 > effective_limit {
+                if template.truncation_policy.as_ref() == Some(policy) {
+                    policy.limit = effective_limit as u64;
+                } else {
+                    return Err(format!(
+                        "模型 '{}' 的 truncation_policy.limit 超出有效上下文范围",
+                        model.slug
+                    ));
+                }
+            }
+        }
+        if model.default_reasoning_level.is_empty() {
+            model.default_reasoning_level = template.default_reasoning_level.clone();
+        }
+        if model.supported_reasoning_levels.is_empty() {
+            model.supported_reasoning_levels = template.supported_reasoning_levels.clone();
+        }
+        for (key, value) in &template.extra {
+            model.extra.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+
+        let mut efforts = HashSet::new();
+        for level in &mut model.supported_reasoning_levels {
+            level.effort = level.effort.trim().to_string();
+            if level.effort.is_empty() || !efforts.insert(level.effort.clone()) {
+                return Err(format!("模型 '{}' 的推理档位无效或重复", model.slug));
+            }
+            level.description = level.description.trim().to_string();
+        }
+        model.default_reasoning_level = model.default_reasoning_level.trim().to_string();
+        if !model.default_reasoning_level.is_empty()
+            && !efforts.contains(&model.default_reasoning_level)
+        {
+            return Err(format!(
+                "模型 '{}' 的默认推理档位不在 supported_reasoning_levels 中",
+                model.slug
+            ));
+        }
+    }
+    Ok(catalog)
+}
+
+fn render_model_catalog(profile: &CodexProfile) -> Result<Vec<u8>, String> {
+    let catalog = profile
+        .model_catalog
+        .as_ref()
+        .ok_or_else(|| format!("CodeX 配置 '{}' 没有模型目录定义", profile.name))?;
+    let catalog = normalize_model_catalog(catalog.clone())?;
+    let mut root = catalog.extra;
+    let models = catalog
+        .models
+        .into_iter()
+        .map(|model| {
+            let mut object = model.extra;
+            object.insert("slug".to_string(), Value::String(model.slug));
+            object.insert(
+                "display_name".to_string(),
+                Value::String(model.display_name),
+            );
+            object.insert(
+                "input_modalities".to_string(),
+                Value::Array(
+                    model
+                        .input_modalities
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+            object.insert(
+                "supports_image_detail_original".to_string(),
+                Value::Bool(model.supports_image_detail_original),
+            );
+            object.insert(
+                "context_window".to_string(),
+                Value::Number(model.context_window.into()),
+            );
+            object.insert(
+                "max_context_window".to_string(),
+                Value::Number(model.max_context_window.into()),
+            );
+            object.insert(
+                "effective_context_window_percent".to_string(),
+                Value::Number((model.effective_context_window_percent as u64).into()),
+            );
+            if let Some(policy) = model.truncation_policy {
+                let mut policy_object = policy.extra;
+                policy_object.insert("mode".to_string(), Value::String(policy.mode));
+                policy_object.insert(
+                    "limit".to_string(),
+                    Value::Number(policy.limit.into()),
+                );
+                object.insert("truncation_policy".to_string(), Value::Object(policy_object));
+            }
+            if !model.default_reasoning_level.is_empty() {
+                object.insert(
+                    "default_reasoning_level".to_string(),
+                    Value::String(model.default_reasoning_level),
+                );
+            }
+            if !model.supported_reasoning_levels.is_empty() {
+                let levels = model
+                    .supported_reasoning_levels
+                    .into_iter()
+                    .map(|level| {
+                        let mut level_object = level.extra;
+                        level_object.insert("effort".to_string(), Value::String(level.effort));
+                        if !level.description.is_empty() {
+                            level_object.insert(
+                                "description".to_string(),
+                                Value::String(level.description),
+                            );
+                        }
+                        Value::Object(level_object)
+                    })
+                    .collect::<Vec<_>>();
+                object.insert("supported_reasoning_levels".to_string(), Value::Array(levels));
+            }
+            Value::Object(object)
+        })
+        .collect::<Vec<_>>();
+    root.insert("models".to_string(), Value::Array(models));
+    let bytes = serde_json::to_vec_pretty(&Value::Object(root))
+        .map_err(|error| format!("无法序列化 models.json：{error}"))?;
+    validate_model_catalog_bytes(&bytes)?;
+    Ok(bytes)
+}
+
+fn validate_model_catalog_bytes(bytes: &[u8]) -> Result<(), String> {
+    let root: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("models.json 无法解析：{error}"))?;
+    let models = root
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "models.json 的 models 必须是数组".to_string())?;
+    if models.is_empty() {
+        return Err("models.json 至少需要一个模型".to_string());
+    }
+    Ok(())
+}
+
 fn normalize_profile(mut profile: CodexProfile) -> Result<CodexProfile, String> {
     profile.name = profile.name.trim().to_string();
     if profile.name.is_empty() {
@@ -328,6 +710,28 @@ fn normalize_profile(mut profile: CodexProfile) -> Result<CodexProfile, String> 
     profile.base_url = profile.base_url.trim().to_string();
     profile.env_key = profile.env_key.trim().to_string();
     profile.wire_api = profile.wire_api.trim().to_string();
+    if let Some(catalog) = profile.model_catalog.take() {
+        let catalog = normalize_model_catalog(catalog)?;
+        if profile.auth_mode == CodexAuthMode::Custom {
+            if profile.model.is_empty() {
+                profile.model = catalog
+                    .models
+                    .first()
+                    .map(|model| model.slug.clone())
+                    .unwrap_or_default();
+            } else if !catalog
+                .models
+                .iter()
+                .any(|model| model.slug == profile.model)
+            {
+                return Err(format!(
+                    "默认模型 '{}' 不在 models.json 的 models 列表中",
+                    profile.model
+                ));
+            }
+        }
+        profile.model_catalog = Some(catalog);
+    }
 
     match profile.auth_mode {
         CodexAuthMode::Official => {
@@ -383,6 +787,75 @@ fn set_optional_string(document: &mut DocumentMut, key: &str, value_text: &str) 
     }
 }
 
+fn model_catalog_json_value(document: &DocumentMut) -> Option<String> {
+    document
+        .get("model_catalog_json")
+        .and_then(Item::as_value)
+        .and_then(|item| item.as_str())
+        .map(str::to_string)
+}
+
+fn model_catalog_json_value_from_raw(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let document = DocumentMut::from_str(raw)
+        .map_err(|error| format!("现有 CodeX config.toml 无法解析：{error}"))?;
+    Ok(model_catalog_json_value(&document))
+}
+
+fn validate_managed_profile_model_catalog_reference(
+    raw: Option<&str>,
+    profile_id: &str,
+    previous_value: &Option<String>,
+    managing: bool,
+) -> Result<(), String> {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let current = model_catalog_json_value_from_raw(Some(raw))?;
+    let expected = Some(
+        managed_model_catalog_path(profile_id)?
+            .to_string_lossy()
+            .to_string(),
+    );
+    let matches = if managing {
+        current == expected
+    } else {
+        current == expected || current == previous_value.clone()
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "CodeX profile '{}' 的 model_catalog_json 已被外部修改，拒绝覆盖",
+            profile_id
+        ))
+    }
+}
+
+fn validate_managed_global_model_catalog_reference(
+    raw: Option<&str>,
+    managed: &ManagedGlobalModelCatalogState,
+    managing: bool,
+) -> Result<(), String> {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let current = model_catalog_json_value_from_raw(Some(raw))?;
+    let applied = Some(managed.applied_value.clone());
+    let matches = if managing {
+        current == applied
+    } else {
+        current == applied || current == managed.previous_value.clone()
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err("CodeX 全局 config.toml 的 model_catalog_json 已被外部修改，拒绝覆盖".to_string())
+    }
+}
+
 fn remove_provider(document: &mut DocumentMut, provider_id: &str) {
     if provider_id.is_empty() {
         return;
@@ -433,10 +906,11 @@ fn configure_provider_credentials(
     Ok(())
 }
 
-fn build_profile_toml(
+fn build_profile_toml_with_model_catalog_restore(
     existing: Option<&str>,
     previous_managed_provider_id: Option<&str>,
     profile: &CodexProfile,
+    restored_model_catalog_json: Option<&Option<String>>,
 ) -> Result<String, String> {
     let mut document = match existing {
         Some(raw) => DocumentMut::from_str(raw)
@@ -450,6 +924,19 @@ fn build_profile_toml(
         "model_reasoning_effort",
         &profile.reasoning_effort,
     );
+    let model_catalog_path = if profile.auth_mode == CodexAuthMode::Custom
+        && profile.model_catalog.is_some()
+    {
+        managed_model_catalog_path(&profile.id)?
+            .to_string_lossy()
+            .to_string()
+    } else {
+        restored_model_catalog_json
+            .and_then(|value| value.as_deref())
+            .unwrap_or_default()
+            .to_string()
+    };
+    set_optional_string(&mut document, "model_catalog_json", &model_catalog_path);
 
     if let Some(previous_provider_id) = previous_managed_provider_id {
         if profile.auth_mode != CodexAuthMode::Custom || previous_provider_id != profile.provider_id
@@ -494,12 +981,41 @@ fn build_profile_toml(
     Ok(rendered)
 }
 
+#[cfg(test)]
+fn build_profile_toml(
+    existing: Option<&str>,
+    previous_managed_provider_id: Option<&str>,
+    profile: &CodexProfile,
+) -> Result<String, String> {
+    build_profile_toml_with_model_catalog_restore(
+        existing,
+        previous_managed_provider_id,
+        profile,
+        None,
+    )
+}
+
+#[cfg(test)]
 fn build_global_toml(
     existing: Option<&str>,
     previous_managed_provider_id: Option<&str>,
     profile: &CodexProfile,
 ) -> Result<String, String> {
     build_profile_toml(existing, previous_managed_provider_id, profile)
+}
+
+fn build_global_toml_with_model_catalog_restore(
+    existing: Option<&str>,
+    previous_managed_provider_id: Option<&str>,
+    profile: &CodexProfile,
+    restored_model_catalog_json: Option<&Option<String>>,
+) -> Result<String, String> {
+    build_profile_toml_with_model_catalog_restore(
+        existing,
+        previous_managed_provider_id,
+        profile,
+        restored_model_catalog_json,
+    )
 }
 
 fn managed_provider_id(profile: &CodexProfile) -> Option<&str> {
@@ -571,6 +1087,14 @@ fn write_toml_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
     })
 }
 
+fn write_model_catalog_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+    write_atomic_validated(path, content, "CodeX models.json", validate_model_catalog_bytes)
+}
+
+fn write_raw_atomic(path: &Path, content: &[u8], label: &str) -> Result<(), String> {
+    write_atomic_validated(path, content, label, |_| Ok(()))
+}
+
 fn write_credential_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
     write_atomic_validated(path, content, "CodeX 加密凭据", |bytes| {
         if bytes.is_empty() {
@@ -603,8 +1127,12 @@ fn restore_snapshot(
             SnapshotKind::Json => write_json_atomic(path, content, "CodeX 回滚 JSON"),
             SnapshotKind::Toml => write_toml_atomic(path, content),
             SnapshotKind::Credential => write_credential_atomic(path, content),
+            SnapshotKind::Raw => write_raw_atomic(path, content, "CodeX models.json 回滚"),
         },
-        None => remove_if_exists(path),
+        None => {
+            remove_if_exists(path)?;
+            remove_transaction_sidecars(path)
+        }
     }
 }
 
@@ -613,6 +1141,182 @@ enum SnapshotKind {
     Json,
     Toml,
     Credential,
+    Raw,
+}
+
+fn read_optional_file(path: &Path, label: &str) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("无法读取 {label} {}：{error}", path.display())),
+    }
+}
+
+fn profile_from_state<'a>(state: &'a CodexProfileState, profile_id: &str) -> Option<&'a CodexProfile> {
+    state.profiles.iter().find(|profile| profile.id == profile_id)
+}
+
+fn desired_model_catalogs(
+    state: &CodexProfileState,
+    active_profile_id: Option<&str>,
+    global_profile_id: Option<&str>,
+    global_provider_id: Option<&str>,
+    keep_current_global_projection: bool,
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut desired = BTreeMap::new();
+    if let Some(profile_id) = active_profile_id {
+        if let Some(profile) = profile_from_state(state, profile_id) {
+            if profile.auth_mode == CodexAuthMode::Custom && profile.model_catalog.is_some() {
+                desired.insert(profile_id.to_string(), render_model_catalog(profile)?);
+            }
+        }
+    }
+
+    if global_provider_id.is_some() {
+        if let Some(profile_id) = global_profile_id {
+            if keep_current_global_projection {
+                if let Some(managed) = state.managed_model_catalogs.get(profile_id) {
+                    desired
+                        .entry(profile_id.to_string())
+                        .or_insert_with(|| managed.applied_bytes.clone());
+                } else if let Some(profile) = profile_from_state(state, profile_id) {
+                    if profile.auth_mode == CodexAuthMode::Custom
+                        && profile.model_catalog.is_some()
+                    {
+                        desired.insert(profile_id.to_string(), render_model_catalog(profile)?);
+                    }
+                }
+            } else if let Some(profile) = profile_from_state(state, profile_id) {
+                if profile.auth_mode == CodexAuthMode::Custom && profile.model_catalog.is_some() {
+                    desired.insert(profile_id.to_string(), render_model_catalog(profile)?);
+                }
+            }
+        }
+    }
+    Ok(desired)
+}
+
+fn synchronize_model_catalogs(
+    state: &mut CodexProfileState,
+    desired: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    let codex_home = codex_home()?;
+    synchronize_model_catalogs_at(state, desired, &codex_home)
+}
+
+fn synchronize_model_catalogs_at(
+    state: &mut CodexProfileState,
+    desired: &BTreeMap<String, Vec<u8>>,
+    codex_home: &Path,
+) -> Result<(), String> {
+    for (profile_id, content) in desired {
+        let path = managed_model_catalog_path_at(codex_home, profile_id);
+        let path_text = path.to_string_lossy().to_string();
+        if let Some(managed) = state.managed_model_catalogs.get_mut(profile_id) {
+            if managed.path != path_text {
+                return Err(format!(
+                    "CodeX 模型目录路径与 profile '{}' 的管理记录不一致",
+                    profile_id
+                ));
+            }
+            let current = read_optional_file(&path, "CodeX models.json")?;
+            let previous_applied = Some(managed.applied_bytes.as_slice());
+            if current.as_deref() != previous_applied && current.as_deref() != Some(content) {
+                return Err(format!(
+                    "CodeX 模型目录 {} 已被外部修改，拒绝静默覆盖",
+                    path.display()
+                ));
+            }
+            if current.as_deref() != Some(content) {
+                write_model_catalog_atomic(&path, content)?;
+            }
+            managed.applied_bytes = content.clone();
+        } else {
+            let previous_bytes = read_optional_file(&path, "CodeX models.json")?;
+            write_model_catalog_atomic(&path, content)?;
+            state.managed_model_catalogs.insert(
+                profile_id.clone(),
+                ManagedModelCatalogState {
+                    path: path_text,
+                    previous_bytes,
+                    applied_bytes: content.clone(),
+                },
+            );
+        }
+    }
+
+    let stale_ids = state
+        .managed_model_catalogs
+        .keys()
+        .filter(|profile_id| !desired.contains_key(*profile_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for profile_id in stale_ids {
+        let managed = state
+            .managed_model_catalogs
+            .get(&profile_id)
+            .cloned()
+            .ok_or_else(|| format!("CodeX 模型目录管理记录 '{}' 不存在", profile_id))?;
+        let expected_path = managed_model_catalog_path_at(codex_home, &profile_id);
+        if PathBuf::from(&managed.path) != expected_path {
+            return Err(format!(
+                "CodeX 模型目录管理记录 '{}' 指向了非预期路径",
+                profile_id
+            ));
+        }
+        let current = read_optional_file(&expected_path, "CodeX models.json")?;
+        if current.as_deref() != Some(managed.applied_bytes.as_slice()) {
+            return Err(format!(
+                "CodeX 模型目录 {} 已被外部修改，拒绝删除或恢复",
+                expected_path.display()
+            ));
+        }
+        restore_snapshot(
+            &expected_path,
+            managed.previous_bytes.as_deref(),
+            SnapshotKind::Raw,
+        )?;
+        state.managed_model_catalogs.remove(&profile_id);
+    }
+    Ok(())
+}
+
+fn model_catalog_paths_for_transition(
+    state: &CodexProfileState,
+    desired: &BTreeMap<String, Vec<u8>>,
+) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>, String> {
+    let codex_home = codex_home()?;
+    model_catalog_paths_for_transition_at(state, desired, &codex_home)
+}
+
+fn model_catalog_paths_for_transition_at(
+    state: &CodexProfileState,
+    desired: &BTreeMap<String, Vec<u8>>,
+    codex_home: &Path,
+) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>, String> {
+    let mut paths = HashSet::new();
+    for profile_id in state.managed_model_catalogs.keys() {
+        paths.insert(managed_model_catalog_path_at(codex_home, profile_id));
+    }
+    for profile_id in desired.keys() {
+        paths.insert(managed_model_catalog_path_at(codex_home, profile_id));
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let snapshot = read_optional_file(&path, "CodeX models.json")?;
+            Ok((path, snapshot))
+        })
+        .collect()
+}
+
+fn restore_model_catalog_paths(
+    snapshots: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+) -> Result<(), String> {
+    for (path, snapshot) in snapshots {
+        restore_snapshot(path, snapshot.as_deref(), SnapshotKind::Raw)?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1079,6 +1783,7 @@ fn enrich_profiles(state: &mut CodexProfileState) -> Result<(), String> {
         profile.managed_profile_name = managed_profile_name(&profile.id);
         profile.has_stored_api_key = profile_secret_exists(&profile.id)?;
         let profile_path = managed_profile_path(&profile.id)?;
+        migrate_legacy_managed_profile(&profile.id, &profile_path)?;
         if profile_path.exists() {
             let raw = fs::read_to_string(&profile_path).map_err(|error| {
                 format!("无法读取 CodeX profile {}：{error}", profile_path.display())
@@ -1102,10 +1807,36 @@ fn global_profile_matches_document(state: &CodexProfileState, raw: &str) -> bool
     else {
         return false;
     };
-    build_global_toml(
+    let model_catalog_is_managed = profile.auth_mode == CodexAuthMode::Custom
+        && profile.model_catalog.is_some();
+    if let Some(managed) = state.managed_global_model_catalog.as_ref() {
+        if validate_managed_global_model_catalog_reference(
+            Some(raw),
+            managed,
+            model_catalog_is_managed,
+        )
+        .is_err()
+        {
+            return false;
+        }
+    }
+    let restore_value = if profile.auth_mode == CodexAuthMode::Custom
+        && profile.model_catalog.is_some()
+    {
+        None
+    } else if let Some(managed) = state.managed_global_model_catalog.as_ref() {
+        Some(managed.previous_value.clone())
+    } else {
+        let Ok(current) = model_catalog_json_value_from_raw(Some(raw)) else {
+            return false;
+        };
+        Some(current)
+    };
+    build_global_toml_with_model_catalog_restore(
         Some(raw),
         state.managed_global_provider_id.as_deref(),
         profile,
+        restore_value.as_ref(),
     )
     .is_ok_and(|expected| expected == raw)
 }
@@ -1227,6 +1958,7 @@ pub fn save_codex_profile(
     let profile = normalize_profile(request.profile)?;
     let metadata_path = profiles_path()?;
     let profile_path = managed_profile_path(&profile.id)?;
+    migrate_legacy_managed_profile(&profile.id, &profile_path)?;
     let mut state = load_profile_state()?;
     let previous_profile = state
         .profiles
@@ -1250,6 +1982,23 @@ pub fn save_codex_profile(
         None
     };
     let previous_secret = read_profile_secret(&profile.id)?;
+    let profile_model_catalog_is_managed = profile.auth_mode == CodexAuthMode::Custom
+        && profile.model_catalog.is_some();
+    if let Some(previous) = state.managed_profile_model_catalogs.get(&profile.id) {
+        validate_managed_profile_model_catalog_reference(
+            existing_toml.as_deref(),
+            &profile.id,
+            previous,
+            profile_model_catalog_is_managed,
+        )?;
+    }
+    let profile_model_catalog_restore = if profile_model_catalog_is_managed {
+        None
+    } else if let Some(previous) = state.managed_profile_model_catalogs.get(&profile.id) {
+        Some(previous.clone())
+    } else {
+        Some(model_catalog_json_value_from_raw(existing_toml.as_deref())?)
+    };
     let mut stored_profile = profile.clone();
     stored_profile.has_stored_api_key = match stored_profile.auth_mode {
         CodexAuthMode::Official => false,
@@ -1264,18 +2013,34 @@ pub fn save_codex_profile(
         }
     };
     let previous_managed_provider_id = previous_profile.as_ref().and_then(managed_provider_id);
-    let rendered = build_profile_toml(
+    let rendered = build_profile_toml_with_model_catalog_restore(
         existing_toml.as_deref(),
         previous_managed_provider_id,
         &stored_profile,
+        profile_model_catalog_restore.as_ref(),
     )?;
 
     let previous_metadata = fs::read(&metadata_path).ok();
     let previous_toml = fs::read(&profile_path).ok();
     let previous_index = load_profile_index_state(CODEX_STATE_KEY)?;
 
-    let transaction = (|| {
+    let transaction: Result<(), String> = (|| {
         write_toml_atomic(&profile_path, rendered.as_bytes())?;
+        if profile_model_catalog_is_managed {
+            let previous = state
+                .managed_profile_model_catalogs
+                .get(&stored_profile.id)
+                .cloned()
+                .unwrap_or(model_catalog_json_value_from_raw(existing_toml.as_deref())?);
+            state
+                .managed_profile_model_catalogs
+                .entry(stored_profile.id.clone())
+                .or_insert(previous);
+        } else {
+            state
+                .managed_profile_model_catalogs
+                .remove(&stored_profile.id);
+        }
 
         match stored_profile.auth_mode {
             CodexAuthMode::Official => {
@@ -1383,10 +2148,28 @@ pub fn apply_codex_profile(
     let profile_path = managed_profile_path(&profile.id)?;
     let existing_profile_toml = fs::read_to_string(&profile_path)
         .map_err(|error| format!("无法读取 CodeX profile：{error}"))?;
-    let rendered_profile_toml = build_profile_toml(
+    let profile_model_catalog_is_managed = profile.auth_mode == CodexAuthMode::Custom
+        && profile.model_catalog.is_some();
+    if let Some(previous) = state.managed_profile_model_catalogs.get(&profile.id) {
+        validate_managed_profile_model_catalog_reference(
+            Some(&existing_profile_toml),
+            &profile.id,
+            previous,
+            profile_model_catalog_is_managed,
+        )?;
+    }
+    let profile_model_catalog_restore = if profile_model_catalog_is_managed {
+        None
+    } else if let Some(previous) = state.managed_profile_model_catalogs.get(&profile.id) {
+        Some(previous.clone())
+    } else {
+        Some(model_catalog_json_value_from_raw(Some(&existing_profile_toml))?)
+    };
+    let rendered_profile_toml = build_profile_toml_with_model_catalog_restore(
         Some(&existing_profile_toml),
         managed_provider_id(&profile),
         &profile,
+        profile_model_catalog_restore.as_ref(),
     )?;
     let profile_needs_update = rendered_profile_toml != existing_profile_toml;
     let previous_index = load_profile_index_state(CODEX_STATE_KEY)?;
@@ -1397,23 +2180,80 @@ pub fn apply_codex_profile(
     let previous_global_env_file = fs::read(&global_env_record_path).ok();
     let previous_managed_env = load_managed_global_env()?;
 
+    let existing_global_raw = if request.apply_to_global && global_path.exists() {
+        Some(
+            fs::read_to_string(&global_path)
+                .map_err(|error| format!("无法读取全局 config.toml：{error}"))?,
+        )
+    } else {
+        None
+    };
+    let global_model_catalog_is_managed = profile.auth_mode == CodexAuthMode::Custom
+        && profile.model_catalog.is_some();
+    if request.apply_to_global {
+        if let Some(managed) = state.managed_global_model_catalog.as_ref() {
+            validate_managed_global_model_catalog_reference(
+                existing_global_raw.as_deref(),
+                managed,
+                global_model_catalog_is_managed,
+            )?;
+        }
+    }
+    let next_global_model_catalog = if request.apply_to_global && global_model_catalog_is_managed {
+        let previous_value = state
+            .managed_global_model_catalog
+            .as_ref()
+            .map(|managed| managed.previous_value.clone())
+            .unwrap_or(model_catalog_json_value_from_raw(existing_global_raw.as_deref())?);
+        Some(ManagedGlobalModelCatalogState {
+            previous_value,
+            applied_value: managed_model_catalog_path(&profile.id)?
+                .to_string_lossy()
+                .to_string(),
+        })
+    } else {
+        None
+    };
+    let global_model_catalog_restore = if global_model_catalog_is_managed {
+        None
+    } else if let Some(managed) = state.managed_global_model_catalog.as_ref() {
+        Some(managed.previous_value.clone())
+    } else {
+        Some(model_catalog_json_value_from_raw(existing_global_raw.as_deref())?)
+    };
     let rendered_global = if request.apply_to_global {
-        let existing = if global_path.exists() {
-            Some(
-                fs::read_to_string(&global_path)
-                    .map_err(|error| format!("无法读取全局 config.toml：{error}"))?,
-            )
-        } else {
-            None
-        };
-        Some(build_global_toml(
-            existing.as_deref(),
+        Some(build_global_toml_with_model_catalog_restore(
+            existing_global_raw.as_deref(),
             state.managed_global_provider_id.as_deref(),
             &profile,
+            if global_model_catalog_is_managed {
+                None
+            } else {
+                global_model_catalog_restore.as_ref()
+            },
         )?)
     } else {
         None
     };
+    let next_global_profile_id = if request.apply_to_global {
+        Some(profile.id.clone())
+    } else {
+        state.global_profile_id.clone()
+    };
+    let next_global_provider_id = if request.apply_to_global {
+        managed_provider_id(&profile).map(str::to_string)
+    } else {
+        state.managed_global_provider_id.clone()
+    };
+    let desired_model_catalogs = desired_model_catalogs(
+        &state,
+        Some(profile.id.as_str()),
+        next_global_profile_id.as_deref(),
+        next_global_provider_id.as_deref(),
+        !request.apply_to_global,
+    )?;
+    let previous_model_catalog_files =
+        model_catalog_paths_for_transition(&state, &desired_model_catalogs)?;
     let next_api_key = if request.apply_to_global
         && profile.auth_mode == CodexAuthMode::Custom
         && custom_global_key_sync_supported()
@@ -1439,16 +2279,31 @@ pub fn apply_codex_profile(
         if profile_needs_update {
             write_toml_atomic(&profile_path, rendered_profile_toml.as_bytes())?;
         }
+        if profile_model_catalog_is_managed {
+            let previous = state
+                .managed_profile_model_catalogs
+                .get(&profile.id)
+                .cloned()
+                .unwrap_or(model_catalog_json_value_from_raw(Some(&existing_profile_toml))?);
+            state
+                .managed_profile_model_catalogs
+                .entry(profile.id.clone())
+                .or_insert(previous);
+        } else {
+            state.managed_profile_model_catalogs.remove(&profile.id);
+        }
+        synchronize_model_catalogs(&mut state, &desired_model_catalogs)?;
         if let Some(rendered) = rendered_global.as_ref() {
             write_toml_atomic(&global_path, rendered.as_bytes())?;
             let next_env = next_api_key
                 .as_deref()
                 .map(|api_key| (profile.env_key.as_str(), api_key));
             transition_managed_global_env(next_env, previous_managed_env.as_ref())?;
-            state.global_profile_id = Some(profile.id.clone());
-            state.managed_global_provider_id = managed_provider_id(&profile).map(str::to_string);
-            save_profile_state(&state)?;
+            state.global_profile_id = next_global_profile_id.clone();
+            state.managed_global_provider_id = next_global_provider_id.clone();
+            state.managed_global_model_catalog = next_global_model_catalog.clone();
         }
+        save_profile_state(&state)?;
 
         let index = normalize_index(
             &state.profiles,
@@ -1512,14 +2367,17 @@ pub fn apply_codex_profile(
                 rollback_errors.push(rollback);
             }
         }
+        if let Err(rollback) = restore_model_catalog_paths(&previous_model_catalog_files) {
+            rollback_errors.push(rollback);
+        }
+        if let Err(rollback) = restore_snapshot(
+            &profiles_path()?,
+            previous_metadata.as_deref(),
+            SnapshotKind::Json,
+        ) {
+            rollback_errors.push(rollback);
+        }
         if request.apply_to_global {
-            if let Err(rollback) = restore_snapshot(
-                &profiles_path()?,
-                previous_metadata.as_deref(),
-                SnapshotKind::Json,
-            ) {
-                rollback_errors.push(rollback);
-            }
             if let Err(rollback) =
                 restore_snapshot(&global_path, previous_global.as_deref(), SnapshotKind::Toml)
             {
@@ -1570,6 +2428,9 @@ pub fn delete_codex_profile(
     state
         .profiles
         .retain(|profile| profile.id != request.profile_id);
+    state
+        .managed_profile_model_catalogs
+        .remove(&request.profile_id);
     if state.global_profile_id.as_deref() == Some(request.profile_id.as_str()) {
         state.global_profile_id = None;
     }
@@ -1631,8 +2492,9 @@ pub fn resolve_codex_profile(profile_id: String) -> Result<CodexLaunchContext, S
     enrich_profiles(&mut state)?;
     let profile = state
         .profiles
-        .into_iter()
+        .iter()
         .find(|profile| profile.id == profile_id)
+        .cloned()
         .ok_or_else(|| format!("CodeX 配置方案 '{profile_id}' 不存在"))?;
     let profile_path = managed_profile_path(&profile.id)?;
     if !profile_path.exists() {
@@ -1643,14 +2505,29 @@ pub fn resolve_codex_profile(profile_id: String) -> Result<CodexLaunchContext, S
     }
     let existing_toml = fs::read_to_string(&profile_path)
         .map_err(|error| format!("无法读取 CodeX profile：{error}"))?;
-    let rendered_toml = build_profile_toml(
+    let profile_model_catalog_is_managed = profile.auth_mode == CodexAuthMode::Custom
+        && profile.model_catalog.is_some();
+    if let Some(previous) = state.managed_profile_model_catalogs.get(&profile.id) {
+        validate_managed_profile_model_catalog_reference(
+            Some(&existing_toml),
+            &profile.id,
+            previous,
+            profile_model_catalog_is_managed,
+        )?;
+    }
+    let profile_model_catalog_restore = if profile_model_catalog_is_managed {
+        None
+    } else if let Some(previous) = state.managed_profile_model_catalogs.get(&profile.id) {
+        Some(previous.clone())
+    } else {
+        Some(model_catalog_json_value_from_raw(Some(&existing_toml))?)
+    };
+    let rendered_toml = build_profile_toml_with_model_catalog_restore(
         Some(&existing_toml),
         managed_provider_id(&profile),
         &profile,
+        profile_model_catalog_restore.as_ref(),
     )?;
-    if rendered_toml != existing_toml {
-        write_toml_atomic(&profile_path, rendered_toml.as_bytes())?;
-    }
     let mut env_vars = BTreeMap::new();
     if profile.auth_mode == CodexAuthMode::Custom && !uses_plaintext_command_auth(&profile) {
         let api_key = resolve_profile_api_key(&profile)?;
@@ -1660,6 +2537,60 @@ pub fn resolve_codex_profile(profile_id: String) -> Result<CodexLaunchContext, S
         CodexAuthMode::Official => "openai".to_string(),
         CodexAuthMode::Custom => profile.provider_id.clone(),
     };
+
+    let previous_model_catalog_state = state.managed_model_catalogs.clone();
+    let desired_model_catalogs = desired_model_catalogs(
+        &state,
+        Some(profile.id.as_str()),
+        state.global_profile_id.as_deref(),
+        state.managed_global_provider_id.as_deref(),
+        true,
+    )?;
+    let previous_model_catalog_files =
+        model_catalog_paths_for_transition(&state, &desired_model_catalogs)?;
+    let previous_metadata = fs::read(profiles_path()?).ok();
+    let profile_needs_update = rendered_toml != existing_toml;
+    let transaction: Result<(), String> = (|| {
+        if profile_needs_update {
+            write_toml_atomic(&profile_path, rendered_toml.as_bytes())?;
+        }
+        synchronize_model_catalogs(&mut state, &desired_model_catalogs)?;
+        if state.managed_model_catalogs != previous_model_catalog_state {
+            save_profile_state(&state)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = transaction {
+        let mut rollback_errors = Vec::new();
+        state.managed_model_catalogs = previous_model_catalog_state;
+        if let Err(rollback) = restore_model_catalog_paths(&previous_model_catalog_files) {
+            rollback_errors.push(rollback);
+        }
+        if profile_needs_update {
+            if let Err(rollback) = restore_snapshot(
+                &profile_path,
+                Some(existing_toml.as_bytes()),
+                SnapshotKind::Toml,
+            ) {
+                rollback_errors.push(rollback);
+            }
+        }
+        if let Err(rollback) = restore_snapshot(
+            &profiles_path()?,
+            previous_metadata.as_deref(),
+            SnapshotKind::Json,
+        ) {
+            rollback_errors.push(rollback);
+        }
+        if rollback_errors.is_empty() {
+            return Err(format!("启动前 CodeX 配置准备失败，旧数据已恢复：{error}"));
+        }
+        return Err(format!(
+            "启动前 CodeX 配置准备失败且回滚不完整：{error}；{}",
+            rollback_errors.join("；")
+        ));
+    }
+
     Ok(CodexLaunchContext {
         managed_profile_name: profile.managed_profile_name,
         model_provider,
@@ -1750,8 +2681,50 @@ mod tests {
             env_key: default_env_key(),
             has_stored_api_key: false,
             managed_profile_name: String::new(),
+            model_catalog: None,
             extra: Map::new(),
         }
+    }
+
+    fn custom_profile_with_catalog() -> CodexProfile {
+        let mut profile = official_profile();
+        profile.auth_mode = CodexAuthMode::Custom;
+        profile.model = "deepseek-v4-flash".to_string();
+        profile.provider_id = "deepseek".to_string();
+        profile.provider_name = "DeepSeek".to_string();
+        profile.base_url = "https://api.deepseek.com/".to_string();
+        profile.model_catalog = Some(CodexModelCatalog {
+            models: vec![CodexModelDefinition {
+                slug: "deepseek-v4-flash".to_string(),
+                display_name: "DeepSeek-V4-Flash".to_string(),
+                input_modalities: vec!["text".to_string()],
+                supports_image_detail_original: false,
+                context_window: 1_048_576,
+                max_context_window: 1_048_576,
+                effective_context_window_percent: 95,
+                truncation_policy: Some(CodexTruncationPolicy {
+                    mode: "tokens".to_string(),
+                    limit: 10_000,
+                    extra: Map::new(),
+                }),
+                default_reasoning_level: "high".to_string(),
+                supported_reasoning_levels: vec![
+                    CodexReasoningLevel {
+                        effort: "low".to_string(),
+                        description: "Fast responses".to_string(),
+                        extra: Map::new(),
+                    },
+                    CodexReasoningLevel {
+                        effort: "high".to_string(),
+                        description: "Deep reasoning".to_string(),
+                        extra: Map::new(),
+                    },
+                ],
+                extra: Map::new(),
+            }],
+            extra: Map::new(),
+        });
+        profile
     }
 
     #[test]
@@ -1869,6 +2842,321 @@ mod tests {
         assert_eq!(document["model"].as_str(), Some("gpt-5.6"));
         assert_eq!(document["model_provider"].as_str(), Some("openai"));
         assert_eq!(document["features"]["js_repl"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn model_catalog_renders_context_and_official_field_names() {
+        let profile = normalize_profile(custom_profile_with_catalog()).expect("valid profile");
+        let bytes = render_model_catalog(&profile).expect("render models.json");
+        let document: Value = serde_json::from_slice(&bytes).expect("parse models.json");
+        let model = &document["models"][0];
+        assert_eq!(model["slug"].as_str(), Some("deepseek-v4-flash"));
+        assert_eq!(model["input_modalities"], serde_json::json!(["text"]));
+        assert_eq!(model["supports_image_detail_original"].as_bool(), Some(false));
+        assert_eq!(model["context_window"].as_u64(), Some(1_048_576));
+        assert_eq!(model["max_context_window"].as_u64(), Some(1_048_576));
+        assert_eq!(
+            model["effective_context_window_percent"].as_u64(),
+            Some(95)
+        );
+        assert_eq!(
+            model["supported_reasoning_levels"][0]["effort"].as_str(),
+            Some("low")
+        );
+        assert_eq!(model["prefer_websockets"].as_bool(), Some(false));
+        assert_eq!(model["minimal_client_version"].as_str(), Some("0.144.0"));
+        assert!(model["model_messages"].is_object());
+        assert!(model["base_instructions"].is_string());
+        assert!(model.get("supported_reasoning_efforts").is_none());
+
+        let rendered = build_profile_toml(None, None, &profile).expect("render profile TOML");
+        let toml = DocumentMut::from_str(&rendered).expect("parse profile TOML");
+        assert_eq!(
+            toml["model_catalog_json"].as_str(),
+            Some(
+                managed_model_catalog_path(&profile.id)
+                    .expect("catalog path")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+    }
+
+    #[test]
+    fn model_catalog_supports_multiple_models_and_keeps_the_selected_default() {
+        let mut profile = custom_profile_with_catalog();
+        let mut second = profile
+            .model_catalog
+            .as_ref()
+            .expect("catalog")
+            .models[0]
+            .clone();
+        second.slug = "deepseek-v4-pro".to_string();
+        second.display_name = "DeepSeek-V4-Pro".to_string();
+        profile
+            .model_catalog
+            .as_mut()
+            .expect("catalog")
+            .models
+            .push(second);
+        profile.model = "deepseek-v4-pro".to_string();
+
+        let profile = normalize_profile(profile).expect("valid multi-model profile");
+        assert_eq!(profile.model, "deepseek-v4-pro");
+        let bytes = render_model_catalog(&profile).expect("render multi-model catalog");
+        let document: Value = serde_json::from_slice(&bytes).expect("parse models.json");
+        assert_eq!(document["models"].as_array().map(Vec::len), Some(2));
+        assert_eq!(document["models"][1]["slug"].as_str(), Some("deepseek-v4-pro"));
+        assert_eq!(document["models"][1]["priority"].as_u64(), Some(2));
+        assert_eq!(document["models"][1]["context_window"].as_u64(), Some(1_048_576));
+    }
+
+    #[test]
+    fn model_catalog_normalizes_modalities_with_text_as_the_default() {
+        let mut profile = custom_profile_with_catalog();
+        profile
+            .model_catalog
+            .as_mut()
+            .expect("catalog")
+            .models[0]
+            .input_modalities = vec!["IMAGE".to_string(), "image".to_string()];
+
+        let normalized = normalize_profile(profile).expect("valid modality configuration");
+        assert_eq!(
+            normalized.model_catalog.expect("catalog").models[0].input_modalities,
+            vec!["text".to_string(), "image".to_string()]
+        );
+    }
+
+    #[test]
+    fn model_catalog_renders_image_input_capability() {
+        let mut profile = custom_profile_with_catalog();
+        let model = &mut profile
+            .model_catalog
+            .as_mut()
+            .expect("catalog")
+            .models[0];
+        model.input_modalities = vec!["text".to_string(), "image".to_string()];
+        model.supports_image_detail_original = true;
+
+        let normalized = normalize_profile(profile).expect("valid multimodal profile");
+        let bytes = render_model_catalog(&normalized).expect("render multimodal catalog");
+        let document: Value = serde_json::from_slice(&bytes).expect("parse models.json");
+        assert_eq!(
+            document["models"][0]["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(
+            document["models"][0]["supports_image_detail_original"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn model_catalog_validation_rejects_invalid_context_ranges() {
+        let mut profile = custom_profile_with_catalog();
+        let catalog = profile.model_catalog.as_mut().expect("catalog");
+        catalog.models[0].context_window = 0;
+        assert!(normalize_profile(profile)
+            .expect_err("zero context must fail")
+            .contains("context_window"));
+
+        let mut profile = custom_profile_with_catalog();
+        let catalog = profile.model_catalog.as_mut().expect("catalog");
+        catalog.models[0].max_context_window = 1;
+        assert!(normalize_profile(profile)
+            .expect_err("max context below context must fail")
+            .contains("max_context_window"));
+    }
+
+    #[test]
+    fn model_catalog_template_truncation_limit_fits_a_smaller_context_window() {
+        let mut profile = custom_profile_with_catalog();
+        let catalog = profile.model_catalog.as_mut().expect("catalog");
+        catalog.models[0].context_window = 4096;
+        catalog.models[0].max_context_window = 4096;
+        let normalized = normalize_profile(profile).expect("smaller context is valid");
+        assert_eq!(
+            normalized.model_catalog.expect("catalog").models[0]
+                .truncation_policy.as_ref().expect("policy").limit,
+            3891
+        );
+    }
+
+    #[test]
+    fn official_profile_can_retain_third_party_catalog_without_using_its_model() {
+        let mut profile = custom_profile_with_catalog();
+        profile.auth_mode = CodexAuthMode::Official;
+        profile.model = "gpt-5.6".to_string();
+        let normalized = normalize_profile(profile).expect("official profile remains valid");
+        assert_eq!(normalized.model, "gpt-5.6");
+        assert!(normalized.model_catalog.is_some());
+    }
+
+    #[test]
+    fn official_restore_can_restore_or_remove_model_catalog_json() {
+        let existing = "model_catalog_json = \"C:/user/models.json\"\n";
+        let profile = official_profile();
+        let previous = Some(Some("C:/user/models.json".to_string()));
+        let restored = build_profile_toml_with_model_catalog_restore(
+            Some(existing),
+            None,
+            &profile,
+            previous.as_ref(),
+        )
+        .expect("restore previous path");
+        assert_eq!(
+            DocumentMut::from_str(&restored).expect("parse restored") ["model_catalog_json"]
+                .as_str(),
+            Some("C:/user/models.json")
+        );
+
+        let absent = Some(None);
+        let removed = build_profile_toml_with_model_catalog_restore(
+            Some(existing),
+            None,
+            &profile,
+            absent.as_ref(),
+        )
+        .expect("remove project path");
+        assert!(DocumentMut::from_str(&removed)
+            .expect("parse removed")
+            .get("model_catalog_json")
+            .is_none());
+    }
+
+    #[test]
+    fn global_official_restore_preserves_the_preexisting_catalog_reference() {
+        let existing = "model_provider = \"deepseek\"\nmodel_catalog_json = \"C:/user/models.json\"\n";
+        let profile = official_profile();
+        let previous = Some(Some("C:/user/models.json".to_string()));
+        let restored = build_global_toml_with_model_catalog_restore(
+            Some(existing),
+            Some("deepseek"),
+            &profile,
+            previous.as_ref(),
+        )
+        .expect("restore global catalog reference");
+        let document = DocumentMut::from_str(&restored).expect("parse global TOML");
+        assert_eq!(
+            document["model_catalog_json"].as_str(),
+            Some("C:/user/models.json")
+        );
+        assert_eq!(document["model_provider"].as_str(), Some("openai"));
+    }
+
+    #[test]
+    fn raw_model_catalog_snapshot_restores_bytes_or_removes_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-model-catalog-{}",
+            Uuid::new_v4()
+        ));
+        let path = directory.join("models.json");
+        let original = br#"{ "models": [{ "slug": "user-model" }] }"#;
+        fs::create_dir_all(&directory).expect("create temp directory");
+        fs::write(&path, br#"{ "models": [{ "slug": "managed-model" }] }"#)
+            .expect("write managed file");
+        restore_snapshot(&path, Some(original), SnapshotKind::Raw).expect("restore original");
+        assert_eq!(fs::read(&path).expect("read restored"), original);
+        restore_snapshot(&path, None, SnapshotKind::Raw).expect("remove projection");
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn model_catalog_projection_is_removed_when_original_file_was_missing() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-model-catalog-missing-{}",
+            Uuid::new_v4()
+        ));
+        let profile_id = "profile-missing";
+        let mut profile = custom_profile_with_catalog();
+        profile.id = profile_id.to_string();
+        let content = render_model_catalog(&normalize_profile(profile).expect("valid profile"))
+            .expect("render projection");
+        let path = managed_model_catalog_path_at(&directory, profile_id);
+        let desired = BTreeMap::from([(profile_id.to_string(), content.clone())]);
+        let mut state = CodexProfileState::default();
+
+        assert!(!path.exists());
+        synchronize_model_catalogs_at(&mut state, &desired, &directory)
+            .expect("create projection");
+        assert_eq!(fs::read(&path).expect("read projection"), content);
+        assert_eq!(
+            state
+                .managed_model_catalogs
+                .get(profile_id)
+                .and_then(|managed| managed.previous_bytes.as_deref()),
+            None
+        );
+
+        synchronize_model_catalogs_at(&mut state, &BTreeMap::new(), &directory)
+            .expect("remove projection");
+        assert!(!path.exists());
+        assert!(state.managed_model_catalogs.is_empty());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn model_catalog_projection_restores_original_bytes_after_official_switch() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-model-catalog-existing-{}",
+            Uuid::new_v4()
+        ));
+        let profile_id = "profile-existing";
+        let path = managed_model_catalog_path_at(&directory, profile_id);
+        let original = br#"{\n  "models": [{"slug": "user-model"}],\n  "user_field": "preserve-me"\n}\n"#;
+        fs::create_dir_all(&directory).expect("create catalog directory");
+        fs::write(&path, original).expect("write original catalog");
+
+        let mut profile = custom_profile_with_catalog();
+        profile.id = profile_id.to_string();
+        let content = render_model_catalog(&normalize_profile(profile).expect("valid profile"))
+            .expect("render projection");
+        let desired = BTreeMap::from([(profile_id.to_string(), content.clone())]);
+        let mut state = CodexProfileState::default();
+
+        synchronize_model_catalogs_at(&mut state, &desired, &directory)
+            .expect("replace original catalog");
+        assert_eq!(fs::read(&path).expect("read projection"), content);
+        assert_eq!(
+            state
+                .managed_model_catalogs
+                .get(profile_id)
+                .and_then(|managed| managed.previous_bytes.as_deref()),
+            Some(original.as_slice())
+        );
+
+        synchronize_model_catalogs_at(&mut state, &BTreeMap::new(), &directory)
+            .expect("restore original catalog");
+        assert_eq!(fs::read(&path).expect("read restored catalog"), original);
+        assert!(state.managed_model_catalogs.is_empty());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn legacy_cc_launcher_profile_is_migrated_to_agents_launcher_name() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-profile-migration-{}",
+            Uuid::new_v4()
+        ));
+        let profile_id = "profile-legacy";
+        let legacy = legacy_managed_profile_path_at(&directory, profile_id);
+        let target = directory.join(format!("{}.config.toml", managed_profile_name(profile_id)));
+        let original = b"model = \"legacy-model\"\n[features]\njs_repl = true\n";
+        fs::create_dir_all(&directory).expect("create profile directory");
+        fs::write(&legacy, original).expect("write legacy profile");
+
+        migrate_legacy_managed_profile_at(profile_id, &target, &directory)
+            .expect("migrate legacy profile");
+        assert_eq!(fs::read(&target).expect("read migrated profile"), original);
+        assert!(!legacy.exists());
+        assert!(DocumentMut::from_str(
+            &String::from_utf8(fs::read(&target).expect("read migrated TOML"))
+                .expect("UTF-8 migrated TOML")
+        )
+        .is_ok());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

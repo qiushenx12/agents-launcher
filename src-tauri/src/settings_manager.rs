@@ -340,7 +340,7 @@ mod tests {
     use uuid::Uuid;
 
     fn temp_paths() -> (PathBuf, SettingsPaths) {
-        let directory = std::env::temp_dir().join(format!("cc-launcher-{}", Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("agents-launcher-{}", Uuid::new_v4()));
         let paths = SettingsPaths {
             canonical: directory.join("settings.json"),
             legacy: [directory.join("claude.json"), directory.join("config.json")],

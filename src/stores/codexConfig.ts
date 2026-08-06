@@ -2,12 +2,69 @@ import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 import { confirm } from '@tauri-apps/plugin-dialog'
+import deepSeekModelCatalogTemplate from '../deepseekModelsTemplate.json'
 import type {
   CliProfileRef,
+  CodexModelDefinition,
   CodexLaunchContext,
   CodexProfile,
   CodexProfilesPayload,
 } from '@/types/config'
+
+const TEMPLATE_MODEL_FIELDS = new Set([
+  'slug',
+  'display_name',
+  'input_modalities',
+  'supports_image_detail_original',
+  'context_window',
+  'max_context_window',
+  'effective_context_window_percent',
+  'truncation_policy',
+  'default_reasoning_level',
+  'supported_reasoning_levels',
+])
+
+function templateModelForSlug(slug: string) {
+  return deepSeekModelCatalogTemplate.models.find(model => model.slug === slug)
+    ?? deepSeekModelCatalogTemplate.models[0]
+}
+
+function normalizeInputModalities(value: unknown): string[] {
+  const modalities = Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : []
+  const normalized = modalities
+    .map(item => item.trim().toLowerCase())
+    .filter(Boolean)
+    .filter((item, index, items) => items.indexOf(item) === index)
+  if (!normalized.includes('text')) normalized.unshift('text')
+  return normalized
+}
+
+function emptyModelDefinition(
+  slug = '',
+  options: { blankWhenEmpty?: boolean } = {},
+): CodexModelDefinition {
+  const normalizedSlug = slug.trim()
+  const template = templateModelForSlug(normalizedSlug)
+  const templateExtra = Object.fromEntries(
+    Object.entries(template).filter(([key]) => !TEMPLATE_MODEL_FIELDS.has(key)),
+  )
+  const resolvedSlug = normalizedSlug || (options.blankWhenEmpty ? '' : template.slug)
+  return {
+    ...templateExtra,
+    slug: resolvedSlug,
+    displayName: template.slug === resolvedSlug ? template.display_name : resolvedSlug,
+    inputModalities: normalizeInputModalities(template.input_modalities),
+    supportsImageDetailOriginal: template.supports_image_detail_original ?? false,
+    contextWindow: template.context_window,
+    maxContextWindow: template.max_context_window,
+    effectiveContextWindowPercent: template.effective_context_window_percent,
+    truncationPolicy: JSON.parse(JSON.stringify(template.truncation_policy)) as CodexModelDefinition['truncationPolicy'],
+    defaultReasoningLevel: template.default_reasoning_level,
+    supportedReasoningLevels: JSON.parse(JSON.stringify(template.supported_reasoning_levels)) as CodexModelDefinition['supportedReasoningLevels'],
+  }
+}
 
 function emptyProfile(): CodexProfile {
   return {
@@ -24,6 +81,7 @@ function emptyProfile(): CodexProfile {
     envKey: 'OPENAI_API_KEY',
     hasStoredApiKey: false,
     managedProfileName: '',
+    modelCatalog: null,
   }
 }
 
@@ -44,6 +102,7 @@ function serializeDraft(profile: CodexProfile, apiKeyInput: string, clearApiKey:
     baseUrl: profile.baseUrl,
     wireApi: profile.wireApi,
     envKey: profile.envKey,
+    modelCatalog: profile.modelCatalog,
     apiKeyInput,
     clearApiKey,
   })
@@ -136,6 +195,81 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     availableModels.value = []
     syncToGlobal.value = Boolean(profile.id && globalProfileId.value === profile.id)
     markClean()
+  }
+
+  function enableModelCatalog() {
+    if (editingProfile.value.modelCatalog) return
+    const initialModel = emptyModelDefinition('', { blankWhenEmpty: true })
+    editingProfile.value.modelCatalog = {
+      models: [initialModel],
+    }
+    editingProfile.value.model = ''
+    statusMessage.value = '已启用第三方 models.json 配置，模型字段沿用模板，请填写模型 slug'
+  }
+
+  function syncModelCatalogDraft(profile: CodexProfile) {
+    const models = profile.modelCatalog?.models
+    if (!models || models.length === 0) return
+    for (const model of models) {
+      model.slug = model.slug.trim()
+      if (!model.displayName.trim()) model.displayName = model.slug
+      model.inputModalities = normalizeInputModalities(model.inputModalities)
+      if (typeof model.supportsImageDetailOriginal !== 'boolean') {
+        model.supportsImageDetailOriginal = false
+      }
+    }
+    const selectedModel = models.find(model => model.slug === profile.model.trim())
+    profile.model = selectedModel?.slug ?? models[0].slug
+  }
+
+  function addModel(slug: string): boolean {
+    if (!editingProfile.value.modelCatalog) enableModelCatalog()
+    const models = editingProfile.value.modelCatalog?.models
+    if (!models) return false
+    const normalizedSlug = slug.trim()
+    if (!normalizedSlug) {
+      statusMessage.value = '请输入模型 slug'
+      return false
+    }
+    if (!/^[A-Za-z0-9._-]+$/.test(normalizedSlug)) {
+      statusMessage.value = '模型 slug 只能包含字母、数字、短横线、下划线和点'
+      return false
+    }
+    if (models.some(model => model.slug === normalizedSlug)) {
+      statusMessage.value = `模型 '${normalizedSlug}' 已存在`
+      return false
+    }
+    const placeholderIndex = models.findIndex(model => !model.slug.trim())
+    if (placeholderIndex >= 0) models[placeholderIndex] = emptyModelDefinition(normalizedSlug)
+    else models.push(emptyModelDefinition(normalizedSlug))
+    if (!editingProfile.value.model.trim()) editingProfile.value.model = normalizedSlug
+    statusMessage.value = `已添加模型 '${normalizedSlug}'`
+    return true
+  }
+
+  function removeModel(slug: string): boolean {
+    const models = editingProfile.value.modelCatalog?.models
+    if (!models) return false
+    if (models.length <= 1) {
+      statusMessage.value = '至少需要保留一个模型'
+      return false
+    }
+    const index = models.findIndex(model => model.slug === slug)
+    if (index < 0) return false
+    const wasDefault = editingProfile.value.model === slug
+    models.splice(index, 1)
+    if (wasDefault || !models.some(model => model.slug === editingProfile.value.model)) {
+      editingProfile.value.model = models[0]?.slug ?? ''
+    }
+    statusMessage.value = `已移除模型 '${slug}'`
+    return true
+  }
+
+  function setDefaultModel(slug: string): boolean {
+    const models = editingProfile.value.modelCatalog?.models
+    if (!models?.some(model => model.slug === slug)) return false
+    editingProfile.value.model = slug
+    return true
   }
 
   function applyPayload(payload: CodexProfilesPayload, preferredProfileId?: string | null) {
@@ -253,6 +387,7 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     saving.value = true
     const requestedGlobalSync = syncToGlobal.value
     const profile = cloneProfile(editingProfile.value)
+    syncModelCatalogDraft(profile)
     if (!profile.id) profile.id = `profile-${crypto.randomUUID()}`
     const nextOrder = order.value.includes(profile.id) ? [...order.value] : [...order.value, profile.id]
     const apiKeyForSave = apiKeyInput.value === revealedStoredApiKey.value
@@ -498,6 +633,10 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     activeProfile,
     activeProfileRef,
     editingProfile,
+    enableModelCatalog,
+    addModel,
+    removeModel,
+    setDefaultModel,
     apiKeyInput,
     storedApiKeyRevealed,
     apiKeyRevealing,

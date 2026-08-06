@@ -20,6 +20,37 @@ export interface CliProfileRef {
 
 export type CodexAuthMode = 'official' | 'custom'
 
+export interface CodexReasoningLevel {
+  effort: string
+  description: string
+  [key: string]: unknown
+}
+
+export interface CodexTruncationPolicy {
+  mode: string
+  limit: number
+  [key: string]: unknown
+}
+
+export interface CodexModelDefinition {
+  slug: string
+  displayName: string
+  inputModalities: string[]
+  supportsImageDetailOriginal: boolean
+  contextWindow: number
+  maxContextWindow: number
+  effectiveContextWindowPercent: number
+  truncationPolicy: CodexTruncationPolicy | null
+  defaultReasoningLevel: string
+  supportedReasoningLevels: CodexReasoningLevel[]
+  [key: string]: unknown
+}
+
+export interface CodexModelCatalog {
+  models: CodexModelDefinition[]
+  [key: string]: unknown
+}
+
 export interface CodexProfile {
   id: string
   name: string
@@ -34,6 +65,7 @@ export interface CodexProfile {
   envKey: string
   hasStoredApiKey: boolean
   managedProfileName: string
+  modelCatalog: CodexModelCatalog | null
   [key: string]: unknown
 }
 

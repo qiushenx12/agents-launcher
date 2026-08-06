@@ -748,7 +748,7 @@ fn exchange_codex_thread_list(
             "id": 0,
             "params": {
                 "clientInfo": {
-                    "name": "cc-launcher",
+                    "name": "agents-launcher",
                     "title": "Agents Launcher",
                     "version": env!("CARGO_PKG_VERSION")
                 }

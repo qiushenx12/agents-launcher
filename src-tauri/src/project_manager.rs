@@ -639,7 +639,7 @@ mod tests {
     use uuid::Uuid;
 
     fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("cc-launcher-pasted-images-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("agents-launcher-pasted-images-{}", Uuid::new_v4()))
     }
 
     #[test]

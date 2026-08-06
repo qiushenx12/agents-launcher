@@ -170,11 +170,166 @@
         </template>
 
         <ModelField
+          v-if="!profile.modelCatalog"
           v-model="profile.model"
           label="默认模型"
           :models="store.availableModels"
           placeholder="留空则继承下层配置"
         />
+
+        <div v-if="profile.authMode === 'custom'" class="model-catalog-editor">
+          <div class="field-row model-catalog-header">
+            <label class="field-label">模型目录</label>
+            <button
+              v-if="!profile.modelCatalog"
+              class="btn btn-secondary"
+              type="button"
+              @click="store.enableModelCatalog()"
+            >
+              使用模板
+            </button>
+            <span v-else class="field-help-inline">未编辑的字段会沿用官方模板。</span>
+          </div>
+
+          <template v-if="profile.modelCatalog">
+            <div class="model-add-row">
+              <select
+                v-model="selectedFetchedModel"
+                class="select model-fetch-select"
+                :disabled="fetchedModelOptions.length === 0"
+                aria-label="从已获取模型中选择"
+                @change="addFetchedModel"
+              >
+                <option value="">从已获取模型中添加</option>
+                <option v-for="model in fetchedModelOptions" :key="model" :value="model">
+                  {{ model }}
+                </option>
+              </select>
+              <input
+                v-model="modelDraftSlug"
+                class="input"
+                type="text"
+                placeholder="输入模型 slug，例如 deepseek-v4-flash"
+                @keydown.enter.prevent="addModel"
+              />
+              <button class="btn btn-secondary" type="button" @click="addModel">
+                添加模型
+              </button>
+            </div>
+
+            <div v-if="catalogModels.length === 0" class="model-empty">
+              暂无模型
+            </div>
+            <div v-else class="model-list">
+              <div class="model-columns" aria-hidden="true">
+                <span>默认</span>
+                <span>模型 slug</span>
+                <span>显示名称</span>
+                <span>上下文长度（token）</span>
+                <span>最大上下文（token）</span>
+                <span>有效比例</span>
+                <span>Image</span>
+                <span>原图细节</span>
+                <span />
+              </div>
+              <div
+                v-for="(model, index) in catalogModels"
+                :key="index"
+                class="model-row"
+              >
+                <label class="model-default-field">
+                  <input
+                    type="radio"
+                    :name="`codex-default-model-${profile.id || 'draft'}`"
+                    :checked="defaultModelSlug === model.slug"
+                    :disabled="catalogModels.length === 1"
+                    :aria-label="`设为默认模型 ${model.slug}`"
+                    @change="store.setDefaultModel(model.slug)"
+                  />
+                </label>
+                <input
+                  :value="model.slug"
+                  class="input"
+                  type="text"
+                  aria-label="模型 slug"
+                  @input="updateModelSlug(model, $event)"
+                />
+                <input
+                  v-model="model.displayName"
+                  class="input"
+                  type="text"
+                  aria-label="模型显示名称"
+                />
+                <input
+                  :value="model.contextWindow || ''"
+                  class="input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  aria-label="上下文长度"
+                  @input="updateModelNumber(model, 'contextWindow', $event)"
+                />
+                <input
+                  :value="model.maxContextWindow || ''"
+                  class="input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  aria-label="最大上下文长度"
+                  @input="updateModelNumber(model, 'maxContextWindow', $event)"
+                />
+                <div class="field-inline model-percent-field">
+                  <input
+                    :value="model.effectiveContextWindowPercent || ''"
+                    class="input"
+                    type="number"
+                    min="1"
+                    max="100"
+                    step="1"
+                    aria-label="有效上下文比例"
+                    @input="updateModelNumber(model, 'effectiveContextWindowPercent', $event)"
+                  />
+                  <span class="field-suffix">%</span>
+                </div>
+                <label class="model-image-field">
+                  <input
+                    type="checkbox"
+                    :checked="hasImageModality(model)"
+                    :aria-label="`启用模型 ${model.slug} 的 Image 输入`"
+                    @change="updateModelImageModality(model, $event)"
+                  />
+                </label>
+                <label class="model-image-field">
+                  <input
+                    type="checkbox"
+                    :checked="model.supportsImageDetailOriginal"
+                    :disabled="!hasImageModality(model)"
+                    :aria-label="`启用模型 ${model.slug} 的原图细节支持`"
+                    @change="updateModelImageDetailOriginal(model, $event)"
+                  />
+                </label>
+                <button
+                  class="icon-button"
+                  type="button"
+                  title="删除模型"
+                  :disabled="catalogModels.length === 1"
+                  @click="store.removeModel(model.slug)"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+            <p class="field-help">
+              默认模型会写入 Codex profile 的 <code>model</code>；其它模型字段按模板生成，
+              上下文长度和有效比例可按第三方模型实际能力调整。
+            </p>
+            <p class="field-help">
+              Text is always enabled; Image writes <code>input_modalities</code>; 原图细节 writes
+              <code>supports_image_detail_original</code> and requires Image.
+            </p>
+          </template>
+        </div>
+
 
         <div class="field-row">
           <label class="field-label">推理强度</label>
@@ -281,7 +436,7 @@
         <div class="card-title">配置边界</div>
         <p>全局配置：{{ store.globalConfigPath || '~/.codex/config.toml' }}</p>
         <p>启动器索引：{{ store.profilesPath || defaultProfilesPath }}</p>
-        <p>启动器通过独立的 <code>--profile {{ profile.managedProfileName || 'cc-launcher-…' }}</code> 启动；只有主动勾选“同时同步到全局配置”才修改全局文件。</p>
+        <p>启动器通过独立的 <code>--profile {{ profile.managedProfileName || 'agents-launcher-…' }}</code> 启动；只有主动勾选“同时同步到全局配置”才修改全局文件。</p>
         <p>CodeX 优先级：CLI 参数 → 项目 <code>.codex/config.toml</code> → 当前启动器 profile → 全局配置。</p>
       </section>
     </main>
@@ -289,7 +444,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useCodexConfigStore } from '@/stores/codexConfig'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
 import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
@@ -298,6 +453,7 @@ import SecretField from '@/components/config/SecretField.vue'
 import { useDragReorder } from '@/composables/useDragReorder'
 import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
 import { useSettingsPopover } from '@/composables/useSettingsPopover'
+import type { CodexModelDefinition } from '@/types/config'
 
 const { toggleSettings } = useSettingsPopover()
 import { usePlatform } from '@/composables/usePlatform'
@@ -316,6 +472,21 @@ const { draggingIndex, overIndex, justDragged, onPointerDown } = useDragReorder(
   (newOrder: string[]) => store.reorderProfiles(newOrder),
 )
 const profile = computed(() => store.editingProfile)
+const modelDraftSlug = ref('')
+const selectedFetchedModel = ref('')
+const catalogModels = computed(() => profile.value.modelCatalog?.models ?? [])
+const defaultModelSlug = computed(() => {
+  const models = catalogModels.value
+  return models.some(model => model.slug === profile.value.model)
+    ? profile.value.model
+    : models[0]?.slug ?? ''
+})
+const fetchedModelOptions = computed(() => {
+  const existingSlugs = new Set(
+    catalogModels.value.map(model => model.slug.trim()).filter(Boolean),
+  )
+  return store.availableModels.filter(model => !existingSlugs.has(model))
+})
 const defaultProfilesPath = computed(() => isMacOS.value
   ? '~/Library/Application Support/ClaudeEnvManager/codex/profiles.json'
   : '%APPDATA%\\ClaudeEnvManager\\codex\\profiles.json')
@@ -376,6 +547,60 @@ function profileStateLabel(profileId: string) {
 function onProfileClick(profileId: string) {
   if (justDragged.value) return
   store.selectProfile(profileId)
+}
+
+function addModel() {
+  if (store.addModel(modelDraftSlug.value)) modelDraftSlug.value = ''
+}
+
+function addFetchedModel() {
+  const slug = selectedFetchedModel.value
+  if (!slug) return
+  store.addModel(slug)
+  selectedFetchedModel.value = ''
+}
+
+function updateModelSlug(model: { slug: string }, event: Event) {
+  const previousSlug = model.slug
+  const nextSlug = (event.target as HTMLInputElement).value
+  model.slug = nextSlug
+  if (profile.value.model === previousSlug || !profile.value.model) {
+    profile.value.model = nextSlug
+  }
+}
+
+function updateModelNumber(
+  model: {
+    contextWindow: number
+    maxContextWindow: number
+    effectiveContextWindowPercent: number
+  },
+  field: 'contextWindow' | 'maxContextWindow' | 'effectiveContextWindowPercent',
+  event: Event,
+) {
+  const raw = (event.target as HTMLInputElement).value.trim()
+  const parsed = Number(raw)
+  model[field] = raw && Number.isSafeInteger(parsed) ? parsed : 0
+}
+
+function hasImageModality(model: CodexModelDefinition) {
+  return Array.isArray(model.inputModalities) && model.inputModalities.includes('image')
+}
+
+function updateModelImageModality(model: CodexModelDefinition, event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  const otherModalities = (Array.isArray(model.inputModalities) ? model.inputModalities : [])
+    .filter(modality => modality !== 'text' && modality !== 'image')
+  model.inputModalities = ['text', ...(checked ? ['image'] : []), ...otherModalities]
+  if (!checked) model.supportsImageDetailOriginal = false
+}
+
+function updateModelImageDetailOriginal(model: CodexModelDefinition, event: Event) {
+  if (!hasImageModality(model)) {
+    model.supportsImageDetailOriginal = false
+    return
+  }
+  model.supportsImageDetailOriginal = (event.target as HTMLInputElement).checked
 }
 
 function onEffortSelect(event: Event) {
@@ -627,6 +852,31 @@ watch(leftWidth, (width) => {
 
 .field-inline .input { min-width: 0; flex: 1; }
 .effort-select { width: 100px; flex-shrink: 0; }
+.field-help-inline { color: var(--text-secondary); font-size: var(--font-size-small); }
+.field-suffix { flex: 0 0 auto; color: var(--text-secondary); }
+.model-catalog-editor { margin-top: 4px; }
+.model-catalog-header { align-items: center; }
+.model-add-row { margin: 2px 0 10px 120px; display: flex; gap: 6px; }
+.model-fetch-select { flex: 0 1 260px; min-width: 220px; }
+.model-add-row .input { min-width: 0; flex: 1; }
+.model-empty { margin-left: 120px; padding: 14px; color: var(--text-secondary); text-align: center; font-size: var(--font-size-small); }
+.model-list { margin-left: 120px; overflow-x: auto; }
+.model-columns,
+.model-row {
+  min-width: 1110px;
+  display: grid;
+  grid-template-columns: 46px minmax(150px, 1.1fr) minmax(150px, 1fr) minmax(130px, 0.9fr) minmax(130px, 0.9fr) minmax(100px, 0.7fr) 54px 74px 30px;
+  gap: 7px;
+  align-items: center;
+}
+.model-columns { padding: 0 2px 4px; color: var(--text-secondary); font-size: var(--font-size-small); }
+.model-row { margin-top: 6px; }
+.model-row .input { min-width: 0; }
+.model-default-field { display: flex; align-items: center; justify-content: center; }
+.model-image-field { display: flex; align-items: center; justify-content: center; }
+.model-percent-field { min-width: 0; }
+.model-percent-field .input { min-width: 0; }
+.model-row .icon-button { justify-self: center; }
 
 .radio-group,
 .scope-row {
@@ -688,5 +938,6 @@ watch(leftWidth, (width) => {
 
 @media (max-width: 820px) {
   .codex-config-panel__sidebar { width: 220px; }
+  .model-add-row, .model-empty, .model-list { margin-left: 0; }
 }
 </style>

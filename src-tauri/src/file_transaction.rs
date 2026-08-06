@@ -174,7 +174,7 @@ mod tests {
 
     fn temp_file(name: &str) -> PathBuf {
         std::env::temp_dir()
-            .join(format!("cc-launcher-{}", Uuid::new_v4()))
+            .join(format!("agents-launcher-{}", Uuid::new_v4()))
             .join(name)
     }
 

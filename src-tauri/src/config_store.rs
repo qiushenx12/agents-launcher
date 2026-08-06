@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn profile_round_trip_preserves_unknown_environment_fields() {
-        let directory = std::env::temp_dir().join(format!("cc-launcher-{}", Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("agents-launcher-{}", Uuid::new_v4()));
         let path = directory.join("env_configs.json");
         let mut vars = HashMap::new();
         vars.insert("ANTHROPIC_MODEL".to_string(), "known-model".to_string());
