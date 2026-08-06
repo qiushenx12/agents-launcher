@@ -45,6 +45,7 @@ claude-code-2-1-112/
 
 # Local workspace data (work logs, agent state)
 .workbuddy/
+.agents/
 
 # Local OS shortcuts
 *.lnk
