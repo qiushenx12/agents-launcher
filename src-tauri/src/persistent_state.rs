@@ -151,6 +151,8 @@ pub struct AppState {
     #[serde(default)]
     pub window: WindowState,
     #[serde(default)]
+    pub minimize_to_tray: bool,
+    #[serde(default)]
     pub claude: ToolState,
     #[serde(default)]
     pub codex: ToolState,
@@ -420,6 +422,16 @@ pub fn save_window_state(mut state: WindowState) -> Result<(), String> {
         }
         current.window = state;
     })
+}
+
+#[tauri::command]
+pub fn load_minimize_to_tray() -> Result<bool, String> {
+    Ok(load_state()?.minimize_to_tray)
+}
+
+#[tauri::command]
+pub fn save_minimize_to_tray(enabled: bool) -> Result<(), String> {
+    update_state(|state| state.minimize_to_tray = enabled)
 }
 
 // ---------------------------------------------------------------------------
@@ -717,6 +729,20 @@ mod tests {
 
         assert_eq!(output["claude"]["futureToolField"], "keep");
         assert_eq!(output["futureRootField"]["enabled"], Value::Bool(true));
+    }
+
+    #[test]
+    fn minimize_to_tray_defaults_to_disabled_and_round_trips() {
+        assert!(!AppState::default().minimize_to_tray);
+
+        let state: AppState = serde_json::from_value(serde_json::json!({
+            "minimize_to_tray": true
+        }))
+        .expect("decode minimize-to-tray setting");
+        assert!(state.minimize_to_tray);
+
+        let output = serde_json::to_value(state).expect("encode minimize-to-tray setting");
+        assert_eq!(output["minimize_to_tray"], Value::Bool(true));
     }
 
     #[test]

@@ -40,7 +40,7 @@
           />
           <span class="codex-profile-item__content">
             <strong>{{ item.name }}</strong>
-            <small>{{ item.authMode === 'official' ? 'Codex 官方登录' : item.providerId }}</small>
+            <small>{{ item.authMode === 'official' ? 'Codex 官方登录' : '第三方 API' }}</small>
           </span>
           <span
             v-if="profileStateLabel(item.id)"
@@ -98,16 +98,8 @@
         </div>
 
         <template v-if="profile.authMode === 'official'">
-          <div class="field-row">
-            <label class="field-label">API 地址</label>
-            <input
-              v-model="profile.openaiBaseUrl"
-              class="input"
-              type="text"
-              placeholder="留空使用 Codex 官方地址"
-            />
-          </div>
           <ConfigStatusBanner
+            class="official-auth-status"
             :message="store.authStatusLabel"
             :tone="store.authStatus.error ? 'error' : store.authStatus.hasCredentials ? 'success' : 'info'"
           />
@@ -145,32 +137,10 @@
             @reveal-stored-value="store.revealApiKey()"
           />
 
-          <div class="field-row">
-            <label class="field-label">Provider ID</label>
-            <input v-model="profile.providerId" class="input" type="text" placeholder="例如 company_proxy" />
-          </div>
-          <div class="field-row">
-            <label class="field-label">显示名称</label>
-            <input v-model="profile.providerName" class="input" type="text" placeholder="例如 Company Proxy" />
-          </div>
-          <div class="field-row">
-            <label class="field-label">Key 环境变量</label>
-            <input v-model="profile.envKey" class="input" type="text" placeholder="OPENAI_API_KEY" />
-          </div>
-          <div class="field-row">
-            <label class="field-label">Wire API</label>
-            <select v-model="profile.wireApi" class="select">
-              <option value="responses">responses</option>
-            </select>
-          </div>
-          <label v-if="profile.hasStoredApiKey" class="clear-secret">
-            <input v-model="store.clearStoredApiKey" type="checkbox" />
-            删除已加密保存的 API Key，改用系统环境变量
-          </label>
         </template>
 
         <ModelField
-          v-if="!profile.modelCatalog"
+          v-if="profile.authMode === 'custom' && !profile.modelCatalog"
           v-model="profile.model"
           label="默认模型"
           :models="store.availableModels"
@@ -188,7 +158,15 @@
             >
               使用模板
             </button>
-            <span v-else class="field-help-inline">未编辑的字段会沿用官方模板。</span>
+            <template v-else>
+              <button
+                class="btn btn-secondary"
+                type="button"
+                @click="store.disableModelCatalog()"
+              >
+                不使用模板
+              </button>
+            </template>
           </div>
 
           <template v-if="profile.modelCatalog">
@@ -206,10 +184,10 @@
                 </option>
               </select>
               <input
-                v-model="modelDraftSlug"
+                v-model="modelDraftName"
                 class="input"
                 type="text"
-                placeholder="输入模型 slug，例如 deepseek-v4-flash"
+                placeholder="输入模型名称，例如 deepseek-v4-flash"
                 @keydown.enter.prevent="addModel"
               />
               <button class="btn btn-secondary" type="button" @click="addModel">
@@ -223,10 +201,8 @@
             <div v-else class="model-list">
               <div class="model-columns" aria-hidden="true">
                 <span>默认</span>
-                <span>模型 slug</span>
                 <span>显示名称</span>
-                <span>上下文长度（token）</span>
-                <span>最大上下文（token）</span>
+                <span>上下文长度</span>
                 <span>有效比例</span>
                 <span>Image</span>
                 <span>原图细节</span>
@@ -248,36 +224,39 @@
                   />
                 </label>
                 <input
-                  :value="model.slug"
-                  class="input"
-                  type="text"
-                  aria-label="模型 slug"
-                  @input="updateModelSlug(model, $event)"
-                />
-                <input
-                  v-model="model.displayName"
+                  :value="model.displayName"
                   class="input"
                   type="text"
                   aria-label="模型显示名称"
+                  @input="updateModelName(model, $event)"
                 />
-                <input
-                  :value="model.contextWindow || ''"
-                  class="input"
-                  type="number"
-                  min="1"
-                  step="1"
-                  aria-label="上下文长度"
-                  @input="updateModelNumber(model, 'contextWindow', $event)"
-                />
-                <input
-                  :value="model.maxContextWindow || ''"
-                  class="input"
-                  type="number"
-                  min="1"
-                  step="1"
-                  aria-label="最大上下文长度"
-                  @input="updateModelNumber(model, 'maxContextWindow', $event)"
-                />
+                <div class="field-inline context-window-field">
+                  <input
+                    :value="model.contextWindow || ''"
+                    class="input context-window-custom-input"
+                    type="number"
+                    min="1"
+                    step="1"
+                    aria-label="上下文长度"
+                    placeholder="token"
+                    @input="updateModelNumber(model, 'contextWindow', $event)"
+                  />
+                  <select
+                    class="select context-window-preset"
+                    :value="contextWindowPresetValue(model.contextWindow)"
+                    aria-label="上下文长度预设"
+                    @change="updateContextWindowPreset(model, $event)"
+                  >
+                    <option value="custom">自定义</option>
+                    <option
+                      v-for="preset in contextWindowPresets"
+                      :key="preset.value"
+                      :value="preset.value"
+                    >
+                      {{ preset.label }}
+                    </option>
+                  </select>
+                </div>
                 <div class="field-inline model-percent-field">
                   <input
                     :value="model.effectiveContextWindowPercent || ''"
@@ -319,19 +298,11 @@
                 </button>
               </div>
             </div>
-            <p class="field-help">
-              默认模型会写入 Codex profile 的 <code>model</code>；其它模型字段按模板生成，
-              上下文长度和有效比例可按第三方模型实际能力调整。
-            </p>
-            <p class="field-help">
-              Text is always enabled; Image writes <code>input_modalities</code>; 原图细节 writes
-              <code>supports_image_detail_original</code> and requires Image.
-            </p>
           </template>
         </div>
 
 
-        <div class="field-row">
+        <div v-if="profile.authMode === 'custom'" class="field-row">
           <label class="field-label">推理强度</label>
           <div class="field-inline">
             <input
@@ -349,12 +320,13 @@
           </div>
         </div>
 
-        <p class="field-help">
-          {{ profile.authMode === 'official'
-            ? '复用 CLI、桌面端和 IDE 的 Codex 官方登录，不读取、覆盖或清除 auth.json。'
-            : secretStorageDescription }}
-        </p>
-
+        <div v-if="profile.authMode === 'custom'" class="field-row">
+          <label class="field-label">协议转换</label>
+          <label class="checkbox-inline">
+            <input v-model="profile.protocolConversion" type="checkbox" />
+            启用 Responses → Chat Completions 转换
+          </label>
+        </div>
         <hr class="separator" style="margin: 12px 0 10px;" />
 
         <div class="scope-row">
@@ -367,30 +339,28 @@
             />
             同时同步到全局配置
           </label>
-          <span class="scope-hint">
-            {{ globalApplied
-              ? '当前方案已经同步到全局；选择另一方案同步时会替换它'
-              : '不勾选时只改变启动器当前方案' }}
-          </span>
         </div>
         <p v-if="profile.authMode === 'custom' && store.secretStorageKind === 'macos_plaintext'" class="scope-warning">
           macOS 会将第三方 Key 以明文保存到启动器的私有凭据文件，不使用 Keychain；新启动的 CodeX 会按 profile 读取对应 Key。
         </p>
-        <p v-if="store.syncToGlobal" class="scope-warning">
-          <template v-if="profile.authMode === 'official'">
-            将更新 {{ store.globalConfigPath || '~/.codex/config.toml' }}；auth.json 保持只读。
+        <p
+          v-if="store.syncToGlobal"
+          class="scope-warning"
+        >
+          <template v-if="profile.authMode === 'official' && store.platform === 'windows'">
+            将更新该方案独立的 CODEX_HOME/config.toml，并隔离桌面端会话；auth.json 保持只读。
           </template>
-          <template v-else-if="store.customGlobalKeySyncSupported">
-            将更新 {{ store.globalConfigPath || '~/.codex/config.toml' }}；并把
-            <code>{{ profile.envKey || 'API Key 环境变量' }}</code> 写入 Windows 当前用户环境。该环境变量不是密文存储；外部终端和 CodeX 桌面端需重启后读取新环境。
+          <template v-else-if="profile.authMode === 'official'">
+            将更新 Codex 全局 config.toml；auth.json 保持只读。
           </template>
           <template v-else-if="store.secretStorageKind === 'macos_plaintext' && profile.hasStoredApiKey">
-            将把第三方 Provider 和模型同步到 {{ store.globalConfigPath || '~/.codex/config.toml' }}，并配置 Codex 的命令式认证从启动器凭据文件读取 Key。明文不会写入 TOML 或 shell，不使用 Keychain。
+            将把第三方 Provider 和模型同步到 Codex 全局 config.toml，并配置 Codex 的命令式认证从启动器凭据文件读取 Key。明文不会写入 TOML 或 shell，不使用 Keychain。
+          </template>
+          <template v-else-if="store.platform === 'windows'">
+            将把第三方 Provider 和模型同步到该方案独立的 CODEX_HOME/config.toml，并隔离桌面端会话；完全退出（含后台）并重新打开 Codex 桌面端后生效。
           </template>
           <template v-else>
-            将把第三方 Provider、模型和 <code>env_key</code> 同步到
-            {{ store.globalConfigPath || '~/.codex/config.toml' }}。Key 不会写入 TOML 或 shell；启动器内会自动注入，外部 CodeX 需要自行设置
-            <code>{{ profile.envKey || 'API Key 环境变量' }}</code>，或配置 Codex 命令式认证。
+            将把第三方 Provider 和模型同步到 Codex 全局 config.toml；外部 Codex 仍需自行提供对应的 API Key。
           </template>
         </p>
 
@@ -428,17 +398,9 @@
           <button class="btn btn-secondary" type="button" @click="workspaceStore.openPreflight()">
             启动前检测
           </button>
-          <span>检查 CLI、配置来源、实际应用 profile 和脱敏后的启动上下文。</span>
         </div>
       </section>
 
-      <section class="card codex-source-note">
-        <div class="card-title">配置边界</div>
-        <p>全局配置：{{ store.globalConfigPath || '~/.codex/config.toml' }}</p>
-        <p>启动器索引：{{ store.profilesPath || defaultProfilesPath }}</p>
-        <p>启动器通过独立的 <code>--profile {{ profile.managedProfileName || 'agents-launcher-…' }}</code> 启动；只有主动勾选“同时同步到全局配置”才修改全局文件。</p>
-        <p>CodeX 优先级：CLI 参数 → 项目 <code>.codex/config.toml</code> → 当前启动器 profile → 全局配置。</p>
-      </section>
     </main>
   </div>
 </template>
@@ -456,7 +418,6 @@ import { useSettingsPopover } from '@/composables/useSettingsPopover'
 import type { CodexModelDefinition } from '@/types/config'
 
 const { toggleSettings } = useSettingsPopover()
-import { usePlatform } from '@/composables/usePlatform'
 
 const store = useCodexConfigStore()
 const workspaceStore = useConfigWorkspaceStore()
@@ -466,13 +427,12 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: 'left-width-change', width: number): void
 }>()
-const { isMacOS } = usePlatform()
 const { draggingIndex, overIndex, justDragged, onPointerDown } = useDragReorder(
   () => store.orderedProfiles.map(item => item.id),
   (newOrder: string[]) => store.reorderProfiles(newOrder),
 )
 const profile = computed(() => store.editingProfile)
-const modelDraftSlug = ref('')
+const modelDraftName = ref('')
 const selectedFetchedModel = ref('')
 const catalogModels = computed(() => profile.value.modelCatalog?.models ?? [])
 const defaultModelSlug = computed(() => {
@@ -487,12 +447,6 @@ const fetchedModelOptions = computed(() => {
   )
   return store.availableModels.filter(model => !existingSlugs.has(model))
 })
-const defaultProfilesPath = computed(() => isMacOS.value
-  ? '~/Library/Application Support/ClaudeEnvManager/codex/profiles.json'
-  : '%APPDATA%\\ClaudeEnvManager\\codex\\profiles.json')
-const secretStorageDescription = computed(() => store.secretStorageKind === 'macos_plaintext'
-  ? 'Key 以明文保存在启动器私有 credentials.json 中；Codex 通过命令式认证按 profile 读取，不使用 Keychain。'
-  : 'Key 使用 Windows DPAPI 加密保存，并且只注入启动器创建的 CodeX 子进程。')
 watch(
   () => [profile.value.authMode, store.customGlobalSyncSupported] as const,
   ([authMode, supported]) => {
@@ -500,6 +454,13 @@ watch(
   },
 )
 const reasoningEfforts = ['minimal', 'low', 'medium', 'high', 'xhigh', 'ultra', 'max']
+const contextWindowPresets = [
+  { label: '128k', value: 128 * 1024 },
+  { label: '200k', value: 200 * 1024 },
+  { label: '256k', value: 256 * 1024 },
+  { label: '512k', value: 512 * 1024 },
+  { label: '1m', value: 1024 * 1024 },
+] as const
 const appApplied = computed(() => Boolean(
   profile.value.id && store.activeProfileId === profile.value.id,
 ))
@@ -550,7 +511,7 @@ function onProfileClick(profileId: string) {
 }
 
 function addModel() {
-  if (store.addModel(modelDraftSlug.value)) modelDraftSlug.value = ''
+  if (store.addModel(modelDraftName.value)) modelDraftName.value = ''
 }
 
 function addFetchedModel() {
@@ -560,13 +521,35 @@ function addFetchedModel() {
   selectedFetchedModel.value = ''
 }
 
-function updateModelSlug(model: { slug: string }, event: Event) {
+function updateModelName(model: { slug: string; displayName: string }, event: Event) {
   const previousSlug = model.slug
+  const previousName = model.displayName
   const nextSlug = (event.target as HTMLInputElement).value
   model.slug = nextSlug
-  if (profile.value.model === previousSlug || !profile.value.model) {
+  model.displayName = nextSlug
+  if (
+    profile.value.model === previousSlug
+    || profile.value.model === previousName
+    || !profile.value.model
+  ) {
     profile.value.model = nextSlug
   }
+}
+
+function contextWindowPresetValue(value: number): string {
+  return contextWindowPresets.find(preset => preset.value === value)?.value.toString() ?? 'custom'
+}
+
+function updateContextWindowPreset(
+  model: { contextWindow: number; maxContextWindow: number },
+  event: Event,
+) {
+  const value = (event.target as HTMLSelectElement).value
+  if (value === 'custom') return
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return
+  model.contextWindow = parsed
+  model.maxContextWindow = parsed
 }
 
 function updateModelNumber(
@@ -581,6 +564,7 @@ function updateModelNumber(
   const raw = (event.target as HTMLInputElement).value.trim()
   const parsed = Number(raw)
   model[field] = raw && Number.isSafeInteger(parsed) ? parsed : 0
+  if (field === 'contextWindow') model.maxContextWindow = model.contextWindow
 }
 
 function hasImageModality(model: CodexModelDefinition) {
@@ -852,6 +836,9 @@ watch(leftWidth, (width) => {
 
 .field-inline .input { min-width: 0; flex: 1; }
 .effort-select { width: 100px; flex-shrink: 0; }
+.context-window-field { gap: 4px; }
+.context-window-custom-input { min-width: 0; }
+.context-window-preset { width: 76px; flex: 0 0 76px; min-width: 0; padding-left: 6px; padding-right: 24px; }
 .field-help-inline { color: var(--text-secondary); font-size: var(--font-size-small); }
 .field-suffix { flex: 0 0 auto; color: var(--text-secondary); }
 .model-catalog-editor { margin-top: 4px; }
@@ -863,9 +850,9 @@ watch(leftWidth, (width) => {
 .model-list { margin-left: 120px; overflow-x: auto; }
 .model-columns,
 .model-row {
-  min-width: 1110px;
+  min-width: 850px;
   display: grid;
-  grid-template-columns: 46px minmax(150px, 1.1fr) minmax(150px, 1fr) minmax(130px, 0.9fr) minmax(130px, 0.9fr) minmax(100px, 0.7fr) 54px 74px 30px;
+  grid-template-columns: 46px minmax(180px, 1.1fr) minmax(130px, 0.9fr) minmax(100px, 0.7fr) 54px 74px 30px;
   gap: 7px;
   align-items: center;
 }
@@ -904,13 +891,13 @@ watch(leftWidth, (width) => {
 
 .field-help,
 .scope-hint,
-.scope-warning,
-.codex-source-note p {
+.scope-warning {
   color: var(--text-secondary);
   font-size: var(--font-size-small);
   line-height: 1.55;
 }
 
+.official-auth-status { margin-left: 120px; }
 .scope-warning { color: var(--warning, #b26a00); overflow-wrap: anywhere; }
 .action-row {
   padding: 4px 0;
@@ -927,14 +914,6 @@ watch(leftWidth, (width) => {
   gap: 10px;
   border-top: 1px solid var(--separator);
 }
-
-.preflight-entry span {
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-  line-height: 1.45;
-}
-
-.codex-source-note p + p { margin-top: 5px; }
 
 @media (max-width: 820px) {
   .codex-config-panel__sidebar { width: 220px; }

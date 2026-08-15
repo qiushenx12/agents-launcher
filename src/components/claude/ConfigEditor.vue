@@ -174,7 +174,6 @@
       <button class="btn btn-secondary" type="button" @click="workspaceStore.openPreflight()">
         启动前检测
       </button>
-      <span>检查 CLI、配置来源与当前启动上下文，诊断内容会自动脱敏。</span>
     </div>
   </div>
 </template>
@@ -339,12 +338,6 @@ async function openClaudePath() {
   align-items: center;
   gap: 10px;
   border-top: 1px solid var(--separator);
-}
-
-.preflight-entry span {
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-  line-height: 1.45;
 }
 
 </style>

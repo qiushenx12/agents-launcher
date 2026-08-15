@@ -295,7 +295,8 @@ fn all_codex_threads(
     }
     let threads = match query_all_codex_threads(max_count, &runtime) {
         Ok(threads) => {
-            let rollout_threads = codex_threads_from_rollouts(max_count).unwrap_or_default();
+            let rollout_threads =
+                codex_threads_from_rollouts(max_count, &runtime).unwrap_or_default();
             let threads = enrich_codex_thread_titles(threads, &rollout_threads);
             let filtered = filter_codex_threads_by_provider(threads, &runtime.model_provider);
             if filtered.is_empty() {
@@ -313,7 +314,7 @@ fn all_codex_threads(
             }
         }
         Err(_) => filter_codex_threads_by_provider(
-            codex_threads_from_rollouts(max_count)?,
+            codex_threads_from_rollouts(max_count, &runtime)?,
             &runtime.model_provider,
         ),
     };
@@ -378,15 +379,22 @@ pub async fn list_codex_threads(
 }
 
 #[tauri::command]
-pub async fn discover_codex_projects() -> Result<CodexProjectDiscovery, String> {
-    tokio::task::spawn_blocking(discover_codex_projects_from_session_meta)
-        .await
-        .map_err(|error| format!("CodeX 项目发现任务异常结束: {error}"))?
+pub async fn discover_codex_projects(
+    profile_id: Option<String>,
+) -> Result<CodexProjectDiscovery, String> {
+    tokio::task::spawn_blocking(move || {
+        let runtime = crate::codex_config::resolve_codex_runtime_context(profile_id.as_deref())?;
+        discover_codex_projects_from_session_meta(&runtime)
+    })
+    .await
+    .map_err(|error| format!("CodeX 项目发现任务异常结束: {error}"))?
 }
 
-fn discover_codex_projects_from_session_meta() -> Result<CodexProjectDiscovery, String> {
-    let sessions_root =
-        codex_sessions_root().ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
+fn discover_codex_projects_from_session_meta(
+    runtime: &crate::codex_config::CodexRuntimeContext,
+) -> Result<CodexProjectDiscovery, String> {
+    let sessions_root = codex_sessions_root(runtime)
+        .ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
     if !sessions_root.is_dir() {
         return Ok(CodexProjectDiscovery {
             projects: Vec::new(),
@@ -503,11 +511,11 @@ fn spawn_codex_app_server(
     let path =
         locate_cli(CliKind::Codex).ok_or_else(|| "未检测到 CodeX，无法读取会话。".to_string())?;
     let mut command = hidden_command(&path);
-    if let Some(profile_name) = runtime.profile_name.as_deref() {
-        command.args(["--profile", profile_name]);
-    }
+    // --profile is a top-level Codex option and must precede app-server.
+    // CODEX_HOME provides physical session isolation; the profile layer keeps
+    // the app-server configuration identical to the interactive terminal.
     command
-        .arg("app-server")
+        .args(codex_app_server_args(runtime.profile_name.as_deref()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -518,6 +526,16 @@ fn spawn_codex_app_server(
     command
         .spawn()
         .map_err(|error| format!("无法启动 CodeX App Server: {error}"))
+}
+
+fn codex_app_server_args(profile_name: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(profile_name) = profile_name {
+        args.push("--profile".to_string());
+        args.push(profile_name.to_string());
+    }
+    args.push("app-server".to_string());
+    args
 }
 
 fn query_codex_threads(
@@ -541,9 +559,12 @@ fn query_all_codex_threads(
     result
 }
 
-fn codex_threads_from_rollouts(max_count: u32) -> Result<Vec<CodexThreadSummary>, String> {
-    let sessions_root =
-        codex_sessions_root().ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
+fn codex_threads_from_rollouts(
+    max_count: u32,
+    runtime: &crate::codex_config::CodexRuntimeContext,
+) -> Result<Vec<CodexThreadSummary>, String> {
+    let sessions_root = codex_sessions_root(runtime)
+        .ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
     if !sessions_root.is_dir() {
         return Err(format!(
             "未找到 CodeX 会话目录: {}",
@@ -684,8 +705,10 @@ fn enrich_codex_thread_titles(
     threads
 }
 
-fn codex_sessions_root() -> Option<PathBuf> {
-    std::env::var_os("CODEX_HOME")
+fn codex_sessions_root(runtime: &crate::codex_config::CodexRuntimeContext) -> Option<PathBuf> {
+    runtime
+        .env_vars
+        .get("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
         .map(|home| home.join("sessions"))
@@ -1143,6 +1166,15 @@ mod tests {
         assert_eq!(threads[0].name.as_deref(), Some("Desktop task"));
         assert_eq!(threads[0].model_provider.as_deref(), Some("openai"));
         assert_eq!(threads[1].preview, "CLI task prompt");
+    }
+
+    #[test]
+    fn codex_app_server_receives_profile_before_the_subcommand() {
+        assert_eq!(
+            codex_app_server_args(Some("agents-launcher-test")),
+            ["--profile", "agents-launcher-test", "app-server"]
+        );
+        assert_eq!(codex_app_server_args(None), ["app-server"]);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
-import { confirm } from '@tauri-apps/plugin-dialog'
+import { confirm, message } from '@tauri-apps/plugin-dialog'
 import deepSeekModelCatalogTemplate from '../deepseekModelsTemplate.json'
+import { useAppSettingsStore } from './appSettings'
 import type {
   CliProfileRef,
   CodexModelDefinition,
@@ -54,7 +55,7 @@ function emptyModelDefinition(
   return {
     ...templateExtra,
     slug: resolvedSlug,
-    displayName: template.slug === resolvedSlug ? template.display_name : resolvedSlug,
+    displayName: resolvedSlug,
     inputModalities: normalizeInputModalities(template.input_modalities),
     supportsImageDetailOriginal: template.supports_image_detail_original ?? false,
     contextWindow: template.context_window,
@@ -78,6 +79,9 @@ function emptyProfile(): CodexProfile {
     providerName: '',
     baseUrl: '',
     wireApi: 'responses',
+    protocolConversion: false,
+    chatUpstreamModel: '',
+    promptCacheRouting: 'auto',
     envKey: 'OPENAI_API_KEY',
     hasStoredApiKey: false,
     managedProfileName: '',
@@ -87,6 +91,36 @@ function emptyProfile(): CodexProfile {
 
 function cloneProfile(profile: CodexProfile): CodexProfile {
   return JSON.parse(JSON.stringify(profile)) as CodexProfile
+}
+
+function defaultProfileName(): string {
+  return `profile_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`
+}
+
+function providerIdFromProfileName(name: string, fallback: string): string {
+  let providerId = ''
+  let needsSeparator = false
+  for (const character of name.trim()) {
+    if (/^[A-Za-z0-9_-]$/.test(character)) {
+      if (needsSeparator && providerId && !/[-_]$/.test(providerId)) providerId += '_'
+      providerId += character
+      needsSeparator = false
+    } else if (providerId) {
+      needsSeparator = true
+    }
+  }
+  providerId = providerId.replace(/^[-_]+|[-_]+$/g, '')
+  if (!providerId) return fallback
+  if (['openai', 'ollama', 'lmstudio'].includes(providerId.toLowerCase())) {
+    return `${providerId}_custom`
+  }
+  return providerId
+}
+
+function syncProviderIdentity(profile: CodexProfile) {
+  if (profile.authMode !== 'custom') return
+  profile.providerName = profile.name.trim()
+  profile.providerId = providerIdFromProfileName(profile.name, profile.id)
 }
 
 function serializeDraft(profile: CodexProfile, apiKeyInput: string, clearApiKey: boolean): string {
@@ -101,6 +135,9 @@ function serializeDraft(profile: CodexProfile, apiKeyInput: string, clearApiKey:
     providerName: profile.providerName,
     baseUrl: profile.baseUrl,
     wireApi: profile.wireApi,
+    protocolConversion: profile.protocolConversion,
+    chatUpstreamModel: profile.chatUpstreamModel,
+    promptCacheRouting: profile.promptCacheRouting,
     envKey: profile.envKey,
     modelCatalog: profile.modelCatalog,
     apiKeyInput,
@@ -109,11 +146,13 @@ function serializeDraft(profile: CodexProfile, apiKeyInput: string, clearApiKey:
 }
 
 export const useCodexConfigStore = defineStore('codexConfig', () => {
+  const appSettingsStore = useAppSettingsStore()
   const profiles = ref<CodexProfile[]>([])
   const order = ref<string[]>([])
   const activeProfileId = ref<string | null>(null)
   const globalProfileId = ref<string | null>(null)
   const globalProfileInSync = ref(false)
+  const globalSyncRepairRequired = ref(false)
   const selectedProfileId = ref<string | null>(null)
   const editingProfile = ref<CodexProfile>(emptyProfile())
   const apiKeyInput = ref('')
@@ -165,9 +204,14 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     apiKeyInput.value === revealedStoredApiKey.value ? '' : apiKeyInput.value,
   )
 
-  const isDirty = computed(() =>
-    serializeDraft(editingProfile.value, draftApiKeyInput.value, clearStoredApiKey.value) !== baseline.value,
-  )
+  const isDirty = computed(() => {
+    const expected = cloneProfile(editingProfile.value)
+    syncProviderIdentity(expected)
+    return serializeDraft(editingProfile.value, draftApiKeyInput.value, clearStoredApiKey.value)
+        !== baseline.value
+      || editingProfile.value.providerId !== expected.providerId
+      || editingProfile.value.providerName !== expected.providerName
+  })
 
   const authStatusLabel = computed(() => {
     if (authStatus.value.error) return `登录状态文件异常：${authStatus.value.error}`
@@ -190,7 +234,16 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
 
   function editProfile(profile: CodexProfile) {
     selectedProfileId.value = profile.id
-    editingProfile.value = cloneProfile(profile)
+    const cloned = cloneProfile(profile)
+    cloned.protocolConversion = Boolean(cloned.protocolConversion)
+    cloned.chatUpstreamModel = typeof cloned.chatUpstreamModel === 'string'
+      ? cloned.chatUpstreamModel
+      : ''
+    cloned.promptCacheRouting = cloned.promptCacheRouting === 'enabled'
+      || cloned.promptCacheRouting === 'disabled'
+      ? cloned.promptCacheRouting
+      : 'auto'
+    editingProfile.value = cloned
     resetApiKeyEditor()
     availableModels.value = []
     syncToGlobal.value = Boolean(profile.id && globalProfileId.value === profile.id)
@@ -207,19 +260,37 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     statusMessage.value = '已启用第三方 models.json 配置，模型字段沿用模板，请填写模型 slug'
   }
 
+  function disableModelCatalog() {
+    const models = editingProfile.value.modelCatalog?.models
+    const selectedModel = models?.find(model => model.slug === editingProfile.value.model.trim())
+      ?? models?.[0]
+    if (selectedModel?.slug.trim()) editingProfile.value.model = selectedModel.slug.trim()
+    editingProfile.value.modelCatalog = null
+    statusMessage.value = '已切换为不使用模型目录，默认模型将直接写入 CodeX profile'
+  }
+
   function syncModelCatalogDraft(profile: CodexProfile) {
     const models = profile.modelCatalog?.models
     if (!models || models.length === 0) return
+    const selectedModel = models.find(model => (
+      model.slug.trim() === profile.model.trim()
+      || model.displayName.trim() === profile.model.trim()
+    ))
+    const selectedModelName = selectedModel
+      ? (selectedModel.slug.trim() || selectedModel.displayName.trim())
+      : ''
     for (const model of models) {
       model.slug = model.slug.trim()
-      if (!model.displayName.trim()) model.displayName = model.slug
+      model.displayName = model.slug
+      model.maxContextWindow = model.contextWindow
       model.inputModalities = normalizeInputModalities(model.inputModalities)
       if (typeof model.supportsImageDetailOriginal !== 'boolean') {
         model.supportsImageDetailOriginal = false
       }
     }
-    const selectedModel = models.find(model => model.slug === profile.model.trim())
-    profile.model = selectedModel?.slug ?? models[0].slug
+    profile.model = selectedModelName && models.some(model => model.slug === selectedModelName)
+      ? selectedModelName
+      : models[0].slug
   }
 
   function addModel(slug: string): boolean {
@@ -228,11 +299,11 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     if (!models) return false
     const normalizedSlug = slug.trim()
     if (!normalizedSlug) {
-      statusMessage.value = '请输入模型 slug'
+      statusMessage.value = '请输入模型名称'
       return false
     }
     if (!/^[A-Za-z0-9._-]+$/.test(normalizedSlug)) {
-      statusMessage.value = '模型 slug 只能包含字母、数字、短横线、下划线和点'
+      statusMessage.value = '模型名称只能包含字母、数字、短横线、下划线和点'
       return false
     }
     if (models.some(model => model.slug === normalizedSlug)) {
@@ -281,6 +352,7 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
       : null
     globalProfileId.value = payload.globalProfileId
     globalProfileInSync.value = payload.globalProfileInSync
+    globalSyncRepairRequired.value = payload.globalSyncRepairRequired
     profilesPath.value = payload.profilesPath
     globalConfigPath.value = payload.globalConfigPath
     authPath.value = payload.authPath
@@ -315,6 +387,7 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
 
   async function loadProfiles(force = false) {
     if (loading.value || (loaded.value && !force)) return
+    const initialLoad = !loaded.value
     loading.value = true
     try {
       const payload = await invoke<CodexProfilesPayload>('load_codex_profiles')
@@ -322,6 +395,9 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
       loaded.value = true
       loadError.value = ''
       if (payload.globalConfigError) statusMessage.value = payload.globalConfigError
+      if (initialLoad && payload.globalSyncRepairRequired) {
+        void promptGlobalSyncRepair()
+      }
     } catch (error) {
       loaded.value = false
       loadError.value = `加载 CodeX 配置失败：${error}`
@@ -329,6 +405,29 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     } finally {
       loading.value = false
     }
+  }
+
+  async function promptGlobalSyncRepair(): Promise<void> {
+    const profile = (globalProfileId.value
+      && profiles.value.find(item => item.id === globalProfileId.value))
+      ?? profiles.value.find(item => item.id === selectedProfileId.value)
+      ?? orderedProfiles.value[0]
+    if (!profile) return
+
+    const shouldSync = await confirm(
+      '检测到 Codex 全局配置与启动器状态不一致，当前无法安全恢复协议转换代理。点击“同步”将使用当前配置重新写入并同步全局；点击“取消”仅关闭此提示，不修改配置。',
+      {
+        title: '需要重新同步 Codex 全局配置',
+        kind: 'warning',
+        okLabel: '同步',
+        cancelLabel: '取消',
+      },
+    )
+    if (!shouldSync) return
+
+    editProfile(profile)
+    syncToGlobal.value = true
+    await applyProfile()
   }
 
   async function ensureLoaded() {
@@ -367,7 +466,7 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     editProfile(profile)
     statusMessage.value = profileId === activeProfileId.value
       ? `CodeX 配置 '${profile.name}' 当前应用中`
-      : `已选择 CodeX 配置 '${profile.name}'，点击“应用此配置”后才会用于新启动的终端`
+      : ''
     return true
   }
 
@@ -375,6 +474,7 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     if (!(await confirmDiscardChanges('新建配置方案'))) return false
     selectedProfileId.value = null
     editingProfile.value = emptyProfile()
+    editingProfile.value.name = defaultProfileName()
     resetApiKeyEditor()
     availableModels.value = []
     syncToGlobal.value = false
@@ -384,11 +484,28 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
 
   async function saveProfile(): Promise<boolean> {
     if (saving.value || apiKeyRevealing.value) return false
+    const profile = cloneProfile(editingProfile.value)
+    if (!profile.id) profile.id = `profile-${crypto.randomUUID()}`
+    const previousProfile = profiles.value.find(item => item.id === profile.id)
+    const nameChanged = Boolean(previousProfile)
+      && previousProfile!.name.trim() !== profile.name.trim()
+    const isActiveProfile = profile.id === activeProfileId.value
+    const isGlobalProfile = profile.id === globalProfileId.value
+    if (nameChanged && (isActiveProfile || isGlobalProfile)) {
+      const appliedScopes = [
+        isActiveProfile ? '启动器当前应用' : '',
+        isGlobalProfile ? 'Codex 全局配置' : '',
+      ].filter(Boolean).join('和')
+      await message(
+        `当前配置正在${appliedScopes}中，不能直接改名。改名会破坏配置与 Provider 的关联。请先将其他配置应用到对应范围，使当前配置不再处于应用状态，然后再修改名称并保存。`,
+        { title: '无法修改已应用配置名称', kind: 'warning' },
+      )
+      return false
+    }
     saving.value = true
     const requestedGlobalSync = syncToGlobal.value
-    const profile = cloneProfile(editingProfile.value)
+    syncProviderIdentity(profile)
     syncModelCatalogDraft(profile)
-    if (!profile.id) profile.id = `profile-${crypto.randomUUID()}`
     const nextOrder = order.value.includes(profile.id) ? [...order.value] : [...order.value, profile.id]
     const apiKeyForSave = apiKeyInput.value === revealedStoredApiKey.value
       ? null
@@ -447,6 +564,31 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     if (!profile || isDirty.value || applying.value || apiKeyRevealing.value) return false
     const applyToGlobal = syncToGlobal.value
       && (profile.authMode === 'official' || customGlobalSyncSupported.value)
+    let protocolConversionWithoutTray = false
+
+    if (profile.protocolConversion && profile.authMode === 'custom') {
+      await appSettingsStore.load()
+      if (!appSettingsStore.minimizeToTray) {
+        const shouldEnable = await confirm(
+          '协议转换代理需要在应用关闭后继续运行。建议开启“关闭时最小化到托盘”，以免关闭启动器后代理停止。点击“确定”自动开启；点击“取消”保持关闭。',
+          {
+            title: '建议开启关闭时最小化到托盘',
+            kind: 'warning',
+            okLabel: '确定',
+            cancelLabel: '取消',
+          },
+        )
+        if (shouldEnable) {
+          try {
+            await appSettingsStore.setMinimizeToTray(true)
+          } catch (error) {
+            statusMessage.value = `关闭时最小化到托盘设置保存失败：${error}`
+          }
+        }
+        protocolConversionWithoutTray = !appSettingsStore.minimizeToTray
+      }
+    }
+
     if (profile.id === activeProfileId.value
       && (!applyToGlobal
         || (profile.id === globalProfileId.value && globalProfileInSync.value))) return true
@@ -478,8 +620,11 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
         statusMessage.value = `CodeX 配置 '${profile.name}' 已同步到启动器和全局；外部 CodeX 仍需自行设置 ${profile.envKey}`
       } else {
         statusMessage.value = applyToGlobal
-          ? `CodeX 配置 '${profile.name}' 已应用到启动器和全局；重启外部终端及 CodeX 桌面端后生效`
+          ? `CodeX 配置 '${profile.name}' 已应用到启动器和全局；请完全退出（含后台）并重新打开外部终端及 CodeX 桌面端后生效`
           : `CodeX 配置 '${profile.name}' 已应用；新启动或重新打开的 CodeX 终端将使用该配置`
+      }
+      if (protocolConversionWithoutTray) {
+        statusMessage.value += '；注意：关闭时最小化到托盘未开启，关闭启动器后协议转换代理将停止'
       }
       return true
     } catch (error) {
@@ -629,11 +774,13 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     activeProfileId,
     globalProfileId,
     globalProfileInSync,
+    globalSyncRepairRequired,
     selectedProfileId,
     activeProfile,
     activeProfileRef,
     editingProfile,
     enableModelCatalog,
+    disableModelCatalog,
     addModel,
     removeModel,
     setDefaultModel,

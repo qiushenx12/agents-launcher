@@ -177,6 +177,7 @@ const safeDiagnostic = computed(() => JSON.stringify(redactConfigRecord({
     managedProfileName: appliedCodexProfile.value?.managedProfileName || null,
     globalProfileId: codexStore.globalProfileId,
     globalProfileInSync: codexStore.globalProfileInSync,
+    globalSyncRepairRequired: codexStore.globalSyncRepairRequired,
     globalProfileName: globalCodexProfile.value?.name || null,
     authMode: appliedCodexProfile.value?.authMode || null,
     model: appliedCodexProfile.value?.model || null,

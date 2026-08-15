@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -26,6 +26,19 @@ const CODEX_STATE_VERSION: u32 = 1;
 const CODEX_STATE_KEY: &str = "codex";
 const MANAGED_PROFILE_PREFIX: &str = "agents-launcher-";
 const LEGACY_MANAGED_PROFILE_PREFIX: &str = "cc-launcher-";
+const CODEX_HOME_ENV: &str = "CODEX_HOME";
+const CODEX_SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
+const CODEX_DESKTOP_STATE_FILE: &str = ".codex-global-state.json";
+const DESKTOP_PROJECT_STATE_MIGRATION_FILE: &str =
+    ".agents-launcher-project-state-migration-v1.json";
+const DESKTOP_PROJECT_ARRAY_KEYS: [&str; 3] = [
+    "electron-saved-workspace-roots",
+    "project-order",
+    "active-workspace-roots",
+];
+const DESKTOP_PROJECT_OBJECT_KEYS: [&str; 2] =
+    ["local-projects", "electron-workspace-root-labels"];
+const DESKTOP_PROJECT_VALUE_KEYS: [&str; 1] = ["selected-project"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +148,19 @@ pub struct CodexProfile {
     pub base_url: String,
     #[serde(default = "default_wire_api")]
     pub wire_api: String,
+    /// 协议转换开关：启用后启动 CodeX 终端时把 API 地址改写为本机转换代理
+    /// （Codex Responses ↔ Chat Completions），用于仅支持 Chat Completions
+    /// 的服务（如 Kimi For Coding）。仅对 Custom 模式生效。
+    #[serde(default)]
+    pub protocol_conversion: bool,
+    /// Real model ID sent to a Chat Completions upstream when the Codex model
+    /// slug is only a client-facing/catalog identifier.
+    #[serde(default)]
+    pub chat_upstream_model: String,
+    /// Prompt-cache routing policy for the Responses -> Chat proxy.
+    /// `auto` only enables the field for known compatible endpoints.
+    #[serde(default = "default_prompt_cache_routing")]
+    pub prompt_cache_routing: String,
     #[serde(default = "default_env_key")]
     pub env_key: String,
     #[serde(default)]
@@ -153,6 +179,10 @@ fn default_wire_api() -> String {
 
 fn default_env_key() -> String {
     "OPENAI_API_KEY".to_string()
+}
+
+fn default_prompt_cache_routing() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -228,6 +258,7 @@ pub struct CodexProfilesPayload {
     pub active_profile_id: Option<String>,
     pub global_profile_id: Option<String>,
     pub global_profile_in_sync: bool,
+    pub global_sync_repair_required: bool,
     pub profiles_path: String,
     pub global_config_path: String,
     pub auth_path: String,
@@ -335,9 +366,55 @@ fn global_env_path() -> Result<PathBuf, String> {
     Ok(codex_data_dir()?.join("global-env.bin"))
 }
 
+fn global_codex_home_env_path() -> Result<PathBuf, String> {
+    Ok(codex_data_dir()?.join("global-codex-home-env.bin"))
+}
+
+fn managed_homes_dir() -> Result<PathBuf, String> {
+    Ok(codex_data_dir()?.join("homes"))
+}
+
+fn profile_home(profile_id: &str) -> Result<PathBuf, String> {
+    if profile_id.is_empty()
+        || !profile_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+        })
+    {
+        return Err("CodeX profile ID 含有不支持的字符".to_string());
+    }
+    Ok(managed_homes_dir()?.join(profile_id))
+}
+
+fn path_is_managed_profile_home(path: &Path) -> bool {
+    managed_homes_dir().is_ok_and(|homes| path.starts_with(homes))
+}
+
 fn codex_home() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
-        if !path.as_os_str().is_empty() {
+    // Once a profile has been synchronized for the desktop app, this process
+    // may itself inherit that managed CODEX_HOME on the next launch. Keep the
+    // original user home as the migration/bootstrap source instead of
+    // recursively treating one isolated profile as the shared source.
+    #[cfg(windows)]
+    if let Ok(Some(record)) = load_managed_global_codex_home_env() {
+        if let Ok(Some(current)) = read_user_env_var(CODEX_HOME_ENV) {
+            let current_path = PathBuf::from(&current);
+            if current != record.applied_value
+                && !current.is_empty()
+                && !path_is_managed_profile_home(&current_path)
+            {
+                return Ok(current_path);
+            }
+        }
+        if let Some(previous) = record.previous_value.filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(previous));
+        }
+        return dirs::home_dir()
+            .map(|path| path.join(".codex"))
+            .ok_or_else(|| "无法确定 CODEX_HOME".to_string());
+    }
+
+    if let Some(path) = std::env::var_os(CODEX_HOME_ENV).map(PathBuf::from) {
+        if !path.as_os_str().is_empty() && !path_is_managed_profile_home(&path) {
             return Ok(path);
         }
     }
@@ -346,12 +423,48 @@ fn codex_home() -> Result<PathBuf, String> {
         .ok_or_else(|| "无法确定 CODEX_HOME".to_string())
 }
 
+fn global_config_path_for_profile(profile_id: &str) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        return Ok(profile_home(profile_id)?.join("config.toml"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = profile_id;
+        Ok(codex_home()?.join("config.toml"))
+    }
+}
+
 fn global_config_path() -> Result<PathBuf, String> {
-    Ok(codex_home()?.join("config.toml"))
+    let state = load_profile_state()?;
+    match state.global_profile_id.as_deref() {
+        Some(profile_id) => global_config_path_for_profile(profile_id),
+        None => Ok(codex_home()?.join("config.toml")),
+    }
 }
 
 fn auth_path() -> Result<PathBuf, String> {
-    Ok(codex_home()?.join("auth.json"))
+    let state = load_profile_state()?;
+    let index = load_profile_index_state(CODEX_STATE_KEY)?;
+    let official_profile_id = index
+        .active_profile_id
+        .as_deref()
+        .filter(|profile_id| {
+            state.profiles.iter().any(|profile| {
+                profile.id == *profile_id && profile.auth_mode == CodexAuthMode::Official
+            })
+        })
+        .or_else(|| {
+            state.global_profile_id.as_deref().filter(|profile_id| {
+                state.profiles.iter().any(|profile| {
+                    profile.id == *profile_id && profile.auth_mode == CodexAuthMode::Official
+                })
+            })
+        });
+    match official_profile_id {
+        Some(profile_id) => Ok(profile_home(profile_id)?.join("auth.json")),
+        None => Ok(codex_home()?.join("auth.json")),
+    }
 }
 
 fn managed_profile_name(profile_id: &str) -> String {
@@ -361,8 +474,54 @@ fn managed_profile_name(profile_id: &str) -> String {
     )
 }
 
+fn provider_id_from_profile_name(name: &str, fallback: &str) -> String {
+    let mut provider_id = String::new();
+    let mut needs_separator = false;
+    for character in name.trim().chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+            if needs_separator
+                && !provider_id.is_empty()
+                && !provider_id.ends_with('-')
+                && !provider_id.ends_with('_')
+            {
+                provider_id.push('_');
+            }
+            provider_id.push(character);
+            needs_separator = false;
+        } else if !provider_id.is_empty() {
+            needs_separator = true;
+        }
+    }
+    while provider_id.ends_with('-') || provider_id.ends_with('_') {
+        provider_id.pop();
+    }
+    if provider_id.is_empty() {
+        return fallback.to_string();
+    }
+    if matches!(
+        provider_id.to_ascii_lowercase().as_str(),
+        "openai" | "ollama" | "lmstudio"
+    ) {
+        return format!("{provider_id}_custom");
+    }
+    provider_id
+}
+
+fn sync_provider_identity(profile: &mut CodexProfile) {
+    if profile.auth_mode == CodexAuthMode::Custom {
+        profile.provider_id = provider_id_from_profile_name(&profile.name, &profile.id);
+        profile.provider_name = profile.name.clone();
+    } else {
+        profile.provider_id.clear();
+        profile.provider_name.clear();
+    }
+}
+
 fn managed_profile_path(profile_id: &str) -> Result<PathBuf, String> {
-    Ok(codex_home()?.join(format!("{}.config.toml", managed_profile_name(profile_id))))
+    Ok(profile_home(profile_id)?.join(format!(
+        "{}.config.toml",
+        managed_profile_name(profile_id)
+    )))
 }
 
 fn legacy_managed_profile_path_at(codex_home: &Path, profile_id: &str) -> PathBuf {
@@ -373,10 +532,39 @@ fn legacy_managed_profile_path_at(codex_home: &Path, profile_id: &str) -> PathBu
     ))
 }
 
-fn migrate_legacy_managed_profile(profile_id: &str, target: &Path) -> Result<(), String> {
-    migrate_legacy_managed_profile_at(profile_id, target, &codex_home()?)
+fn shared_managed_profile_path_at(codex_home: &Path, profile_id: &str) -> PathBuf {
+    codex_home.join(format!("{}.config.toml", managed_profile_name(profile_id)))
 }
 
+fn copy_valid_toml_if_missing(source: &Path, target: &Path, label: &str) -> Result<(), String> {
+    if target.exists() || !source.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(source)
+        .map_err(|error| format!("无法读取{label} {}：{error}", source.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("{label}不是 UTF-8：{error}"))?;
+    DocumentMut::from_str(text).map_err(|error| format!("{label}无法解析：{error}"))?;
+    write_toml_atomic(target, &bytes)
+}
+
+fn migrate_managed_profile_to_home(profile_id: &str, target: &Path) -> Result<(), String> {
+    if target.exists() {
+        return Ok(());
+    }
+    let shared_home = codex_home()?;
+    let current = shared_managed_profile_path_at(&shared_home, profile_id);
+    copy_valid_toml_if_missing(&current, target, "旧版 CodeX profile")?;
+    if target.exists() {
+        return Ok(());
+    }
+    let legacy = legacy_managed_profile_path_at(&shared_home, profile_id);
+    // The isolated-home migration is deliberately copy-only. The shared
+    // profile remains as a recovery source until the user removes it.
+    copy_valid_toml_if_missing(&legacy, target, "旧版 CodeX profile")
+}
+
+#[cfg(test)]
 fn migrate_legacy_managed_profile_at(
     profile_id: &str,
     target: &Path,
@@ -403,6 +591,407 @@ fn migrate_legacy_managed_profile_at(
     }
     remove_if_exists(&legacy)?;
     remove_transaction_sidecars(&legacy)?;
+    Ok(())
+}
+
+fn copy_json_file_if_missing(source: &Path, target: &Path, label: &str) -> Result<(), String> {
+    if target.exists() || !source.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(source)
+        .map_err(|error| format!("无法读取{label} {}：{error}", source.display()))?;
+    serde_json::from_slice::<Value>(&bytes)
+        .map_err(|error| format!("{label}无法解析：{error}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        return write_private_json_atomic(target, &bytes, label);
+    }
+    #[cfg(not(target_os = "macos"))]
+    write_json_atomic(target, &bytes, label)
+}
+
+fn merge_desktop_project_state(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+) -> bool {
+    let mut changed = false;
+
+    for key in DESKTOP_PROJECT_ARRAY_KEYS {
+        let Some(source_items) = source.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        match target.get_mut(key) {
+            Some(Value::Array(target_items)) => {
+                for item in source_items {
+                    if !target_items.contains(item) {
+                        target_items.push(item.clone());
+                        changed = true;
+                    }
+                }
+            }
+            Some(Value::Null) | None => {
+                target.insert(key.to_string(), Value::Array(source_items.clone()));
+                changed = true;
+            }
+            Some(_) => {}
+        }
+    }
+
+    for key in DESKTOP_PROJECT_OBJECT_KEYS {
+        let Some(source_entries) = source.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        match target.get_mut(key) {
+            Some(Value::Object(target_entries)) => {
+                for (entry_key, entry_value) in source_entries {
+                    if !target_entries.contains_key(entry_key) {
+                        target_entries.insert(entry_key.clone(), entry_value.clone());
+                        changed = true;
+                    }
+                }
+            }
+            Some(Value::Null) | None => {
+                target.insert(key.to_string(), Value::Object(source_entries.clone()));
+                changed = true;
+            }
+            Some(_) => {}
+        }
+    }
+
+    for key in DESKTOP_PROJECT_VALUE_KEYS {
+        let Some(source_value) = source.get(key) else {
+            continue;
+        };
+        let should_copy = match target.get(key) {
+            None | Some(Value::Null) => true,
+            Some(Value::Array(items)) => items.is_empty(),
+            Some(Value::Object(entries)) => entries.is_empty(),
+            Some(Value::String(value)) => value.is_empty(),
+            Some(_) => false,
+        };
+        if should_copy {
+            target.insert(key.to_string(), source_value.clone());
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn migrate_desktop_project_state(
+    shared_home: &Path,
+    isolated_home: &Path,
+) -> Result<(), String> {
+    if shared_home == isolated_home {
+        return Ok(());
+    }
+    let marker = isolated_home.join(DESKTOP_PROJECT_STATE_MIGRATION_FILE);
+    if marker.exists() {
+        return Ok(());
+    }
+    let source_path = shared_home.join(CODEX_DESKTOP_STATE_FILE);
+    if !source_path.exists() {
+        return Ok(());
+    }
+    let source_bytes = fs::read(&source_path).map_err(|error| {
+        format!(
+            "无法读取旧 CodeX 桌面项目状态 {}：{error}",
+            source_path.display()
+        )
+    })?;
+    let source_value: Value = serde_json::from_slice(&source_bytes)
+        .map_err(|error| format!("旧 CodeX 桌面项目状态无法解析：{error}"))?;
+    let source = source_value
+        .as_object()
+        .ok_or_else(|| "旧 CodeX 桌面项目状态不是 JSON 对象".to_string())?;
+
+    let target_path = isolated_home.join(CODEX_DESKTOP_STATE_FILE);
+    let target_existed = target_path.exists();
+    let mut target_value = if target_existed {
+        let target_bytes = match fs::read(&target_path) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                // Codex Desktop holds this file open while it is running. Do
+                // not make profile loading fail; leave the marker absent so a
+                // later launcher refresh can retry after Desktop exits.
+                eprintln!(
+                    "CodeX 桌面项目状态正在使用，暂缓迁移 {}：{error}",
+                    target_path.display()
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "无法读取隔离的 CodeX 桌面项目状态 {}：{error}",
+                    target_path.display()
+                ));
+            }
+        };
+        serde_json::from_slice(&target_bytes)
+            .map_err(|error| format!("隔离的 CodeX 桌面项目状态无法解析：{error}"))?
+    } else {
+        Value::Object(Map::new())
+    };
+    let target = target_value
+        .as_object_mut()
+        .ok_or_else(|| "隔离的 CodeX 桌面项目状态不是 JSON 对象".to_string())?;
+
+    if merge_desktop_project_state(source, target) {
+        let bytes = serde_json::to_vec(&target_value)
+            .map_err(|error| format!("无法序列化 CodeX 桌面项目状态：{error}"))?;
+        if let Err(error) = write_json_atomic(&target_path, &bytes, "CodeX 桌面项目状态") {
+            if target_existed {
+                // A running Desktop process can allow reads but deny the
+                // atomic rename. Retry later without breaking profile loading.
+                eprintln!(
+                    "CodeX 桌面项目状态暂时无法写入，稍后重试 {}：{error}",
+                    target_path.display()
+                );
+                return Ok(());
+            }
+            return Err(error);
+        }
+    }
+
+    write_json_atomic(
+        &marker,
+        br#"{"version":1}"#,
+        "CodeX 桌面项目状态迁移标记",
+    )
+}
+
+fn copy_file_if_missing(source: &Path, target: &Path) -> Result<(), String> {
+    if target.exists() || !source.is_file() {
+        return Ok(());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("迁移目标没有父目录：{}", target.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建 CodeX 会话迁移目录：{error}"))?;
+    let temporary = sidecar_path(target, "migration-tmp");
+    if temporary.exists() {
+        remove_if_exists(&temporary)?;
+    }
+    fs::copy(source, &temporary)
+        .map_err(|error| format!("无法复制 CodeX 会话 {}：{error}", source.display()))?;
+    match fs::rename(&temporary, target) {
+        Ok(()) => Ok(()),
+        Err(_) if target.exists() => remove_if_exists(&temporary),
+        Err(error) => {
+            let _ = remove_if_exists(&temporary);
+            Err(format!("无法发布迁移后的 CodeX 会话：{error}"))
+        }
+    }
+}
+
+fn copy_static_tree_if_missing(source_root: &Path, target_root: &Path) -> Result<(), String> {
+    if !source_root.is_dir() {
+        return Ok(());
+    }
+    let mut pending = vec![source_root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            format!("无法读取 CodeX 静态资源目录 {}：{error}", directory.display())
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("无法读取 CodeX 静态资源：{error}"))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("无法读取 CodeX 静态资源类型：{error}"))?;
+            let relative = path
+                .strip_prefix(source_root)
+                .map_err(|error| format!("无法计算 CodeX 静态资源相对路径：{error}"))?;
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() {
+                copy_file_if_missing(&path, &target_root.join(relative))?;
+            }
+            // Do not follow links from a user-controlled Codex home.
+        }
+    }
+    Ok(())
+}
+
+fn rollout_identity(path: &Path) -> Option<(String, String)> {
+    let file = fs::File::open(path).ok()?;
+    let first_line = BufReader::new(file).lines().next()?.ok()?;
+    let envelope: Value = serde_json::from_str(first_line.trim_start_matches('\u{feff}')).ok()?;
+    if envelope.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = envelope.get("payload")?;
+    let id = payload.get("id")?.as_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let provider = payload
+        .get("model_provider")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("openai");
+    Some((id.to_string(), provider.to_string()))
+}
+
+fn migrate_rollout_tree(
+    source_root: &Path,
+    target_root: &Path,
+    model_provider: &str,
+    migrated_ids: &mut HashSet<String>,
+) -> Result<(), String> {
+    if !source_root.is_dir() {
+        return Ok(());
+    }
+    let mut pending = vec![source_root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            format!("无法读取 CodeX 会话目录 {}：{error}", directory.display())
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("无法读取 CodeX 会话条目：{error}"))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("无法读取 CodeX 会话类型：{error}"))?;
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !file_type.is_file() || path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some((id, provider)) = rollout_identity(&path) else {
+                continue;
+            };
+            if provider != model_provider {
+                continue;
+            }
+            let relative = path.strip_prefix(source_root).map_err(|error| {
+                format!("无法计算 CodeX 会话相对路径：{error}")
+            })?;
+            copy_file_if_missing(&path, &target_root.join(relative))?;
+            migrated_ids.insert(id);
+        }
+    }
+    Ok(())
+}
+
+fn merge_filtered_jsonl(
+    source: &Path,
+    target: &Path,
+    id_field: &str,
+    allowed_ids: &HashSet<String>,
+) -> Result<(), String> {
+    if !source.exists() || allowed_ids.is_empty() {
+        return Ok(());
+    }
+    let mut lines = Vec::new();
+    let mut seen = HashSet::new();
+    if target.exists() {
+        let file = fs::File::open(target)
+            .map_err(|error| format!("无法读取迁移后的 CodeX 索引：{error}"))?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|error| format!("无法读取 CodeX 索引行：{error}"))?;
+            if seen.insert(line.clone()) {
+                lines.push(line);
+            }
+        }
+    }
+    let file = fs::File::open(source)
+        .map_err(|error| format!("无法读取旧 CodeX 索引 {}：{error}", source.display()))?;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| format!("无法读取旧 CodeX 索引行：{error}"))?;
+        let include = serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}'))
+            .ok()
+            .and_then(|value| value.get(id_field).and_then(Value::as_str).map(str::to_string))
+            .is_some_and(|id| allowed_ids.contains(&id));
+        if include && seen.insert(line.clone()) {
+            lines.push(line);
+        }
+    }
+    let mut bytes = lines.join("\n").into_bytes();
+    if !bytes.is_empty() {
+        bytes.push(b'\n');
+    }
+    write_raw_atomic(target, &bytes, "CodeX 隔离会话索引")
+}
+
+fn profile_model_provider(profile: &CodexProfile) -> &str {
+    match profile.auth_mode {
+        CodexAuthMode::Official => "openai",
+        CodexAuthMode::Custom => profile.provider_id.as_str(),
+    }
+}
+
+fn prepare_isolated_profile_home(profile: &CodexProfile) -> Result<(), String> {
+    let shared_home = codex_home()?;
+    let isolated_home = profile_home(&profile.id)?;
+    fs::create_dir_all(&isolated_home)
+        .map_err(|error| format!("无法创建 CodeX 隔离目录：{error}"))?;
+
+    copy_valid_toml_if_missing(
+        &shared_home.join("config.toml"),
+        &isolated_home.join("config.toml"),
+        "旧版 CodeX 全局配置",
+    )?;
+    migrate_managed_profile_to_home(&profile.id, &managed_profile_path(&profile.id)?)?;
+
+    if profile.auth_mode == CodexAuthMode::Official {
+        copy_json_file_if_missing(
+            &shared_home.join("auth.json"),
+            &isolated_home.join("auth.json"),
+            "CodeX 登录凭据",
+        )?;
+    }
+
+    // Project roots and project ordering are Desktop preferences, not thread
+    // data. Carry those preferences into every isolated home while explicitly
+    // leaving thread assignments, drafts, prompt history, and client bindings
+    // behind in the shared state file.
+    migrate_desktop_project_state(&shared_home, &isolated_home)?;
+
+    // Keep user instructions, rules, and small skill definitions available in
+    // each isolated home. Plugin caches are intentionally not duplicated;
+    // the copied config retains marketplace/plugin declarations and Codex can
+    // rebuild those large caches per home when needed.
+    copy_file_if_missing(
+        &shared_home.join("AGENTS.md"),
+        &isolated_home.join("AGENTS.md"),
+    )?;
+    for directory in ["skills", "rules"] {
+        copy_static_tree_if_missing(
+            &shared_home.join(directory),
+            &isolated_home.join(directory),
+        )?;
+    }
+
+    let mut migrated_ids = HashSet::new();
+    for directory in ["sessions", "archived_sessions"] {
+        migrate_rollout_tree(
+            &shared_home.join(directory),
+            &isolated_home.join(directory),
+            profile_model_provider(profile),
+            &mut migrated_ids,
+        )?;
+    }
+    merge_filtered_jsonl(
+        &shared_home.join("session_index.jsonl"),
+        &isolated_home.join("session_index.jsonl"),
+        "id",
+        &migrated_ids,
+    )?;
+    merge_filtered_jsonl(
+        &shared_home.join("history.jsonl"),
+        &isolated_home.join("history.jsonl"),
+        "session_id",
+        &migrated_ids,
+    )?;
     Ok(())
 }
 
@@ -499,15 +1088,8 @@ fn normalize_model_catalog(
             .find(|template| template.slug == model.slug)
             .or_else(|| template_catalog.models.first())
             .ok_or_else(|| "DeepSeek models.json template has no models".to_string())?;
-        if model.display_name.trim().is_empty() {
-            model.display_name = if model.slug == template.slug {
-                template.display_name.clone()
-            } else {
-                model.slug.clone()
-            };
-        } else {
-            model.display_name = model.display_name.trim().to_string();
-        }
+        model.display_name = model.slug.clone();
+        model.max_context_window = model.context_window;
         let mut modalities = Vec::with_capacity(model.input_modalities.len() + 1);
         for modality in model.input_modalities.drain(..) {
             let modality = modality.trim().to_ascii_lowercase();
@@ -701,12 +1283,22 @@ fn normalize_profile(mut profile: CodexProfile) -> Result<CodexProfile, String> 
     {
         return Err("CodeX profile ID 含有不支持的字符".to_string());
     }
+    sync_provider_identity(&mut profile);
     profile.managed_profile_name = managed_profile_name(&profile.id);
     profile.model = profile.model.trim().to_string();
     profile.reasoning_effort = profile.reasoning_effort.trim().to_string();
+    profile.chat_upstream_model = profile.chat_upstream_model.trim().to_string();
+    profile.prompt_cache_routing = profile.prompt_cache_routing.trim().to_ascii_lowercase();
+    if profile.prompt_cache_routing.is_empty() {
+        profile.prompt_cache_routing = default_prompt_cache_routing();
+    }
+    if !matches!(
+        profile.prompt_cache_routing.as_str(),
+        "auto" | "enabled" | "disabled"
+    ) {
+        return Err("prompt cache routing 只能是 auto、enabled 或 disabled".to_string());
+    }
     profile.openai_base_url = profile.openai_base_url.trim().to_string();
-    profile.provider_id = profile.provider_id.trim().to_string();
-    profile.provider_name = profile.provider_name.trim().to_string();
     profile.base_url = profile.base_url.trim().to_string();
     profile.env_key = profile.env_key.trim().to_string();
     profile.wire_api = profile.wire_api.trim().to_string();
@@ -766,6 +1358,12 @@ fn normalize_profile(mut profile: CodexProfile) -> Result<CodexProfile, String> 
             {
                 return Err("API Key 环境变量名只能包含字母、数字和下划线".to_string());
             }
+            if matches!(
+                profile.env_key.to_ascii_uppercase().as_str(),
+                CODEX_HOME_ENV | CODEX_SQLITE_HOME_ENV
+            ) {
+                return Err("API Key 环境变量名不能使用 CODEX_HOME 或 CODEX_SQLITE_HOME".to_string());
+            }
         }
     }
     Ok(profile)
@@ -777,6 +1375,26 @@ fn validate_http_url(value: &str, label: &str) -> Result<(), String> {
         return Err(format!("{label} 必须使用 http 或 https"));
     }
     Ok(())
+}
+
+fn profile_rename_block_reason(
+    previous_profile: Option<&CodexProfile>,
+    next_profile: &CodexProfile,
+    active_profile_id: Option<&str>,
+    global_profile_id: Option<&str>,
+) -> Option<&'static str> {
+    let previous_profile = previous_profile?;
+    if previous_profile.name.trim() == next_profile.name.trim() {
+        return None;
+    }
+    let is_active = active_profile_id == Some(next_profile.id.as_str());
+    let is_global = global_profile_id == Some(next_profile.id.as_str());
+    match (is_active, is_global) {
+        (true, true) => Some("启动器当前应用和 Codex 全局配置"),
+        (true, false) => Some("启动器当前应用"),
+        (false, true) => Some("Codex 全局配置"),
+        (false, false) => None,
+    }
 }
 
 fn set_optional_string(document: &mut DocumentMut, key: &str, value_text: &str) {
@@ -906,11 +1524,12 @@ fn configure_provider_credentials(
     Ok(())
 }
 
-fn build_profile_toml_with_model_catalog_restore(
+fn build_codex_toml_with_model_catalog_restore(
     existing: Option<&str>,
     previous_managed_provider_id: Option<&str>,
     profile: &CodexProfile,
     restored_model_catalog_json: Option<&Option<String>>,
+    remove_previous_provider: bool,
 ) -> Result<String, String> {
     let mut document = match existing {
         Some(raw) => DocumentMut::from_str(raw)
@@ -924,6 +1543,7 @@ fn build_profile_toml_with_model_catalog_restore(
         "model_reasoning_effort",
         &profile.reasoning_effort,
     );
+    document["sqlite_home"] = value(profile_home(&profile.id)?.to_string_lossy().to_string());
     let model_catalog_path = if profile.auth_mode == CodexAuthMode::Custom
         && profile.model_catalog.is_some()
     {
@@ -938,10 +1558,13 @@ fn build_profile_toml_with_model_catalog_restore(
     };
     set_optional_string(&mut document, "model_catalog_json", &model_catalog_path);
 
-    if let Some(previous_provider_id) = previous_managed_provider_id {
-        if profile.auth_mode != CodexAuthMode::Custom || previous_provider_id != profile.provider_id
-        {
-            remove_provider(&mut document, previous_provider_id);
+    if remove_previous_provider {
+        if let Some(previous_provider_id) = previous_managed_provider_id {
+            if profile.auth_mode != CodexAuthMode::Custom
+                || previous_provider_id != profile.provider_id
+            {
+                remove_provider(&mut document, previous_provider_id);
+            }
         }
     }
 
@@ -981,6 +1604,21 @@ fn build_profile_toml_with_model_catalog_restore(
     Ok(rendered)
 }
 
+fn build_profile_toml_with_model_catalog_restore(
+    existing: Option<&str>,
+    previous_managed_provider_id: Option<&str>,
+    profile: &CodexProfile,
+    restored_model_catalog_json: Option<&Option<String>>,
+) -> Result<String, String> {
+    build_codex_toml_with_model_catalog_restore(
+        existing,
+        previous_managed_provider_id,
+        profile,
+        restored_model_catalog_json,
+        true,
+    )
+}
+
 #[cfg(test)]
 fn build_profile_toml(
     existing: Option<&str>,
@@ -1001,7 +1639,13 @@ fn build_global_toml(
     previous_managed_provider_id: Option<&str>,
     profile: &CodexProfile,
 ) -> Result<String, String> {
-    build_profile_toml(existing, previous_managed_provider_id, profile)
+    build_codex_toml_with_model_catalog_restore(
+        existing,
+        previous_managed_provider_id,
+        profile,
+        None,
+        false,
+    )
 }
 
 fn build_global_toml_with_model_catalog_restore(
@@ -1010,12 +1654,94 @@ fn build_global_toml_with_model_catalog_restore(
     profile: &CodexProfile,
     restored_model_catalog_json: Option<&Option<String>>,
 ) -> Result<String, String> {
-    build_profile_toml_with_model_catalog_restore(
+    // Global config is also used to reopen historical sessions. Keep old
+    // managed providers there even when model_provider switches to a new
+    // default, otherwise Codex cannot parse rollouts that reference them.
+    build_codex_toml_with_model_catalog_restore(
         existing,
         previous_managed_provider_id,
         profile,
         restored_model_catalog_json,
+        false,
     )
+}
+
+fn merge_missing_provider_item(
+    target: &mut DocumentMut,
+    source: &DocumentMut,
+    provider_id: &str,
+) -> Result<bool, String> {
+    let Some(source_provider) = source
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(provider_id))
+        .cloned()
+    else {
+        return Ok(false);
+    };
+
+    let target_has_provider = target
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .is_some_and(|providers| providers.contains_key(provider_id));
+    if target_has_provider {
+        return Ok(false);
+    }
+
+    let providers = target
+        .as_table_mut()
+        .entry("model_providers")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| "model_providers 不是 TOML 表".to_string())?;
+    providers.insert(provider_id, source_provider);
+    Ok(true)
+}
+
+/// Restore provider definitions needed to parse historical rollouts after an
+/// older launcher version removed the previous global provider on switch.
+fn restore_missing_managed_global_providers(
+    raw: &str,
+    state: &CodexProfileState,
+) -> Result<Option<String>, String> {
+    let mut document = DocumentMut::from_str(raw)
+        .map_err(|error| format!("全局 config.toml 无法解析：{error}"))?;
+    let candidate_profiles = state
+        .profiles
+        .iter()
+        .filter(|profile| profile.auth_mode == CodexAuthMode::Custom)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut changed = false;
+
+    for profile in candidate_profiles {
+        let provider_exists = document
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .is_some_and(|providers| providers.contains_key(profile.provider_id.as_str()));
+        if provider_exists {
+            continue;
+        }
+
+        let profile_path = managed_profile_path(&profile.id)?;
+        let Ok(profile_raw) = fs::read_to_string(profile_path) else {
+            continue;
+        };
+        let Ok(profile_document) = DocumentMut::from_str(&profile_raw) else {
+            continue;
+        };
+        if merge_missing_provider_item(&mut document, &profile_document, &profile.provider_id)? {
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    let rendered = document.to_string();
+    DocumentMut::from_str(&rendered)
+        .map_err(|error| format!("修复后的全局 config.toml 校验失败：{error}"))?;
+    Ok(Some(rendered))
 }
 
 fn managed_provider_id(profile: &CodexProfile) -> Option<&str> {
@@ -1559,25 +2285,44 @@ fn load_managed_global_env() -> Result<Option<ManagedGlobalEnv>, String> {
 
     #[cfg(windows)]
     {
-        let path = global_env_path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let encrypted =
-            fs::read(&path).map_err(|error| format!("无法读取 CodeX 全局环境变量记录：{error}"))?;
-        let json = unprotect_secret(&encrypted)?;
-        serde_json::from_str(&json)
-            .map(Some)
-            .map_err(|error| format!("CodeX 全局环境变量记录无法解析：{error}"))
+        load_managed_env_at(&global_env_path()?, "CodeX 全局环境变量")
     }
 }
 
 #[cfg(windows)]
-fn save_managed_global_env(record: &ManagedGlobalEnv) -> Result<(), String> {
+fn load_managed_env_at(path: &Path, label: &str) -> Result<Option<ManagedGlobalEnv>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let encrypted = fs::read(path).map_err(|error| format!("无法读取{label}记录：{error}"))?;
+    let json = unprotect_secret(&encrypted)?;
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|error| format!("{label}记录无法解析：{error}"))
+}
+
+fn load_managed_global_codex_home_env() -> Result<Option<ManagedGlobalEnv>, String> {
+    #[cfg(windows)]
+    {
+        return load_managed_env_at(
+            &global_codex_home_env_path()?,
+            "CodeX 全局 CODEX_HOME 环境变量",
+        );
+    }
+    #[cfg(not(windows))]
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn save_managed_env_at(
+    path: &Path,
+    label: &str,
+    record: &ManagedGlobalEnv,
+) -> Result<(), String> {
     let json = serde_json::to_string(record)
-        .map_err(|error| format!("无法序列化 CodeX 全局环境变量记录：{error}"))?;
+        .map_err(|error| format!("无法序列化{label}记录：{error}"))?;
     let encrypted = protect_secret(&json)?;
-    write_credential_atomic(&global_env_path()?, &encrypted)
+    write_credential_atomic(path, &encrypted)
 }
 
 #[cfg(windows)]
@@ -1623,9 +2368,37 @@ fn transition_managed_global_env(
     next: Option<(&str, &str)>,
     previous: Option<&ManagedGlobalEnv>,
 ) -> Result<(), String> {
+    transition_managed_user_env(next, previous, &global_env_path()?)
+}
+
+fn transition_managed_global_codex_home_env(
+    next_home: &Path,
+    previous: Option<&ManagedGlobalEnv>,
+) -> Result<(), String> {
     #[cfg(not(windows))]
     {
-        let _ = previous;
+        let _ = (next_home, previous);
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let next_home = next_home.to_string_lossy().to_string();
+        transition_managed_user_env(
+            Some((CODEX_HOME_ENV, next_home.as_str())),
+            previous,
+            &global_codex_home_env_path()?,
+        )
+    }
+}
+
+fn transition_managed_user_env(
+    next: Option<(&str, &str)>,
+    previous: Option<&ManagedGlobalEnv>,
+    record_path: &Path,
+) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        let _ = (previous, record_path);
         return if next.is_none() {
             Ok(())
         } else {
@@ -1645,11 +2418,15 @@ fn transition_managed_global_env(
                     current
                 };
                 write_user_env_var(next_key, Some(next_value))?;
-                save_managed_global_env(&ManagedGlobalEnv {
-                    key: next_key.to_string(),
-                    applied_value: next_value.to_string(),
-                    previous_value,
-                })?;
+                save_managed_env_at(
+                    record_path,
+                    "CodeX 全局环境变量",
+                    &ManagedGlobalEnv {
+                        key: next_key.to_string(),
+                        applied_value: next_value.to_string(),
+                        previous_value,
+                    },
+                )?;
             }
             (previous, next) => {
                 if let Some(previous) = previous {
@@ -1661,14 +2438,18 @@ fn transition_managed_global_env(
                 if let Some((next_key, next_value)) = next {
                     let previous_value = read_user_env_var(next_key)?;
                     write_user_env_var(next_key, Some(next_value))?;
-                    save_managed_global_env(&ManagedGlobalEnv {
-                        key: next_key.to_string(),
-                        applied_value: next_value.to_string(),
-                        previous_value,
-                    })?;
+                    save_managed_env_at(
+                        record_path,
+                        "CodeX 全局环境变量",
+                        &ManagedGlobalEnv {
+                            key: next_key.to_string(),
+                            applied_value: next_value.to_string(),
+                            previous_value,
+                        },
+                    )?;
                 } else {
-                    remove_if_exists(&global_env_path()?)?;
-                    remove_transaction_sidecars(&global_env_path()?)?;
+                    remove_if_exists(record_path)?;
+                    remove_transaction_sidecars(record_path)?;
                 }
             }
         }
@@ -1676,7 +2457,7 @@ fn transition_managed_global_env(
     }
 }
 
-fn resolve_profile_api_key(profile: &CodexProfile) -> Result<String, String> {
+pub(crate) fn resolve_profile_api_key(profile: &CodexProfile) -> Result<String, String> {
     if let Some(secret) = read_profile_secret(&profile.id)? {
         return Ok(secret);
     }
@@ -1782,8 +2563,8 @@ fn enrich_profiles(state: &mut CodexProfileState) -> Result<(), String> {
     for profile in &mut state.profiles {
         profile.managed_profile_name = managed_profile_name(&profile.id);
         profile.has_stored_api_key = profile_secret_exists(&profile.id)?;
+        prepare_isolated_profile_home(profile)?;
         let profile_path = managed_profile_path(&profile.id)?;
-        migrate_legacy_managed_profile(&profile.id, &profile_path)?;
         if profile_path.exists() {
             let raw = fs::read_to_string(&profile_path).map_err(|error| {
                 format!("无法读取 CodeX profile {}：{error}", profile_path.display())
@@ -1796,7 +2577,11 @@ fn enrich_profiles(state: &mut CodexProfileState) -> Result<(), String> {
     Ok(())
 }
 
-fn global_profile_matches_document(state: &CodexProfileState, raw: &str) -> bool {
+fn global_profile_matches_document_with_proxy(
+    state: &CodexProfileState,
+    raw: &str,
+    use_proxy_base_url: bool,
+) -> bool {
     let Some(profile_id) = state.global_profile_id.as_deref() else {
         return false;
     };
@@ -1809,18 +2594,25 @@ fn global_profile_matches_document(state: &CodexProfileState, raw: &str) -> bool
     };
     let model_catalog_is_managed = profile.auth_mode == CodexAuthMode::Custom
         && profile.model_catalog.is_some();
-    if let Some(managed) = state.managed_global_model_catalog.as_ref() {
-        if validate_managed_global_model_catalog_reference(
-            Some(raw),
-            managed,
-            model_catalog_is_managed,
-        )
-        .is_err()
-        {
-            return false;
+    if !cfg!(windows) {
+        if let Some(managed) = state.managed_global_model_catalog.as_ref() {
+            if validate_managed_global_model_catalog_reference(
+                Some(raw),
+                managed,
+                model_catalog_is_managed,
+            )
+            .is_err()
+            {
+                return false;
+            }
         }
     }
-    let restore_value = if profile.auth_mode == CodexAuthMode::Custom
+    let restore_value = if cfg!(windows) {
+        managed_profile_path(&profile.id)
+            .ok()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|profile_raw| model_catalog_json_value_from_raw(Some(&profile_raw)).ok())
+    } else if profile.auth_mode == CodexAuthMode::Custom
         && profile.model_catalog.is_some()
     {
         None
@@ -1832,32 +2624,113 @@ fn global_profile_matches_document(state: &CodexProfileState, raw: &str) -> bool
         };
         Some(current)
     };
+    let mut expected_profile = profile.clone();
+    if use_proxy_base_url
+        && profile.protocol_conversion
+        && profile.auth_mode == CodexAuthMode::Custom
+    {
+        expected_profile.base_url = global_conversion_proxy_url();
+    }
     build_global_toml_with_model_catalog_restore(
         Some(raw),
         state.managed_global_provider_id.as_deref(),
-        profile,
+        &expected_profile,
         restore_value.as_ref(),
     )
     .is_ok_and(|expected| expected == raw)
 }
 
-fn global_profile_in_sync(state: &CodexProfileState) -> Result<bool, String> {
-    if state.global_profile_id.is_none() {
-        return Ok(false);
+fn global_profile_matches_document(state: &CodexProfileState, raw: &str) -> bool {
+    global_profile_matches_document_with_proxy(state, raw, true)
+}
+
+fn global_profile_is_recoverable_at_startup(state: &CodexProfileState, raw: &str) -> bool {
+    global_profile_matches_document_with_proxy(state, raw, true)
+        || global_profile_matches_document_with_proxy(state, raw, false)
+}
+
+fn global_config_contains_conversion_proxy(raw: &str) -> bool {
+    let Ok(document) = DocumentMut::from_str(raw) else {
+        return false;
+    };
+    document
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .is_some_and(|providers| {
+            providers.iter().any(|(_, provider)| {
+                provider
+                    .as_table()
+                    .and_then(|table| table.get("base_url"))
+                    .and_then(Item::as_value)
+                    .and_then(|value| value.as_str())
+                    .is_some_and(is_conversion_proxy_url)
+            })
+        })
+}
+
+fn global_sync_repair_required_for_raw(
+    state: &CodexProfileState,
+    global_profile_in_sync: bool,
+    raw: Option<&str>,
+) -> bool {
+    let Some(raw) = raw else {
+        return state.global_profile_id.is_some() && !global_profile_in_sync;
+    };
+    if state.global_profile_id.is_some() {
+        return !global_profile_is_recoverable_at_startup(state, raw);
     }
+    global_config_contains_conversion_proxy(raw)
+}
+
+fn global_sync_repair_required(
+    state: &CodexProfileState,
+    global_profile_in_sync: bool,
+) -> Result<bool, String> {
+    let path = global_config_path()?;
+    if !path.exists() {
+        return Ok(global_sync_repair_required_for_raw(
+            state,
+            global_profile_in_sync,
+            None,
+        ));
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("无法读取全局 config.toml：{error}"))?;
+    Ok(global_sync_repair_required_for_raw(
+        state,
+        global_profile_in_sync,
+        Some(&raw),
+    ))
+}
+
+fn global_profile_in_sync(state: &CodexProfileState) -> Result<bool, String> {
+    let Some(profile_id) = state.global_profile_id.as_deref() else {
+        return Ok(false);
+    };
     let path = global_config_path()?;
     if !path.exists() {
         return Ok(false);
     }
     let raw =
         fs::read_to_string(&path).map_err(|error| format!("无法读取全局 config.toml：{error}"))?;
-    Ok(global_profile_matches_document(state, &raw))
+    if !global_profile_matches_document(state, &raw) {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    {
+        let expected = profile_home(profile_id)?.to_string_lossy().to_string();
+        if read_user_env_var(CODEX_HOME_ENV)?.as_deref() != Some(expected.as_str()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn load_payload() -> Result<CodexProfilesPayload, String> {
     let mut state = load_profile_state()?;
     enrich_profiles(&mut state)?;
     let global_profile_in_sync = global_profile_in_sync(&state)?;
+    let global_sync_repair_required = global_sync_repair_required(&state, global_profile_in_sync)?;
     let stored_index = load_profile_index_state(CODEX_STATE_KEY)?;
     let index = normalize_index(
         &state.profiles,
@@ -1871,6 +2744,7 @@ fn load_payload() -> Result<CodexProfilesPayload, String> {
         active_profile_id: index.active_profile_id,
         global_profile_id,
         global_profile_in_sync,
+        global_sync_repair_required,
         profiles_path: profiles_path()?.display().to_string(),
         global_config_path: global_config_path()?.display().to_string(),
         auth_path: auth_path()?.display().to_string(),
@@ -1956,15 +2830,26 @@ pub fn save_codex_profile(
     request: SaveCodexProfileRequest,
 ) -> Result<CodexProfilesPayload, String> {
     let profile = normalize_profile(request.profile)?;
+    prepare_isolated_profile_home(&profile)?;
     let metadata_path = profiles_path()?;
     let profile_path = managed_profile_path(&profile.id)?;
-    migrate_legacy_managed_profile(&profile.id, &profile_path)?;
     let mut state = load_profile_state()?;
     let previous_profile = state
         .profiles
         .iter()
         .find(|item| item.id == profile.id)
         .cloned();
+    let previous_index = load_profile_index_state(CODEX_STATE_KEY)?;
+    if let Some(scope) = profile_rename_block_reason(
+        previous_profile.as_ref(),
+        &profile,
+        previous_index.active_profile_id.as_deref(),
+        state.global_profile_id.as_deref(),
+    ) {
+        return Err(format!(
+            "当前配置正在{scope}中，不能直接改名。请先将其他配置应用到对应范围，使当前配置不再处于应用状态后再保存"
+        ));
+    }
     if state
         .profiles
         .iter()
@@ -2022,8 +2907,6 @@ pub fn save_codex_profile(
 
     let previous_metadata = fs::read(&metadata_path).ok();
     let previous_toml = fs::read(&profile_path).ok();
-    let previous_index = load_profile_index_state(CODEX_STATE_KEY)?;
-
     let transaction: Result<(), String> = (|| {
         write_toml_atomic(&profile_path, rendered.as_bytes())?;
         if profile_model_catalog_is_managed {
@@ -2127,6 +3010,10 @@ pub fn save_codex_profile(
         ));
     }
 
+    // 保持全局协议转换接管状态与配置一致（best-effort：保存本身已成功）。
+    if let Err(error) = sync_global_conversion_proxy() {
+        eprintln!("CodeX 全局协议转换代理同步失败：{error}");
+    }
     load_payload()
 }
 
@@ -2174,11 +3061,14 @@ pub fn apply_codex_profile(
     let profile_needs_update = rendered_profile_toml != existing_profile_toml;
     let previous_index = load_profile_index_state(CODEX_STATE_KEY)?;
     let previous_metadata = fs::read(profiles_path()?).ok();
-    let global_path = global_config_path()?;
+    let global_path = global_config_path_for_profile(&profile.id)?;
     let previous_global = fs::read(&global_path).ok();
     let global_env_record_path = global_env_path()?;
     let previous_global_env_file = fs::read(&global_env_record_path).ok();
     let previous_managed_env = load_managed_global_env()?;
+    let global_codex_home_record_path = global_codex_home_env_path()?;
+    let previous_global_codex_home_env_file = fs::read(&global_codex_home_record_path).ok();
+    let previous_managed_codex_home_env = load_managed_global_codex_home_env()?;
 
     let existing_global_raw = if request.apply_to_global && global_path.exists() {
         Some(
@@ -2190,7 +3080,7 @@ pub fn apply_codex_profile(
     };
     let global_model_catalog_is_managed = profile.auth_mode == CodexAuthMode::Custom
         && profile.model_catalog.is_some();
-    if request.apply_to_global {
+    if request.apply_to_global && !cfg!(windows) {
         if let Some(managed) = state.managed_global_model_catalog.as_ref() {
             validate_managed_global_model_catalog_reference(
                 existing_global_raw.as_deref(),
@@ -2199,7 +3089,10 @@ pub fn apply_codex_profile(
             )?;
         }
     }
-    let next_global_model_catalog = if request.apply_to_global && global_model_catalog_is_managed {
+    let next_global_model_catalog = if request.apply_to_global
+        && global_model_catalog_is_managed
+        && !cfg!(windows)
+    {
         let previous_value = state
             .managed_global_model_catalog
             .as_ref()
@@ -2214,7 +3107,11 @@ pub fn apply_codex_profile(
     } else {
         None
     };
-    let global_model_catalog_restore = if global_model_catalog_is_managed {
+    let global_model_catalog_restore = if cfg!(windows) {
+        Some(model_catalog_json_value_from_raw(Some(
+            &rendered_profile_toml,
+        ))?)
+    } else if global_model_catalog_is_managed {
         None
     } else if let Some(managed) = state.managed_global_model_catalog.as_ref() {
         Some(managed.previous_value.clone())
@@ -2222,10 +3119,19 @@ pub fn apply_codex_profile(
         Some(model_catalog_json_value_from_raw(existing_global_raw.as_deref())?)
     };
     let rendered_global = if request.apply_to_global {
+        // 协议转换：全局配置被 Codex 桌面端 / VSCode 扩展等直接读取（不经启动器
+        // 的 resolve 流程），这里在渲染时就接管——base_url 改写为本机转换代理，
+        // 应用退出时由 sync_global_conversion_proxy 恢复真实地址。
+        let mut global_render_profile = profile.clone();
+        if profile.protocol_conversion && profile.auth_mode == CodexAuthMode::Custom {
+            // Render the fixed endpoint first; start/rebuild the proxy only
+            // after all validation and rendering steps have succeeded.
+            global_render_profile.base_url = global_conversion_proxy_url();
+        }
         Some(build_global_toml_with_model_catalog_restore(
             existing_global_raw.as_deref(),
             state.managed_global_provider_id.as_deref(),
-            &profile,
+            &global_render_profile,
             if global_model_catalog_is_managed {
                 None
             } else {
@@ -2267,6 +3173,8 @@ pub fn apply_codex_profile(
     if let Some(previous) = previous_managed_env.as_ref() {
         env_keys.insert(previous.key.clone());
     }
+    #[cfg(windows)]
+    env_keys.insert(CODEX_HOME_ENV.to_string());
     if next_api_key.is_some() {
         env_keys.insert(profile.env_key.clone());
     }
@@ -2274,6 +3182,13 @@ pub fn apply_codex_profile(
         .into_iter()
         .map(|key| read_user_env_var(&key).map(|value| (key, value)))
         .collect::<Result<HashMap<_, _>, _>>()?;
+
+    if request.apply_to_global
+        && profile.protocol_conversion
+        && profile.auth_mode == CodexAuthMode::Custom
+    {
+        crate::codex_proxy::ensure_conversion_fixed_port(&profile)?;
+    }
 
     let transaction = (|| {
         if profile_needs_update {
@@ -2299,6 +3214,10 @@ pub fn apply_codex_profile(
                 .as_deref()
                 .map(|api_key| (profile.env_key.as_str(), api_key));
             transition_managed_global_env(next_env, previous_managed_env.as_ref())?;
+            transition_managed_global_codex_home_env(
+                &profile_home(&profile.id)?,
+                previous_managed_codex_home_env.as_ref(),
+            )?;
             state.global_profile_id = next_global_profile_id.clone();
             state.managed_global_provider_id = next_global_provider_id.clone();
             state.managed_global_model_catalog = next_global_model_catalog.clone();
@@ -2349,6 +3268,19 @@ pub fn apply_codex_profile(
                 }
                 None => {}
             }
+            #[cfg(windows)]
+            {
+                let expected_home = profile_home(&profile.id)?.to_string_lossy().to_string();
+                let verified = load_managed_global_codex_home_env()?.ok_or_else(|| {
+                    "CodeX 全局 CODEX_HOME 环境变量记录不存在".to_string()
+                })?;
+                if verified.key != CODEX_HOME_ENV || verified.applied_value != expected_home {
+                    return Err("CodeX 全局 CODEX_HOME 环境变量记录回读不一致".to_string());
+                }
+                if read_user_env_var(CODEX_HOME_ENV)?.as_deref() != Some(expected_home.as_str()) {
+                    return Err("CodeX 全局 CODEX_HOME 环境变量写入后回读不一致".to_string());
+                }
+            }
         }
         Ok(())
     })();
@@ -2390,8 +3322,20 @@ pub fn apply_codex_profile(
             ) {
                 rollback_errors.push(rollback);
             }
+            if let Err(rollback) = restore_snapshot(
+                &global_codex_home_record_path,
+                previous_global_codex_home_env_file.as_deref(),
+                SnapshotKind::Credential,
+            ) {
+                rollback_errors.push(rollback);
+            }
             if let Err(rollback) = restore_user_env_snapshots(&env_snapshots) {
                 rollback_errors.push(rollback);
+            }
+            // The proxy may have been rebuilt before the file transaction.
+            // Restore the persisted previous global profile's proxy state too.
+            if let Err(recovery) = sync_global_conversion_proxy() {
+                rollback_errors.push(format!("恢复协议转换代理失败：{recovery}"));
             }
         }
         if rollback_errors.is_empty() {
@@ -2403,6 +3347,10 @@ pub fn apply_codex_profile(
         ));
     }
 
+    // 全局协议转换接管状态可能随全局 profile 切换而变化（best-effort）。
+    if let Err(error) = sync_global_conversion_proxy() {
+        eprintln!("CodeX 全局协议转换代理同步失败：{error}");
+    }
     load_payload()
 }
 
@@ -2420,7 +3368,15 @@ pub fn delete_codex_profile(
     {
         return Err("要删除的 CodeX 配置不存在".to_string());
     }
-
+    let deleted_profile = state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == request.profile_id)
+        .cloned()
+        .ok_or_else(|| "要删除的 CodeX 配置不存在".to_string())?;
+    let was_global_profile = state.global_profile_id.as_deref() == Some(request.profile_id.as_str());
+    let global_path = global_config_path()?;
+    let previous_global = fs::read(&global_path).ok();
     let previous_metadata = fs::read(&metadata_path).ok();
     let previous_toml = fs::read(&profile_path).ok();
     let previous_secret = read_profile_secret(&request.profile_id)?;
@@ -2433,12 +3389,25 @@ pub fn delete_codex_profile(
         .remove(&request.profile_id);
     if state.global_profile_id.as_deref() == Some(request.profile_id.as_str()) {
         state.global_profile_id = None;
+        state.managed_global_provider_id = None;
+        state.managed_global_model_catalog = None;
     }
 
     let transaction = (|| {
         remove_if_exists(&profile_path)?;
         remove_transaction_sidecars(&profile_path)?;
         delete_profile_secret(&request.profile_id)?;
+        if was_global_profile
+            && deleted_profile.protocol_conversion
+            && deleted_profile.auth_mode == CodexAuthMode::Custom
+            && global_path.exists()
+        {
+            let raw = fs::read_to_string(&global_path)
+                .map_err(|error| format!("无法读取全局 config.toml: {error}"))?;
+            if let Some(restored) = restore_deleted_global_proxy_base_url(&raw, &deleted_profile)? {
+                write_toml_atomic(&global_path, restored.as_bytes())?;
+            }
+        }
         save_profile_state(&state)?;
         let index = normalize_index(
             &state.profiles,
@@ -2474,6 +3443,13 @@ pub fn delete_codex_profile(
         {
             rollback_errors.push(rollback);
         }
+        if let Err(rollback) = restore_snapshot(
+            &global_path,
+            previous_global.as_deref(),
+            SnapshotKind::Toml,
+        ) {
+            rollback_errors.push(rollback);
+        }
         if rollback_errors.is_empty() {
             return Err(format!("删除 CodeX 配置失败，旧数据已恢复：{error}"));
         }
@@ -2483,7 +3459,202 @@ pub fn delete_codex_profile(
         ));
     }
 
+    // 若删除的是全局 profile，恢复全局配置中残留的代理地址并清理代理
+    // （best-effort：删除本身已成功）。
+    crate::codex_proxy::stop(&request.profile_id);
+    crate::codex_proxy::forget_history(&request.profile_id);
+    if let Err(error) = sync_global_conversion_proxy() {
+        eprintln!("CodeX 全局协议转换代理同步失败：{error}");
+    }
     load_payload()
+}
+
+/// 判断 base_url 是否指向全局协议转换代理的固定地址。
+fn is_conversion_proxy_url(base_url: &str) -> bool {
+    base_url == global_conversion_proxy_url()
+}
+
+/// 用 toml_edit 精确替换全局 config.toml 中 provider 的 base_url，保留其余
+/// 用户手动改动。返回 Some(新内容) 表示发生替换；None 表示无需改动或无法定位。
+fn rewrite_global_provider_base_url(
+    raw: &str,
+    provider_id: &str,
+    base_url: &str,
+) -> Result<Option<String>, String> {
+    let mut document = DocumentMut::from_str(raw)
+        .map_err(|error| format!("全局 config.toml 无法解析：{error}"))?;
+    let Some(provider) = document
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .and_then(|providers| providers.get_mut(provider_id))
+        .and_then(Item::as_table_mut)
+    else {
+        return Ok(None);
+    };
+    let Some(current) = provider
+        .get("base_url")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(None);
+    };
+    if current == base_url {
+        return Ok(None);
+    }
+    provider["base_url"] = value(base_url);
+    Ok(Some(document.to_string()))
+}
+
+fn global_conversion_proxy_url() -> String {
+    format!(
+        "http://127.0.0.1:{}/v1",
+        crate::codex_proxy::GLOBAL_PROXY_PORT
+    )
+}
+
+/// Restore a deleted global conversion profile only when its provider still
+/// points at this application's fixed global proxy port.
+fn restore_deleted_global_proxy_base_url(
+    raw: &str,
+    profile: &CodexProfile,
+) -> Result<Option<String>, String> {
+    let proxy_url = global_conversion_proxy_url();
+    let document = DocumentMut::from_str(raw)
+        .map_err(|error| format!("全局 config.toml 无法解析：{error}"))?;
+    let current = document
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(&profile.provider_id))
+        .and_then(Item::as_table)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_str());
+    if current != Some(proxy_url.as_str()) {
+        return Ok(None);
+    }
+    rewrite_global_provider_base_url(raw, &profile.provider_id, &profile.base_url)
+}
+
+/// 双向同步全局配置的协议转换接管状态。
+///
+/// - 全局 profile 启用了协议转换 → 确保本机转换代理在运行，并把全局
+///   `~/.codex/config.toml` 中该 provider 的 base_url 改写为代理地址
+///   （Codex 桌面端 / VSCode 扩展直接读取全局配置，不经启动器的 resolve 流程）。
+/// - 否则 → 若全局配置残留了代理地址则恢复为真实地址，并停止代理实例。
+///
+/// 调用时机：应用启动（setup）、应用退出（ExitRequested）、以及
+/// save / apply / delete Codex profile 之后，保证接管状态与配置状态一致。
+pub fn sync_global_conversion_proxy() -> Result<(), String> {
+    let state = load_profile_state()?;
+    let Some(global_profile_id) = state.global_profile_id.as_deref() else {
+        // 没有全局 profile：不猜测全局 provider 的归属，只清理本进程代理实例。
+        crate::codex_proxy::stop_global_instances_except(None);
+        return Ok(());
+    };
+    let Some(profile) = state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == global_profile_id)
+        .cloned()
+    else {
+        crate::codex_proxy::stop_global_instances_except(None);
+        return Ok(());
+    };
+
+    let global_path = global_config_path()?;
+    if !global_path.exists() {
+        // 全局状态仍存在但配置文件已丢失，不能依据状态猜测并启动代理。
+        // 保留异常状态，交给 UI 让用户确认后重新同步。
+        crate::codex_proxy::stop_global_instances_except(None);
+        return Ok(());
+    }
+    let mut raw = fs::read_to_string(&global_path)
+        .map_err(|error| format!("无法读取全局 config.toml：{error}"))?;
+    if !global_profile_is_recoverable_at_startup(&state, &raw) {
+        // 全局文件已被外部修改或状态无法对应。保留文件，交给 UI
+        // 让用户确认后重新同步，避免启动时静默覆盖手动配置。
+        crate::codex_proxy::stop_global_instances_except(None);
+        return Ok(());
+    }
+
+    if let Some(repaired) = restore_missing_managed_global_providers(&raw, &state)? {
+        write_toml_atomic(&global_path, repaired.as_bytes())?;
+        raw = repaired;
+    }
+
+    // 清理不再是全局 profile 的 Global 模式代理实例（全局 profile 切换残留）。
+    crate::codex_proxy::stop_global_instances_except(Some(&profile.id));
+
+    if profile.protocol_conversion && profile.auth_mode == CodexAuthMode::Custom {
+        // 接管：改写 base_url 为代理地址。固定端口——Codex 桌面端缓存 base_url，
+        // 随机端口在应用重启后漂移会导致桌面端连不上旧端口。
+        let Some(local_url) = crate::codex_proxy::ensure_conversion_fixed_port(&profile)? else {
+            return Ok(());
+        };
+        if let Some(rewritten) =
+            rewrite_global_provider_base_url(&raw, &profile.provider_id, &local_url)?
+        {
+            write_toml_atomic(&global_path, rewritten.as_bytes())?;
+        }
+        return Ok(());
+    }
+
+    // 未启用转换（或全局 profile 已切换）：恢复残留的代理地址并停止代理。
+    crate::codex_proxy::stop(&profile.id);
+    if !global_path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&global_path)
+        .map_err(|error| format!("无法读取全局 config.toml：{error}"))?;
+    let current = DocumentMut::from_str(&raw)
+        .ok()
+        .and_then(|document| {
+            document
+                .get("model_providers")
+                .and_then(Item::as_table)
+                .and_then(|providers| providers.get(&profile.provider_id))
+                .and_then(Item::as_table)
+                .and_then(|provider| provider.get("base_url"))
+                .and_then(Item::as_value)
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        });
+    // 仅当当前值确实是本机代理地址时才恢复，避免覆盖用户手动改过的地址。
+    if current.as_deref().is_some_and(is_conversion_proxy_url) {
+        if let Some(rewritten) =
+            rewrite_global_provider_base_url(&raw, &profile.provider_id, &profile.base_url)?
+        {
+            write_toml_atomic(&global_path, rewritten.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// Restore the global config before process exit and stop every in-process
+/// proxy. The runtime sync path intentionally keeps an enabled global proxy
+/// active, so shutdown must use a separate operation.
+pub fn restore_global_conversion_proxy() -> Result<(), String> {
+    let state = load_profile_state()?;
+    let global_path = global_config_path()?;
+    if global_path.exists() {
+        let raw = fs::read_to_string(&global_path)
+            .map_err(|error| format!("无法读取全局 config.toml：{error}"))?;
+        let mut restored = raw.clone();
+        if let Some(profile_id) = state.global_profile_id.as_deref() {
+            if let Some(profile) = state.profiles.iter().find(|profile| profile.id == profile_id) {
+                if profile.protocol_conversion && profile.auth_mode == CodexAuthMode::Custom {
+                    if let Some(next) = restore_deleted_global_proxy_base_url(&restored, profile)? {
+                        restored = next;
+                    }
+                }
+            }
+        }
+        if restored != raw {
+            write_toml_atomic(&global_path, restored.as_bytes())?;
+        }
+    }
+    crate::codex_proxy::stop_all();
+    Ok(())
 }
 
 #[tauri::command]
@@ -2522,13 +3693,25 @@ pub fn resolve_codex_profile(profile_id: String) -> Result<CodexLaunchContext, S
     } else {
         Some(model_catalog_json_value_from_raw(Some(&existing_toml))?)
     };
+    // 协议转换：启用时确保本机转换代理在运行，并把 profile TOML 的 base_url
+    // 临时改写为代理地址；未启用时保持现有逻辑（真实 base_url）完全不变。
+    // 代理注册表仅存于内存，profile state 中的 base_url 始终是真实地址。
+    let conversion_local_url = crate::codex_proxy::ensure_conversion(&profile)?;
+    let mut render_profile = profile.clone();
+    if let Some(local_url) = conversion_local_url.as_deref() {
+        render_profile.base_url = local_url.to_string();
+    }
     let rendered_toml = build_profile_toml_with_model_catalog_restore(
         Some(&existing_toml),
         managed_provider_id(&profile),
-        &profile,
+        &render_profile,
         profile_model_catalog_restore.as_ref(),
     )?;
     let mut env_vars = BTreeMap::new();
+    let isolated_home = profile_home(&profile.id)?;
+    let isolated_home_text = isolated_home.to_string_lossy().to_string();
+    env_vars.insert(CODEX_HOME_ENV.to_string(), isolated_home_text.clone());
+    env_vars.insert(CODEX_SQLITE_HOME_ENV.to_string(), isolated_home_text);
     if profile.auth_mode == CodexAuthMode::Custom && !uses_plaintext_command_auth(&profile) {
         let api_key = resolve_profile_api_key(&profile)?;
         env_vars.insert(profile.env_key.clone(), api_key);
@@ -2630,11 +3813,24 @@ pub fn resolve_codex_runtime_context(
     }
 
     let model_provider = global_model_provider()?;
+    let global_home = load_profile_state()?
+        .global_profile_id
+        .as_deref()
+        .map(profile_home)
+        .transpose()?
+        .unwrap_or(codex_home()?);
+    fs::create_dir_all(&global_home)
+        .map_err(|error| format!("无法创建 CodeX 全局数据目录：{error}"))?;
+    let global_home_text = global_home.to_string_lossy().to_string();
+    let env_vars = BTreeMap::from([
+        (CODEX_HOME_ENV.to_string(), global_home_text.clone()),
+        (CODEX_SQLITE_HOME_ENV.to_string(), global_home_text.clone()),
+    ]);
     Ok(CodexRuntimeContext {
         profile_name: None,
         model_provider: model_provider.clone(),
-        env_vars: BTreeMap::new(),
-        cache_key: format!("global:{model_provider}"),
+        env_vars,
+        cache_key: format!("global:{model_provider}:{global_home_text}"),
     })
 }
 
@@ -2678,10 +3874,13 @@ mod tests {
             provider_name: String::new(),
             base_url: String::new(),
             wire_api: default_wire_api(),
+            protocol_conversion: false,
             env_key: default_env_key(),
             has_stored_api_key: false,
             managed_profile_name: String::new(),
             model_catalog: None,
+            chat_upstream_model: String::new(),
+            prompt_cache_routing: default_prompt_cache_routing(),
             extra: Map::new(),
         }
     }
@@ -2964,9 +4163,13 @@ mod tests {
         let mut profile = custom_profile_with_catalog();
         let catalog = profile.model_catalog.as_mut().expect("catalog");
         catalog.models[0].max_context_window = 1;
-        assert!(normalize_profile(profile)
-            .expect_err("max context below context must fail")
-            .contains("max_context_window"));
+        let normalized = normalize_profile(profile).expect("max context is derived from context");
+        let model_catalog = normalized.model_catalog.expect("catalog");
+        let model = &model_catalog.models[0];
+        assert_eq!(
+            model.max_context_window,
+            model.context_window
+        );
     }
 
     #[test]
@@ -3160,11 +4363,187 @@ mod tests {
     }
 
     #[test]
+    fn desktop_project_state_migration_excludes_thread_and_prompt_state() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-project-state-isolation-{}",
+            Uuid::new_v4()
+        ));
+        let shared = directory.join("shared");
+        let isolated = directory.join("isolated");
+        fs::create_dir_all(&shared).expect("create shared home");
+        fs::create_dir_all(&isolated).expect("create isolated home");
+
+        let source = serde_json::json!({
+            "electron-saved-workspace-roots": ["D:/legacy"],
+            "project-order": ["legacy-project"],
+            "active-workspace-roots": ["D:/legacy"],
+            "local-projects": {
+                "legacy-project": {
+                    "id": "legacy-project",
+                    "name": "Legacy",
+                    "rootPaths": ["D:/legacy"]
+                }
+            },
+            "selected-project": {"type": "local", "id": "legacy-project"},
+            "electron-workspace-root-labels": {"D:/legacy": "Legacy root"},
+            "thread-project-assignments": {
+                "legacy-thread": {"projectId": "legacy-project"}
+            },
+            "electron-persisted-atom-state": {
+                "prompt-history": ["must not migrate"],
+                "thread-client-id-v1:legacy-thread": "must-not-migrate"
+            }
+        });
+        fs::write(
+            shared.join(CODEX_DESKTOP_STATE_FILE),
+            serde_json::to_vec(&source).expect("serialize shared state"),
+        )
+        .expect("write shared state");
+
+        let current = serde_json::json!({
+            "electron-saved-workspace-roots": ["D:/current"],
+            "project-order": ["current-project"],
+            "local-projects": {
+                "current-project": {
+                    "id": "current-project",
+                    "name": "Current",
+                    "rootPaths": ["D:/current"]
+                }
+            },
+            "unrelated-current-setting": true
+        });
+        let target_path = isolated.join(CODEX_DESKTOP_STATE_FILE);
+        fs::write(
+            &target_path,
+            serde_json::to_vec(&current).expect("serialize current state"),
+        )
+        .expect("write current state");
+
+        migrate_desktop_project_state(&shared, &isolated).expect("migrate project catalog");
+
+        let migrated: Value = serde_json::from_slice(
+            &fs::read(&target_path).expect("read migrated project state"),
+        )
+        .expect("parse migrated project state");
+        assert_eq!(
+            migrated["electron-saved-workspace-roots"],
+            serde_json::json!(["D:/current", "D:/legacy"])
+        );
+        assert_eq!(
+            migrated["project-order"],
+            serde_json::json!(["current-project", "legacy-project"])
+        );
+        assert!(migrated["local-projects"]["current-project"].is_object());
+        assert!(migrated["local-projects"]["legacy-project"].is_object());
+        assert_eq!(
+            migrated["selected-project"]["id"],
+            Value::String("legacy-project".to_string())
+        );
+        assert_eq!(migrated["unrelated-current-setting"], Value::Bool(true));
+        assert!(migrated.get("thread-project-assignments").is_none());
+        assert!(migrated.get("electron-persisted-atom-state").is_none());
+        assert!(isolated
+            .join(DESKTOP_PROJECT_STATE_MIGRATION_FILE)
+            .exists());
+
+        let mut after_user_removal = migrated;
+        after_user_removal["local-projects"]
+            .as_object_mut()
+            .expect("local projects")
+            .remove("legacy-project");
+        fs::write(
+            &target_path,
+            serde_json::to_vec(&after_user_removal).expect("serialize user removal"),
+        )
+        .expect("write user removal");
+        migrate_desktop_project_state(&shared, &isolated).expect("migration stays one-shot");
+        let after_retry: Value = serde_json::from_slice(
+            &fs::read(&target_path).expect("read state after retry"),
+        )
+        .expect("parse state after retry");
+        assert!(after_retry["local-projects"]
+            .get("legacy-project")
+            .is_none());
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn isolated_home_migration_copies_only_matching_provider_sessions_and_indexes() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-session-isolation-{}",
+            Uuid::new_v4()
+        ));
+        let source = directory.join("shared");
+        let target = directory.join("isolated");
+        let source_sessions = source.join("sessions").join("2026").join("08").join("15");
+        fs::create_dir_all(&source_sessions).expect("create shared sessions");
+        fs::write(
+            source_sessions.join("custom.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"custom-id\",\"model_provider\":\"company\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{}}\n"
+            ),
+        )
+        .expect("write custom rollout");
+        fs::write(
+            source_sessions.join("official.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"official-id\",\"model_provider\":\"openai\"}}\n",
+        )
+        .expect("write official rollout");
+        fs::write(
+            source.join("session_index.jsonl"),
+            concat!(
+                "{\"id\":\"custom-id\",\"thread_name\":\"custom\"}\n",
+                "{\"id\":\"official-id\",\"thread_name\":\"official\"}\n"
+            ),
+        )
+        .expect("write shared index");
+
+        let mut ids = HashSet::new();
+        migrate_rollout_tree(
+            &source.join("sessions"),
+            &target.join("sessions"),
+            "company",
+            &mut ids,
+        )
+        .expect("migrate matching sessions");
+        merge_filtered_jsonl(
+            &source.join("session_index.jsonl"),
+            &target.join("session_index.jsonl"),
+            "id",
+            &ids,
+        )
+        .expect("migrate matching index");
+
+        assert_eq!(ids, HashSet::from(["custom-id".to_string()]));
+        assert!(target
+            .join("sessions/2026/08/15/custom.jsonl")
+            .exists());
+        assert!(!target
+            .join("sessions/2026/08/15/official.jsonl")
+            .exists());
+        let index = fs::read_to_string(target.join("session_index.jsonl"))
+            .expect("read isolated index");
+        assert!(index.contains("custom-id"));
+        assert!(!index.contains("official-id"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn rendered_profile_pins_sqlite_state_to_its_isolated_home() {
+        let profile = official_profile();
+        let rendered = build_profile_toml(None, None, &profile).expect("render profile");
+        let document = DocumentMut::from_str(&rendered).expect("parse profile");
+        let sqlite_home = document["sqlite_home"].as_str().expect("sqlite_home");
+        assert!(Path::new(sqlite_home).ends_with(&profile.id));
+    }
+
+    #[test]
     fn custom_profile_uses_env_key_without_serializing_the_secret() {
         let mut profile = official_profile();
         profile.auth_mode = CodexAuthMode::Custom;
-        profile.provider_id = "company_proxy".to_string();
-        profile.provider_name = "Company Proxy".to_string();
+        profile.name = "Company Proxy".to_string();
         profile.base_url = "https://proxy.example.com/v1".to_string();
         profile.env_key = "COMPANY_CODEX_KEY".to_string();
         let profile = normalize_profile(profile).expect("valid profile");
@@ -3172,15 +4551,17 @@ mod tests {
         assert!(rendered.contains("env_key = \"COMPANY_CODEX_KEY\""));
         assert!(!rendered.contains("sk-test-secret"));
         assert_eq!(
-            DocumentMut::from_str(&rendered).expect("parse")["model_providers"]["company_proxy"]
+            DocumentMut::from_str(&rendered).expect("parse")["model_providers"]["Company_Proxy"]
                 ["wire_api"]
                 .as_str(),
             Some("responses")
         );
+        assert_eq!(profile.provider_id, "Company_Proxy");
+        assert_eq!(profile.provider_name, "Company Proxy");
     }
 
     #[test]
-    fn global_sync_replaces_only_the_previous_managed_provider() {
+    fn global_sync_keeps_the_previous_managed_provider_for_history() {
         let existing = concat!(
             "approval_policy = \"on-request\"\n",
             "model_provider = \"old_proxy\"\n",
@@ -3192,8 +4573,7 @@ mod tests {
         );
         let mut profile = official_profile();
         profile.auth_mode = CodexAuthMode::Custom;
-        profile.provider_id = "new_proxy".to_string();
-        profile.provider_name = "New Proxy".to_string();
+        profile.name = "New Proxy".to_string();
         profile.base_url = "https://new.example.com/v1".to_string();
         let profile = normalize_profile(profile).expect("valid profile");
 
@@ -3202,10 +4582,78 @@ mod tests {
         let document = DocumentMut::from_str(&rendered).expect("parse");
         assert_eq!(document["approval_policy"].as_str(), Some("on-request"));
         assert_eq!(document["features"]["js_repl"].as_bool(), Some(true));
-        assert!(document["model_providers"].get("old_proxy").is_none());
         assert_eq!(
-            document["model_providers"]["new_proxy"]["base_url"].as_str(),
+            document["model_providers"]["old_proxy"]["base_url"].as_str(),
+            Some("https://old.example.com/v1")
+        );
+        assert_eq!(
+            document["model_providers"]["New_Proxy"]["base_url"].as_str(),
             Some("https://new.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn provider_identity_is_derived_from_profile_name() {
+        assert_eq!(provider_id_from_profile_name("Kimi For Coding", "fallback"), "Kimi_For_Coding");
+        assert_eq!(provider_id_from_profile_name("中文配置", "fallback"), "fallback");
+        assert_eq!(provider_id_from_profile_name("OpenAI", "fallback"), "OpenAI_custom");
+
+        let mut profile = official_profile();
+        profile.auth_mode = CodexAuthMode::Custom;
+        profile.name = "中文 配置".to_string();
+        profile.provider_id = "user_supplied".to_string();
+        profile.provider_name = "User supplied".to_string();
+        profile.base_url = "https://proxy.example.com/v1".to_string();
+        let normalized = normalize_profile(profile).expect("valid profile");
+        assert_eq!(normalized.provider_id, "profile-test");
+        assert_eq!(normalized.provider_name, "中文 配置");
+    }
+
+    #[test]
+    fn applied_profile_cannot_be_renamed_but_unused_profile_can() {
+        let previous = official_profile();
+        let mut renamed = previous.clone();
+        renamed.name = "Renamed".to_string();
+
+        assert_eq!(
+            profile_rename_block_reason(
+                Some(&previous),
+                &renamed,
+                Some(previous.id.as_str()),
+                Some(previous.id.as_str()),
+            ),
+            Some("启动器当前应用和 Codex 全局配置")
+        );
+        assert_eq!(
+            profile_rename_block_reason(
+                Some(&previous),
+                &renamed,
+                Some(previous.id.as_str()),
+                None,
+            ),
+            Some("启动器当前应用")
+        );
+        assert_eq!(
+            profile_rename_block_reason(
+                Some(&previous),
+                &renamed,
+                None,
+                Some(previous.id.as_str()),
+            ),
+            Some("Codex 全局配置")
+        );
+        assert_eq!(
+            profile_rename_block_reason(Some(&previous), &renamed, None, None),
+            None
+        );
+        assert_eq!(
+            profile_rename_block_reason(
+                Some(&previous),
+                &previous,
+                Some(previous.id.as_str()),
+                None,
+            ),
+            None
         );
     }
 
@@ -3227,7 +4675,73 @@ mod tests {
     }
 
     #[test]
-    fn official_global_sync_removes_the_previous_managed_provider() {
+    fn global_sync_status_accepts_the_fixed_conversion_proxy_url() {
+        let mut profile = official_profile();
+        profile.auth_mode = CodexAuthMode::Custom;
+        profile.protocol_conversion = true;
+        profile.provider_id = "kimi".to_string();
+        profile.provider_name = "Kimi".to_string();
+        profile.base_url = "https://api.moonshot.cn/v1".to_string();
+        let mut rendered_profile = profile.clone();
+        rendered_profile.base_url = global_conversion_proxy_url();
+        let rendered = build_global_toml(None, None, &rendered_profile).expect("render global config");
+
+        let mut state = CodexProfileState::default();
+        state.global_profile_id = Some(profile.id.clone());
+        state.managed_global_provider_id = Some(profile.provider_id.clone());
+        state.profiles.push(profile);
+
+        assert!(global_profile_matches_document(&state, &rendered));
+    }
+
+    #[test]
+    fn startup_global_sync_diagnostics_accept_proxy_or_real_base_url() {
+        let mut profile = official_profile();
+        profile.auth_mode = CodexAuthMode::Custom;
+        profile.protocol_conversion = true;
+        profile.provider_id = "kimi".to_string();
+        profile.provider_name = "Kimi".to_string();
+        profile.base_url = "https://api.moonshot.cn/v1".to_string();
+        let mut state = CodexProfileState::default();
+        state.global_profile_id = Some(profile.id.clone());
+        state.managed_global_provider_id = Some(profile.provider_id.clone());
+        state.profiles.push(profile.clone());
+
+        let mut proxy_profile = profile.clone();
+        proxy_profile.base_url = global_conversion_proxy_url();
+        let proxy_raw = build_global_toml(None, None, &proxy_profile).expect("render proxy config");
+        assert!(global_profile_is_recoverable_at_startup(&state, &proxy_raw));
+        assert!(!global_sync_repair_required_for_raw(
+            &state,
+            true,
+            Some(&proxy_raw),
+        ));
+
+        let real_raw = build_global_toml(None, None, &profile).expect("render real config");
+        assert!(global_profile_is_recoverable_at_startup(&state, &real_raw));
+
+        let mismatched = real_raw.replace("https://api.moonshot.cn/v1", "https://other.example/v1");
+        assert!(!global_profile_is_recoverable_at_startup(&state, &mismatched));
+        assert!(global_sync_repair_required_for_raw(
+            &state,
+            false,
+            Some(&mismatched),
+        ));
+    }
+
+    #[test]
+    fn startup_global_sync_diagnostics_detect_orphaned_fixed_proxy() {
+        let state = CodexProfileState::default();
+        let raw = format!(
+            "[model_providers.orphan]\nbase_url = \"{}\"\n",
+            global_conversion_proxy_url()
+        );
+        assert!(global_config_contains_conversion_proxy(&raw));
+        assert!(global_sync_repair_required_for_raw(&state, false, Some(&raw)));
+    }
+
+    #[test]
+    fn official_global_sync_keeps_the_previous_managed_provider_for_history() {
         let existing = concat!(
             "model_provider = \"company_proxy\"\n",
             "[model_providers.company_proxy]\n",
@@ -3239,7 +4753,59 @@ mod tests {
             .expect("render official global config");
         let document = DocumentMut::from_str(&rendered).expect("parse");
         assert_eq!(document["model_provider"].as_str(), Some("openai"));
-        assert!(document.get("model_providers").is_none());
+        assert_eq!(
+            document["model_providers"]["company_proxy"]["base_url"].as_str(),
+            Some("https://proxy.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn missing_managed_provider_can_be_restored_without_overwriting_existing_config() {
+        let mut target = DocumentMut::from_str(
+            "model_provider = \"llama-cpp\"\n[model_providers.llama-cpp]\nbase_url = \"https://llama.example/v1\"\n",
+        )
+        .expect("parse target");
+        let source = DocumentMut::from_str(
+            "[model_providers.muskapis]\nname = \"muskapis\"\nbase_url = \"https://muskapis.example/v1\"\n",
+        )
+        .expect("parse source");
+
+        assert!(merge_missing_provider_item(&mut target, &source, "muskapis").expect("merge"));
+        assert!(!merge_missing_provider_item(&mut target, &source, "muskapis").expect("no-op"));
+        assert_eq!(
+            target["model_provider"].as_str(),
+            Some("llama-cpp"),
+            "restoring a historical provider must not change the active provider",
+        );
+        assert_eq!(
+            target["model_providers"]["muskapis"]["base_url"].as_str(),
+            Some("https://muskapis.example/v1")
+        );
+    }
+
+    #[test]
+    fn deleted_global_proxy_restores_only_the_fixed_proxy_url() {
+        let mut profile = official_profile();
+        profile.auth_mode = CodexAuthMode::Custom;
+        profile.provider_id = "kimi".to_string();
+        profile.base_url = "https://api.moonshot.cn/v1".to_string();
+
+        let raw = format!(
+            "[model_providers.kimi]\nbase_url = \"{}\"\n",
+            global_conversion_proxy_url()
+        );
+        let restored = restore_deleted_global_proxy_base_url(&raw, &profile)
+            .expect("restore")
+            .expect("fixed proxy should restore");
+        assert!(restored.contains("base_url = \"https://api.moonshot.cn/v1\""));
+
+        let other_local = raw.replace(
+            &global_conversion_proxy_url(),
+            "http://127.0.0.1:49152/v1",
+        );
+        assert!(restore_deleted_global_proxy_base_url(&other_local, &profile)
+            .expect("restore")
+            .is_none());
     }
 
     #[test]

@@ -864,7 +864,8 @@ export const useProjectStore = defineStore('project', () => {
   async function discoverCodexProjects() {
     let discovery: CodexProjectDiscovery
     try {
-      discovery = await invoke<CodexProjectDiscovery>('discover_codex_projects')
+      const profileId = await resolveActiveCodexProfileId()
+      discovery = await invoke<CodexProjectDiscovery>('discover_codex_projects', { profileId })
     } catch (error) {
       statusMessage.value = `CodeX 项目发现不可用，可手动选择目录：${String(error)}`
       return false
@@ -1330,6 +1331,33 @@ export const useProjectStore = defineStore('project', () => {
       return syncCliSessionsBatched('opencode', { force: true })
     }
     return false
+  }
+
+  async function refreshCodexProfileSessions() {
+    const codexSessions = sessions.value.filter((session) => session.cliKind === 'codex')
+    const terminalStore = useTerminalStore()
+    const terminalIds = codexSessions
+      .map((session) => sessionTerminalIds.value[session.id])
+      .filter((tabId): tabId is number => typeof tabId === 'number')
+
+    // A native Codex session is tied to the profile that started its process.
+    // Drop the launcher bindings before loading the next provider so an old
+    // native id cannot be resumed with the new profile.
+    sessions.value = sessions.value.filter((session) => session.cliKind !== 'codex')
+    for (const session of codexSessions) {
+      delete sessionTerminalIds.value[session.id]
+    }
+    normalizeActiveState()
+    await Promise.all(terminalIds.map((tabId) => terminalStore.closeTab(tabId)))
+    await persist()
+
+    try {
+      await loadProjects()
+      await discoverCliProjects('codex', true)
+      await syncCliSessionsBatched('codex', { force: true })
+    } catch (error) {
+      statusMessage.value = `CodeX 配置切换后会话刷新失败：${String(error)}`
+    }
   }
 
   async function refreshClaudeHistory() {
@@ -2211,6 +2239,7 @@ export const useProjectStore = defineStore('project', () => {
     prepareCliWorkspace,
     setActiveCliKind,
     refreshActiveCliHistory,
+    refreshCodexProfileSessions,
     refreshClaudeHistory,
     handleClaudeSessionLifecycleEvent,
     pickAndAddProject,

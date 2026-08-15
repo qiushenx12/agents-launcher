@@ -486,7 +486,14 @@ def run_build(version: str, product_name: str, platform_key: str) -> bool:
         for artifact in existing_artifacts:
             shutil.copy2(artifact, backup_path / artifact.name)
 
-        result = subprocess.run(platform_build_command(npm, platform_key), cwd=PROJECT_DIR)
+        build_env = os.environ.copy()
+        build_env.pop("CODEX_PROXY_DEBUG_COMPACT", None)
+        build_env.pop("CODEX_PROXY_DEBUG_COMPACT_LOG", None)
+        result = subprocess.run(
+            platform_build_command(npm, platform_key),
+            cwd=PROJECT_DIR,
+            env=build_env,
+        )
 
         restored = 0
         for artifact in existing_artifacts:

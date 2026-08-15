@@ -5,6 +5,7 @@ pub mod cli_contract;
 pub mod cli_migration;
 pub mod cli_runtime;
 pub mod codex_config;
+pub mod codex_proxy;
 pub mod config_store;
 pub mod dependency_manager;
 pub mod env_applier;
@@ -23,6 +24,8 @@ pub mod settings_manager;
 pub mod tab_cli;
 pub mod utils;
 
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 
 mod window_theme {
@@ -54,6 +57,58 @@ mod window_theme {
     }
 }
 
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(
+        app,
+        "show",
+        "打开 Agents Launcher",
+        true,
+        None::<&str>,
+    )?;
+    let quit_item = MenuItem::with_id(
+        app,
+        "quit",
+        "退出应用",
+        true,
+        None::<&str>,
+    )?;
+    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+    let mut builder = TrayIconBuilder::with_id("main-tray")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip("Agents Launcher")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -61,6 +116,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             session_manager::start_history_watcher(app.handle().clone());
+            setup_tray(app)?;
+            // 恢复/接管全局 CodeX 协议转换代理（best-effort：失败不阻止启动）。
+            if let Err(error) = codex_config::sync_global_conversion_proxy() {
+                eprintln!("CodeX 全局协议转换代理同步失败：{error}");
+            }
             app.manage(claude_observer::ClaudeObserverManager::start(
                 app.handle().clone(),
             ));
@@ -138,6 +198,8 @@ pub fn run() {
             // persistent_state commands
             persistent_state::load_window_state,
             persistent_state::save_window_state,
+            persistent_state::load_minimize_to_tray,
+            persistent_state::save_minimize_to_tray,
             persistent_state::load_launch_dir,
             persistent_state::save_launch_dir,
             persistent_state::load_terminal_font_size,
@@ -227,6 +289,8 @@ pub fn run() {
     app.run(|app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } = event {
             pty::cleanup_all_sessions(app_handle);
+            // 应用退出：恢复全局 CodeX 配置中的真实地址并停止代理。
+            let _ = codex_config::restore_global_conversion_proxy();
         }
     });
 }

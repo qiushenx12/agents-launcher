@@ -77,7 +77,30 @@ def install_deps():
 
 def run_dev():
     print("Starting Tauri dev mode...")
-    subprocess.run(["npm", "run", "tauri", "dev"], cwd=PROJECT_DIR, shell=True)
+    compact_log_dir = os.path.join(PROJECT_DIR, "log")
+    compact_log_path = os.path.join(compact_log_dir, "codex-compact-debug.log")
+    compact_debug_marker = os.path.join(compact_log_dir, "codex-compact-debug.enabled")
+    os.makedirs(compact_log_dir, exist_ok=True)
+    with open(compact_log_path, "w", encoding="utf-8"):
+        pass
+    with open(compact_debug_marker, "w", encoding="utf-8") as marker:
+        marker.write("dev.py\n")
+    print(f"Codex Compact protocol diagnostics enabled: {compact_log_path}")
+    dev_env = os.environ.copy()
+    dev_env["CODEX_PROXY_DEBUG_COMPACT"] = "1"
+    dev_env["CODEX_PROXY_DEBUG_COMPACT_LOG"] = compact_log_path
+    try:
+        subprocess.run(
+            ["npm", "run", "tauri", "dev"],
+            cwd=PROJECT_DIR,
+            shell=True,
+            env=dev_env,
+        )
+    finally:
+        try:
+            os.remove(compact_debug_marker)
+        except FileNotFoundError:
+            pass
 
 
 def main():

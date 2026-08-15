@@ -274,6 +274,25 @@
           <span class="settings-dropdown__group-value">界面布局</span>
           <span class="settings-dropdown__chevron">›</span>
         </button>
+        <button
+          class="settings-dropdown__group-trigger"
+          type="button"
+          role="switch"
+          :aria-checked="appSettingsStore.minimizeToTray"
+          @click="toggleMinimizeToTray"
+        >
+          <span>关闭时最小化到托盘</span>
+          <span class="settings-dropdown__group-value">
+            {{ appSettingsStore.minimizeToTray ? '已开启' : '已关闭' }}
+          </span>
+          <span
+            class="settings-dropdown__switch"
+            :class="{ 'is-on': appSettingsStore.minimizeToTray }"
+            aria-hidden="true"
+          >
+            <span />
+          </span>
+        </button>
         <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'project-drop-path' }" type="button" :aria-expanded="activeSettingsSubmenu === 'project-drop-path'" @click="toggleSettingsSubmenu('project-drop-path', $event)">
           <span>项目终端拖入文件</span>
           <span class="settings-dropdown__group-value">{{ claudeStore.projectDropPathMode === 'relative' ? '相对路径' : '仅文件名' }}</span>
@@ -392,9 +411,11 @@ import { useTerminalStore } from './stores/terminal'
 import { useMarkdownFontSize, MD_FONT_MIN, MD_FONT_MAX } from './composables/useMarkdownFontSize'
 import { useSettingsPopover } from './composables/useSettingsPopover'
 import { useProjectStore } from './stores/project'
+import { useCodexConfigStore } from './stores/codexConfig'
 import { useCliRuntimeStore } from './stores/cliRuntime'
 import { useConfigWorkspaceStore } from './stores/configWorkspace'
 import { useTopBarStore } from './stores/topBar'
+import { useAppSettingsStore } from './stores/appSettings'
 import { usePlatform } from './composables/usePlatform'
 import {
   shouldStartTitleBarDrag,
@@ -437,9 +458,11 @@ const claudeObserverStore = useClaudeObserverStore()
 const claudeViewModeStore = useClaudeViewModeStore()
 const terminalStore = useTerminalStore()
 const projectStore = useProjectStore()
+const codexConfigStore = useCodexConfigStore()
 const cliRuntimeStore = useCliRuntimeStore()
 const configWorkspaceStore = useConfigWorkspaceStore()
 const topBarStore = useTopBarStore()
+const appSettingsStore = useAppSettingsStore()
 const { isWindows, isMacOS } = usePlatform()
 const usesNativeMacTitleBar = computed(() => isMacOS.value)
 const terminalManagerRef = ref<InstanceType<typeof TerminalManager> | null>(null)
@@ -881,6 +904,15 @@ function setProjectDropPathMode(mode: 'filename' | 'relative') {
   showSettings.value = false
 }
 
+async function toggleMinimizeToTray() {
+  const enabled = !appSettingsStore.minimizeToTray
+  try {
+    await appSettingsStore.setMinimizeToTray(enabled)
+  } catch (error) {
+    projectStore.statusMessage = `关闭时最小化到托盘设置保存失败：${String(error)}`
+  }
+}
+
 async function setClaudeBusyInputMode(mode: 'native' | 'after-stop') {
   try {
     await claudeObserverStore.setBusyInputMode(mode)
@@ -1041,6 +1073,16 @@ watch(() => claudeStore.switchToProject, async (val) => {
     await openClaudeTab()
   }
 })
+
+let codexProfileWatchInitialized = false
+watch(() => codexConfigStore.activeProfileId, (profileId, previousProfileId) => {
+  if (!codexProfileWatchInitialized) {
+    codexProfileWatchInitialized = true
+    return
+  }
+  if (profileId === previousProfileId) return
+  void projectStore.refreshCodexProfileSessions()
+}, { flush: 'sync' })
 
 // Ensure terminal panes re-fit when switching from config back to terminal tab.
 // The ResizeObserver skips fits when the container is hidden (0×0), so we need
@@ -1208,6 +1250,7 @@ onMounted(async () => {
   await claudeViewModeStore.load()
   await claudeObserverStore.loadBusyInputMode()
   await topBarStore.loadOrder()
+  await appSettingsStore.load()
   await loadWindowState()
   await loadLastMainTab()
   if (usesNativeMacTitleBar.value) {
@@ -1252,6 +1295,16 @@ onMounted(async () => {
   // we must call win.close() ourselves after finishing async work.
   win.onCloseRequested(async (event) => {
     event.preventDefault()
+    if (appSettingsStore.minimizeToTray) {
+      try {
+        await invoke('save_last_active_main_tab', { tab: mainTab.value })
+        await saveWindowState()
+      } catch (e) {
+        console.error('Failed to save window state before hiding to tray:', e)
+      }
+      await win.hide().catch(() => {})
+      return
+    }
     if (mainTab.value === 'config'
       && !(await configWorkspaceStore.confirmDiscardActiveChanges('关闭应用'))) {
       return

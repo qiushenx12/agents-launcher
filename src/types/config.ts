@@ -62,6 +62,9 @@ export interface CodexProfile {
   providerName: string
   baseUrl: string
   wireApi: 'responses'
+  protocolConversion: boolean
+  chatUpstreamModel: string
+  promptCacheRouting: 'auto' | 'enabled' | 'disabled' | string
   envKey: string
   hasStoredApiKey: boolean
   managedProfileName: string
@@ -82,6 +85,7 @@ export interface CodexProfilesPayload {
   activeProfileId: string | null
   globalProfileId: string | null
   globalProfileInSync: boolean
+  globalSyncRepairRequired: boolean
   profilesPath: string
   globalConfigPath: string
   authPath: string
