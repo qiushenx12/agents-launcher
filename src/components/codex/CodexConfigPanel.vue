@@ -140,7 +140,7 @@
         </template>
 
         <ModelField
-          v-if="profile.authMode === 'custom' && !profile.modelCatalog"
+          v-if="!profile.modelCatalog"
           v-model="profile.model"
           label="默认模型"
           :models="store.availableModels"
@@ -302,7 +302,7 @@
         </div>
 
 
-        <div v-if="profile.authMode === 'custom'" class="field-row">
+        <div class="field-row">
           <label class="field-label">推理强度</label>
           <div class="field-inline">
             <input
@@ -467,20 +467,28 @@ const appApplied = computed(() => Boolean(
 const globalApplied = computed(() => Boolean(
   profile.value.id && store.globalProfileId === profile.value.id,
 ))
+const canReapplyOfficialGlobal = computed(() => Boolean(
+  profile.value.authMode === 'official'
+  && store.syncToGlobal
+  && appApplied.value
+  && globalApplied.value,
+))
 const applyDisabled = computed(() => (
   !profile.value.id
   || store.isDirty
   || store.applying
   || store.apiKeyRevealing
   || (appApplied.value && (!store.syncToGlobal
-    || (globalApplied.value && store.globalProfileInSync)))
+    || (globalApplied.value && store.globalProfileInSync && !canReapplyOfficialGlobal.value)))
 ))
 const applyButtonLabel = computed(() => {
   if (store.applying) return '应用并校验中…'
   if (!profile.value.id || store.isDirty) return '请先保存'
   if (store.syncToGlobal) {
     if (appApplied.value && globalApplied.value) {
-      return store.globalProfileInSync ? '全局应用中' : '重新同步全局'
+      return store.globalProfileInSync && profile.value.authMode === 'official'
+        ? '重新应用全局'
+        : store.globalProfileInSync ? '全局应用中' : '重新同步全局'
     }
     return '应用并同步全局'
   }

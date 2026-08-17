@@ -2631,13 +2631,34 @@ fn global_profile_matches_document_with_proxy(
     {
         expected_profile.base_url = global_conversion_proxy_url();
     }
-    build_global_toml_with_model_catalog_restore(
+    let Ok(expected) = build_global_toml_with_model_catalog_restore(
         Some(raw),
         state.managed_global_provider_id.as_deref(),
         &expected_profile,
         restore_value.as_ref(),
-    )
-    .is_ok_and(|expected| expected == raw)
+    ) else {
+        return false;
+    };
+
+    if profile.auth_mode != CodexAuthMode::Official {
+        return expected == raw;
+    }
+
+    // Official Codex sessions may update these fields themselves (for example
+    // when the desktop client changes the selected model). They are not part
+    // of the official profile's global consistency check, whether or not the
+    // launcher profile has a value configured for them.
+    let Ok(mut expected_document) = DocumentMut::from_str(&expected) else {
+        return false;
+    };
+    let Ok(mut actual_document) = DocumentMut::from_str(raw) else {
+        return false;
+    };
+    for document in [&mut expected_document, &mut actual_document] {
+        document.as_table_mut().remove("model");
+        document.as_table_mut().remove("model_reasoning_effort");
+    }
+    expected_document.to_string() == actual_document.to_string()
 }
 
 fn global_profile_matches_document(state: &CodexProfileState, raw: &str) -> bool {
@@ -4658,7 +4679,7 @@ mod tests {
     }
 
     #[test]
-    fn global_sync_status_detects_saved_profile_changes() {
+    fn global_sync_status_ignores_official_model_fields_but_detects_other_changes() {
         let profile = official_profile();
         let rendered = build_global_toml(None, None, &profile).expect("render global config");
         let mut state = CodexProfileState::default();
@@ -4667,10 +4688,39 @@ mod tests {
 
         assert!(global_profile_matches_document(&state, &rendered));
 
-        state.profiles[0].model = "gpt-updated".to_string();
+        let mut external = DocumentMut::from_str(&rendered).expect("parse global config");
+        external["model"] = value("gpt-updated");
+        external["model_reasoning_effort"] = value("xhigh");
         assert!(
-            !global_profile_matches_document(&state, &rendered),
-            "saving the same profile with new values must require a global re-sync",
+            global_profile_matches_document(&state, &external.to_string()),
+            "official model fields must not require a global re-sync",
+        );
+
+        external["model_provider"] = value("unexpected-provider");
+        assert!(
+            !global_profile_matches_document(&state, &external.to_string()),
+            "launcher-managed official config fields must still require a global re-sync",
+        );
+    }
+
+    #[test]
+    fn custom_global_sync_still_compares_model_fields() {
+        let mut profile = official_profile();
+        profile.auth_mode = CodexAuthMode::Custom;
+        profile.provider_id = "custom".to_string();
+        profile.provider_name = "Custom".to_string();
+        profile.base_url = "https://proxy.example.com/v1".to_string();
+        let rendered = build_global_toml(None, None, &profile).expect("render global config");
+        let mut state = CodexProfileState::default();
+        state.global_profile_id = Some(profile.id.clone());
+        state.managed_global_provider_id = Some(profile.provider_id.clone());
+        state.profiles.push(profile);
+
+        let mut external = DocumentMut::from_str(&rendered).expect("parse global config");
+        external["model"] = value("gpt-updated");
+        assert!(
+            !global_profile_matches_document(&state, &external.to_string()),
+            "custom profile model fields remain launcher-managed",
         );
     }
 

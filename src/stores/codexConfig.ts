@@ -564,6 +564,10 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     if (!profile || isDirty.value || applying.value || apiKeyRevealing.value) return false
     const applyToGlobal = syncToGlobal.value
       && (profile.authMode === 'official' || customGlobalSyncSupported.value)
+    const forceOfficialGlobalApply = applyToGlobal
+      && profile.authMode === 'official'
+      && profile.id === activeProfileId.value
+      && profile.id === globalProfileId.value
     let protocolConversionWithoutTray = false
 
     if (profile.protocolConversion && profile.authMode === 'custom') {
@@ -591,7 +595,9 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
 
     if (profile.id === activeProfileId.value
       && (!applyToGlobal
-        || (profile.id === globalProfileId.value && globalProfileInSync.value))) return true
+        || (profile.id === globalProfileId.value
+          && globalProfileInSync.value
+          && !forceOfficialGlobalApply))) return true
 
     applying.value = true
     try {
