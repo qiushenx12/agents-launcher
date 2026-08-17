@@ -522,7 +522,10 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
       })
       applyPayload(payload, profile.id)
       syncToGlobal.value = requestedGlobalSync
-      statusMessage.value = `CodeX 配置 '${editingProfile.value.name}' 已保存并通过磁盘校验`
+      statusMessage.value =
+        payload.globalProfileId === profile.id && !payload.globalProfileInSync
+          ? `CodeX 配置 '${editingProfile.value.name}' 已保存；全局配置待更新，请点击“重新同步全局”`
+          : `CodeX 配置 '${editingProfile.value.name}' 已保存并通过磁盘校验`
       return true
     } catch (error) {
       statusMessage.value = `保存 CodeX 配置失败，表单内容已保留：${error}`

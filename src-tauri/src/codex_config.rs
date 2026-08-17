@@ -2728,6 +2728,13 @@ fn global_profile_in_sync(state: &CodexProfileState) -> Result<bool, String> {
     let Some(profile_id) = state.global_profile_id.as_deref() else {
         return Ok(false);
     };
+    let Some(profile) = state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        return Ok(false);
+    };
     let path = global_config_path()?;
     if !path.exists() {
         return Ok(false);
@@ -2737,14 +2744,81 @@ fn global_profile_in_sync(state: &CodexProfileState) -> Result<bool, String> {
     if !global_profile_matches_document(state, &raw) {
         return Ok(false);
     }
+    // 全局 config.toml 只引用模型目录文件路径，编辑模型目录（如上下文长度）
+    // 后路径本身不变，必须再比较文件内容与 profile 当前渲染结果，否则保存
+    // 后会误报“全局应用中”，用户无法直接重新同步。
+    if !global_model_catalog_in_sync(profile) {
+        return Ok(false);
+    }
     #[cfg(windows)]
     {
         let expected = profile_home(profile_id)?.to_string_lossy().to_string();
         if read_user_env_var(CODEX_HOME_ENV)?.as_deref() != Some(expected.as_str()) {
             return Ok(false);
         }
+        // 全局 Key 持久化在用户环境变量中，保存修改 Key 后 config.toml
+        // 内容不变，同样需要单独比较实际值，让用户保存后立刻可重新同步。
+        if profile.auth_mode == CodexAuthMode::Custom
+            && custom_global_key_sync_supported()
+            && !global_key_env_in_sync(profile)
+        {
+            return Ok(false);
+        }
     }
     Ok(true)
+}
+
+fn global_model_catalog_in_sync(profile: &CodexProfile) -> bool {
+    let path = match managed_model_catalog_path(&profile.id) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let current = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return false,
+    };
+    global_model_catalog_content_in_sync(profile, current.as_deref())
+}
+
+fn global_model_catalog_content_in_sync(profile: &CodexProfile, current: Option<&[u8]>) -> bool {
+    if profile.auth_mode != CodexAuthMode::Custom || profile.model_catalog.is_none() {
+        return true;
+    }
+    match render_model_catalog(profile) {
+        Ok(expected) => current == Some(expected.as_slice()),
+        Err(_) => false,
+    }
+}
+
+fn global_key_env_in_sync(profile: &CodexProfile) -> bool {
+    let stored_secret = read_profile_secret(&profile.id).ok().flatten();
+    let env_value = read_user_env_var(&profile.env_key).ok().flatten();
+    let managed_record = load_managed_global_env().ok().flatten();
+    global_key_env_content_in_sync(
+        profile.has_stored_api_key,
+        stored_secret.as_deref(),
+        env_value.as_deref(),
+        managed_record.as_ref(),
+        &profile.env_key,
+    )
+}
+
+fn global_key_env_content_in_sync(
+    has_stored_api_key: bool,
+    stored_secret: Option<&str>,
+    env_value: Option<&str>,
+    managed_record: Option<&ManagedGlobalEnv>,
+    env_key: &str,
+) -> bool {
+    if has_stored_api_key {
+        return matches!(
+            (stored_secret, env_value),
+            (Some(stored), Some(env)) if env == stored
+        );
+    }
+    // 启动器曾把全局 Key 写入用户环境变量；清除 Key 后残留值也需要重新同步清理。
+    managed_record.is_none_or(|record| record.key != env_key)
 }
 
 fn load_payload() -> Result<CodexProfilesPayload, String> {
@@ -4722,6 +4796,94 @@ mod tests {
             !global_profile_matches_document(&state, &external.to_string()),
             "custom profile model fields remain launcher-managed",
         );
+    }
+
+    #[test]
+    fn global_sync_detects_stale_managed_model_catalog_content() {
+        let profile = custom_profile_with_catalog();
+        let rendered = render_model_catalog(&profile).expect("render catalog");
+
+        // 非第三方或没有模型目录的 profile 不参与目录文件比较。
+        let mut no_catalog = profile.clone();
+        no_catalog.model_catalog = None;
+        assert!(global_model_catalog_content_in_sync(&no_catalog, None));
+
+        // 文件内容与当前渲染结果一致视为已同步。
+        assert!(global_model_catalog_content_in_sync(
+            &profile,
+            Some(rendered.as_slice()),
+        ));
+
+        // 保存更新上下文长度后，旧文件内容必须判定为未同步，
+        // 否则 UI 会停留在“全局应用中”而无法直接重新同步。
+        let stale = String::from_utf8(rendered.clone()).expect("utf8 catalog")
+            .replace("1048576", "2097152")
+            .into_bytes();
+        assert_ne!(stale, rendered);
+        assert!(!global_model_catalog_content_in_sync(&profile, Some(stale.as_slice())));
+
+        // 托管模型目录文件缺失同样视为未同步。
+        assert!(!global_model_catalog_content_in_sync(&profile, None));
+    }
+
+    #[test]
+    fn global_sync_detects_stale_global_api_key_env() {
+        // 有已存 Key：用户环境变量的实际值必须等于已存 Key。
+        assert!(global_key_env_content_in_sync(
+            true,
+            Some("sk-test"),
+            Some("sk-test"),
+            None,
+            "OPENAI_API_KEY",
+        ));
+        assert!(!global_key_env_content_in_sync(
+            true,
+            Some("sk-new"),
+            Some("sk-old"),
+            None,
+            "OPENAI_API_KEY",
+        ));
+        assert!(!global_key_env_content_in_sync(
+            true,
+            None,
+            Some("sk-old"),
+            None,
+            "OPENAI_API_KEY",
+        ));
+        assert!(!global_key_env_content_in_sync(
+            true,
+            Some("sk-old"),
+            None,
+            None,
+            "OPENAI_API_KEY",
+        ));
+
+        // 无已存 Key：启动器托管的全局 Key 记录必须已被清理。
+        let managed = ManagedGlobalEnv {
+            key: "OPENAI_API_KEY".to_string(),
+            applied_value: "sk-old".to_string(),
+            previous_value: None,
+        };
+        let other = ManagedGlobalEnv {
+            key: "OTHER_KEY".to_string(),
+            applied_value: "sk-other".to_string(),
+            previous_value: None,
+        };
+        assert!(global_key_env_content_in_sync(false, None, None, None, "OPENAI_API_KEY"));
+        assert!(!global_key_env_content_in_sync(
+            false,
+            None,
+            None,
+            Some(&managed),
+            "OPENAI_API_KEY",
+        ));
+        assert!(global_key_env_content_in_sync(
+            false,
+            None,
+            None,
+            Some(&other),
+            "OPENAI_API_KEY",
+        ));
     }
 
     #[test]
