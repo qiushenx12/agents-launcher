@@ -484,6 +484,18 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
 
   async function saveProfile(): Promise<boolean> {
     if (saving.value || apiKeyRevealing.value) return false
+    const isAppliedGlobalProfile = Boolean(
+      editingProfile.value.id && editingProfile.value.id === globalProfileId.value,
+    )
+    const removesAppliedGlobalKey = editingProfile.value.hasStoredApiKey
+      && (clearStoredApiKey.value || editingProfile.value.authMode === 'official')
+    if (isAppliedGlobalProfile && removesAppliedGlobalKey) {
+      await confirm('不能删除应用中的配置', {
+        title: '不能删除应用中的配置',
+        kind: 'warning',
+      })
+      return false
+    }
     const profile = cloneProfile(editingProfile.value)
     if (!profile.id) profile.id = `profile-${crypto.randomUUID()}`
     const previousProfile = profiles.value.find(item => item.id === profile.id)
@@ -726,12 +738,16 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
   async function deleteProfile(profileId: string): Promise<boolean> {
     const profile = profiles.value.find(item => item.id === profileId)
     if (!profile) return false
+    if (activeProfileId.value === profileId || globalProfileId.value === profileId) {
+      await confirm('不能删除应用中的配置', {
+        title: '不能删除应用中的配置',
+        kind: 'warning',
+      })
+      return false
+    }
     if (!(await confirmDiscardChanges(`删除配置“${profile.name}”`))) return false
-    const globalNotice = globalProfileId.value === profileId
-      ? '该方案曾同步到全局；删除方案不会撤销已写入的全局 config.toml，请先同步另一个全局方案。'
-      : ''
     const accepted = await confirm(
-      `确定删除 CodeX 配置“${profile.name}”吗？对应的启动器 profile TOML 和加密凭据也会删除。${globalNotice}`,
+      `确定删除 CodeX 配置“${profile.name}”吗？对应的启动器 profile TOML 和加密凭据也会删除。`,
       { title: '删除 CodeX 配置', kind: 'warning' },
     )
     if (!accepted) return false
@@ -752,8 +768,7 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
       })
       applyPayload(payload, nextSelected)
       const activeNotice = activeProfileId.value ? '' : '；当前没有应用启动器方案'
-      const removedGlobalNotice = globalNotice ? '；已写入的全局配置保持不变' : ''
-      statusMessage.value = `CodeX 配置 '${profile.name}' 已删除${activeNotice}${removedGlobalNotice}`
+      statusMessage.value = `CodeX 配置 '${profile.name}' 已删除${activeNotice}`
       return true
     } catch (error) {
       statusMessage.value = `删除 CodeX 配置失败：${error}`

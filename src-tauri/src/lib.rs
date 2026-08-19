@@ -26,7 +26,7 @@ pub mod utils;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 mod window_theme {
     #[cfg(target_os = "windows")]
@@ -65,6 +65,11 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
+#[tauri::command]
+fn exit_application(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(
         app,
@@ -88,7 +93,10 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .tooltip("Agents Launcher")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                show_main_window(app);
+                let _ = app.emit("tray-quit-requested", ());
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -280,6 +288,7 @@ pub fn run() {
             tab_cli::load_preset,
             // window theme
             window_theme::set_titlebar_theme,
+            exit_application,
             // native macOS fullscreen transition
             macos_window::toggle_animated_fullscreen,
         ])

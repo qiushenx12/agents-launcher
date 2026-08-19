@@ -1034,6 +1034,7 @@ async function retryCliGateCheck() {
 const activeLaunchDir = computed(() => claudeStore.launchDir)
 let unlistenClaudeHistory: (() => void) | undefined
 let unlistenClaudeSessionLifecycle: (() => void) | undefined
+let unlistenTrayQuit: (() => void) | undefined
 let refreshingClaudeHistory = false
 
 async function refreshClaudeHistory() {
@@ -1050,6 +1051,30 @@ async function refreshClaudeHistory() {
     console.error('Failed to refresh Claude history:', error)
   } finally {
     refreshingClaudeHistory = false
+  }
+}
+
+let trayQuitInProgress = false
+
+async function handleTrayQuitRequest() {
+  if (trayQuitInProgress) return
+  trayQuitInProgress = true
+  try {
+    if (mainTab.value === 'config'
+      && !(await configWorkspaceStore.confirmDiscardActiveChanges('退出应用'))) {
+      return
+    }
+    try {
+      await invoke('save_last_active_main_tab', { tab: mainTab.value })
+      await saveWindowState()
+    } catch (error) {
+      console.error('Failed to save window state before tray exit:', error)
+    }
+    await invoke('exit_application')
+  } catch (error) {
+    console.error('Failed to exit application from tray:', error)
+  } finally {
+    trayQuitInProgress = false
   }
 }
 
@@ -1274,6 +1299,9 @@ onMounted(async () => {
       console.error('Failed to refresh Claude history:', error)
     })
   }).catch(() => undefined)
+  unlistenTrayQuit = await listen('tray-quit-requested', () => {
+    void handleTrayQuitRequest()
+  }).catch(() => undefined)
 
   unlistenMacFullscreenRequest = await listen<boolean>(
     'macos-fullscreen-toggle-requested',
@@ -1331,6 +1359,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('click', onDocumentClick)
   unlistenClaudeSessionLifecycle?.()
   unlistenClaudeHistory?.()
+  unlistenTrayQuit?.()
   unlistenMacFullscreenRequest?.()
   unlistenWindowResized?.()
   if (macFullscreenSyncTimer !== null) {

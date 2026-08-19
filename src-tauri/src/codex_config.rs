@@ -1397,6 +1397,15 @@ fn profile_rename_block_reason(
     }
 }
 
+fn profile_is_applied(
+    state: &CodexProfileState,
+    index: &ProfileIndexState,
+    profile_id: &str,
+) -> bool {
+    state.global_profile_id.as_deref() == Some(profile_id)
+        || index.active_profile_id.as_deref() == Some(profile_id)
+}
+
 fn set_optional_string(document: &mut DocumentMut, key: &str, value_text: &str) {
     if value_text.is_empty() {
         document.as_table_mut().remove(key);
@@ -2469,6 +2478,16 @@ pub(crate) fn resolve_profile_api_key(profile: &CodexProfile) -> Result<String, 
     })
 }
 
+fn would_remove_profile_secret(
+    profile: &CodexProfile,
+    clear_api_key: bool,
+    previous_secret: Option<&str>,
+) -> bool {
+    previous_secret.is_some()
+        && (profile.auth_mode == CodexAuthMode::Official
+            || (profile.auth_mode == CodexAuthMode::Custom && clear_api_key))
+}
+
 fn auth_status() -> Result<CodexAuthStatus, String> {
     let path = auth_path()?;
     if !path.exists() {
@@ -2791,6 +2810,7 @@ fn global_model_catalog_content_in_sync(profile: &CodexProfile, current: Option<
     }
 }
 
+#[cfg(windows)]
 fn global_key_env_in_sync(profile: &CodexProfile) -> bool {
     let stored_secret = read_profile_secret(&profile.id).ok().flatten();
     let env_value = read_user_env_var(&profile.env_key).ok().flatten();
@@ -2804,6 +2824,7 @@ fn global_key_env_in_sync(profile: &CodexProfile) -> bool {
     )
 }
 
+#[allow(dead_code)] // exercised by tests on all platforms; called on Windows only
 fn global_key_env_content_in_sync(
     has_stored_api_key: bool,
     stored_secret: Option<&str>,
@@ -2962,6 +2983,15 @@ pub fn save_codex_profile(
         None
     };
     let previous_secret = read_profile_secret(&profile.id)?;
+    if state.global_profile_id.as_deref() == Some(profile.id.as_str())
+        && would_remove_profile_secret(
+            &profile,
+            request.clear_api_key,
+            previous_secret.as_deref(),
+        )
+    {
+        return Err("不能删除应用中的配置".to_string());
+    }
     let profile_model_catalog_is_managed = profile.auth_mode == CodexAuthMode::Custom
         && profile.model_catalog.is_some();
     if let Some(previous) = state.managed_profile_model_catalogs.get(&profile.id) {
@@ -3456,12 +3486,16 @@ pub fn delete_codex_profile(
     let metadata_path = profiles_path()?;
     let profile_path = managed_profile_path(&request.profile_id)?;
     let mut state = load_profile_state()?;
+    let previous_index = load_profile_index_state(CODEX_STATE_KEY)?;
     if !state
         .profiles
         .iter()
         .any(|profile| profile.id == request.profile_id)
     {
         return Err("要删除的 CodeX 配置不存在".to_string());
+    }
+    if profile_is_applied(&state, &previous_index, &request.profile_id) {
+        return Err("不能删除应用中的配置".to_string());
     }
     let deleted_profile = state
         .profiles
@@ -3475,7 +3509,6 @@ pub fn delete_codex_profile(
     let previous_metadata = fs::read(&metadata_path).ok();
     let previous_toml = fs::read(&profile_path).ok();
     let previous_secret = read_profile_secret(&request.profile_id)?;
-    let previous_index = load_profile_index_state(CODEX_STATE_KEY)?;
     state
         .profiles
         .retain(|profile| profile.id != request.profile_id);
@@ -4044,6 +4077,37 @@ mod tests {
         assert_eq!(store.read("profile-b").expect("read deleted"), None);
     }
 
+    #[test]
+    fn applied_profile_secret_guard_only_blocks_secret_removal() {
+        let mut profile = official_profile();
+        assert!(would_remove_profile_secret(&profile, false, Some("secret")));
+        assert!(!would_remove_profile_secret(&profile, false, None));
+
+        profile.auth_mode = CodexAuthMode::Custom;
+        assert!(!would_remove_profile_secret(&profile, false, Some("secret")));
+        assert!(would_remove_profile_secret(&profile, true, Some("secret")));
+        assert!(!would_remove_profile_secret(&profile, true, None));
+    }
+
+    #[test]
+    fn applied_profile_delete_guard_blocks_active_and_global_profiles() {
+        let mut state = CodexProfileState::default();
+        let mut index = ProfileIndexState {
+            order: vec!["profile-active".to_string(), "profile-global".to_string()],
+            profile_ids: BTreeMap::new(),
+            active_profile_id: Some("profile-active".to_string()),
+        };
+        state.global_profile_id = Some("profile-global".to_string());
+
+        assert!(profile_is_applied(&state, &index, "profile-active"));
+        assert!(profile_is_applied(&state, &index, "profile-global"));
+        assert!(!profile_is_applied(&state, &index, "profile-other"));
+
+        index.active_profile_id = None;
+        state.global_profile_id = None;
+        assert!(!profile_is_applied(&state, &index, "profile-active"));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_reports_plaintext_storage_and_disables_user_env_sync() {
@@ -4108,7 +4172,7 @@ mod tests {
 
         let rendered = build_global_toml(None, None, &profile).expect("render global config");
         let document = DocumentMut::from_str(&rendered).expect("parse");
-        let provider = document["model_providers"]["company_proxy"]
+        let provider = document["model_providers"][profile.provider_id.as_str()]
             .as_table()
             .expect("provider table");
         assert!(provider.get("env_key").is_none());
