@@ -88,6 +88,29 @@
       </div>
     </div>
 
+    <!-- CLAUDE_CODE_MAX_CONTEXT_TOKENS -->
+    <div class="field-row">
+      <label class="field-label">上下文长度</label>
+      <div class="field-inline">
+        <input
+          class="input"
+          type="number"
+          min="1"
+          step="1"
+          v-model="vars.CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+          placeholder="token 数，留空则不设置"
+        />
+        <select
+          class="select context-select"
+          :value="contextPresetValue"
+          @change="onContextPresetSelect"
+        >
+          <option value="custom">自定义</option>
+          <option v-for="opt in contextPresets" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+        </select>
+      </div>
+    </div>
+
     <!-- DISABLE_AUTOUPDATER -->
     <div class="field-row">
       <label class="field-label">禁用自动更新</label>
@@ -196,6 +219,19 @@ const { isWindows } = usePlatform()
 const vars = computed(() => store.editingConfig.vars)
 
 const effortOptions = ['low', 'medium', 'high', 'xhigh', 'max', 'auto']
+
+const contextPresets = [
+  { label: '128k', value: String(128 * 1024) },
+  { label: '200k', value: String(200 * 1024) },
+  { label: '256k', value: String(256 * 1024) },
+  { label: '512k', value: String(512 * 1024) },
+  { label: '1m', value: String(1024 * 1024) },
+] as const
+
+const contextPresetValue = computed(() => {
+  const current = (vars.value['CLAUDE_CODE_MAX_CONTEXT_TOKENS'] ?? '').trim()
+  return contextPresets.some(p => p.value === current) ? current : 'custom'
+})
 const statusTone = computed<'info' | 'success' | 'warning' | 'error'>(() => {
   if (/失败|错误|无效|损坏|不存在/.test(store.statusMessage)) return 'error'
   if (/已保存|已应用|已获取|已启动/.test(store.statusMessage)) return 'success'
@@ -207,6 +243,12 @@ function onEffortSelect(event: Event) {
   if (val) store.editingConfig.vars['CLAUDE_CODE_EFFORT_LEVEL'] = val
   // reset select back to placeholder
   ;(event.target as HTMLSelectElement).value = ''
+}
+
+function onContextPresetSelect(event: Event) {
+  const val = (event.target as HTMLSelectElement).value
+  if (val === 'custom') return
+  store.editingConfig.vars['CLAUDE_CODE_MAX_CONTEXT_TOKENS'] = val
 }
 
 async function openJsonDir() {
@@ -275,7 +317,8 @@ async function openClaudePath() {
   min-width: 0;
 }
 
-.effort-select {
+.effort-select,
+.context-select {
   width: 100px;
   flex-shrink: 0;
 }
