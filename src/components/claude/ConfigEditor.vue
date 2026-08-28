@@ -97,8 +97,9 @@
           type="number"
           min="1"
           step="1"
-          v-model="vars.CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+          :value="vars.CLAUDE_CODE_MAX_CONTEXT_TOKENS ?? ''"
           placeholder="token 数，留空则不设置"
+          @input="onContextInput"
         />
         <select
           class="select context-select"
@@ -229,7 +230,7 @@ const contextPresets = [
 ] as const
 
 const contextPresetValue = computed(() => {
-  const current = (vars.value['CLAUDE_CODE_MAX_CONTEXT_TOKENS'] ?? '').trim()
+  const current = String(vars.value['CLAUDE_CODE_MAX_CONTEXT_TOKENS'] ?? '').trim()
   return contextPresets.some(p => p.value === current) ? current : 'custom'
 })
 const statusTone = computed<'info' | 'success' | 'warning' | 'error'>(() => {
@@ -243,6 +244,13 @@ function onEffortSelect(event: Event) {
   if (val) store.editingConfig.vars['CLAUDE_CODE_EFFORT_LEVEL'] = val
   // reset select back to placeholder
   ;(event.target as HTMLSelectElement).value = ''
+}
+
+function onContextInput(event: Event) {
+  // type="number" 下 v-model 会自动转成 number，这里手动存字符串，
+  // 与 Record<string, string> 及后端 HashMap<String, String> 保持一致
+  store.editingConfig.vars['CLAUDE_CODE_MAX_CONTEXT_TOKENS'] =
+    (event.target as HTMLInputElement).value
 }
 
 function onContextPresetSelect(event: Event) {
