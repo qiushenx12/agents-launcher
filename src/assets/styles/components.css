@@ -14,7 +14,9 @@
   border: none;
   border-radius: var(--radius-sm);
   cursor: pointer;
-  transition: background-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+  /* 不对 opacity 做过渡：WKWebView 会把渐变中的按钮提升为合成层并按 tile
+     分块更新，禁用态淡入淡出时可能残留旧颜色块（macOS 特有问题） */
+  transition: background-color 0.15s ease, color 0.15s ease;
   white-space: nowrap;
   user-select: none;
 }
