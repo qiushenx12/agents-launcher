@@ -159,6 +159,11 @@ pub struct CodexProfile {
     pub model: String,
     #[serde(default)]
     pub reasoning_effort: String,
+    /// Optional override for the active model's context window in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<u64>,
+    #[serde(default)]
+    pub model_context_window_configured: bool,
     #[serde(default)]
     pub openai_base_url: String,
     #[serde(default)]
@@ -1447,6 +1452,12 @@ fn normalize_profile(mut profile: CodexProfile) -> Result<CodexProfile, String> 
     profile.managed_profile_name = managed_profile_name(&profile.id);
     profile.model = profile.model.trim().to_string();
     profile.reasoning_effort = profile.reasoning_effort.trim().to_string();
+    if let Some(context_window) = profile.model_context_window {
+        if context_window == 0 || context_window > i64::MAX as u64 {
+            return Err("model_context_window 必须是正整数".to_string());
+        }
+        profile.model_context_window_configured = true;
+    }
     profile.chat_upstream_model = profile.chat_upstream_model.trim().to_string();
     profile.prompt_cache_routing = profile.prompt_cache_routing.trim().to_ascii_lowercase();
     if profile.prompt_cache_routing.is_empty() {
@@ -1572,6 +1583,36 @@ fn set_optional_string(document: &mut DocumentMut, key: &str, value_text: &str) 
     } else {
         document[key] = value(value_text);
     }
+}
+
+fn set_optional_u64(
+    document: &mut DocumentMut,
+    key: &str,
+    value_number: Option<u64>,
+) -> Result<(), String> {
+    let Some(value_number) = value_number else {
+        document.as_table_mut().remove(key);
+        return Ok(());
+    };
+    let value_number = i64::try_from(value_number)
+        .map_err(|_| format!("{key} 必须是 TOML 支持的正整数"))?;
+    document[key] = value(value_number);
+    Ok(())
+}
+
+fn model_context_window_from_raw(raw: &str, label: &str) -> Result<Option<u64>, String> {
+    let document = DocumentMut::from_str(raw)
+        .map_err(|error| format!("{label}无法解析：{error}"))?;
+    let Some(item) = document.get("model_context_window") else {
+        return Ok(None);
+    };
+    let Some(value_number) = item.as_value().and_then(|item| item.as_integer()) else {
+        return Err(format!("{label}的 model_context_window 必须是正整数"));
+    };
+    if value_number <= 0 {
+        return Err(format!("{label}的 model_context_window 必须是正整数"));
+    }
+    Ok(Some(value_number as u64))
 }
 
 fn model_catalog_json_value(document: &DocumentMut) -> Option<String> {
@@ -1738,6 +1779,16 @@ fn build_codex_toml_with_model_catalog_restore(
         "model_reasoning_effort",
         &profile.reasoning_effort,
     );
+    if profile.auth_mode == CodexAuthMode::Official
+        || profile.model_context_window_configured
+        || profile.model_context_window.is_some()
+    {
+        set_optional_u64(
+            &mut document,
+            "model_context_window",
+            profile.model_context_window,
+        )?;
+    }
     if document
         .get("sqlite_home")
         .and_then(Item::as_value)
@@ -2795,6 +2846,19 @@ fn prepare_profiles_for_load(state: &mut CodexProfileState) -> Result<(), String
     let previous_managed_api_key = load_managed_global_env()?;
     transition_managed_global_env(None, previous_managed_api_key.as_ref())?;
     migrate_latest_official_auth(state)?;
+    let global_model_context_window = if state.global_profile_id.is_some() {
+        let path = global_config_path()?;
+        if path.exists() {
+            let raw = fs::read_to_string(&path).map_err(|error| {
+                format!("无法读取全局 CodeX config.toml：{error}")
+            })?;
+            model_context_window_from_raw(&raw, "全局 CodeX config.toml")?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     for profile in &mut state.profiles {
         profile.managed_profile_name = managed_profile_name(&profile.id);
         profile.has_stored_api_key = profile_secret_exists(&profile.id)?;
@@ -2807,6 +2871,23 @@ fn prepare_profiles_for_load(state: &mut CodexProfileState) -> Result<(), String
             DocumentMut::from_str(&raw).map_err(|error| {
                 format!("CodeX profile {} 无法解析：{error}", profile_path.display())
             })?;
+            profile.model_context_window = model_context_window_from_raw(
+                &raw,
+                &format!("CodeX profile {} ", profile_path.display()),
+            )?;
+            if profile.model_context_window.is_some() {
+                profile.model_context_window_configured = true;
+            }
+        }
+        if !profile.model_context_window_configured
+            && profile.model_context_window.is_none()
+            && profile.auth_mode == CodexAuthMode::Official
+            && state.global_profile_id.as_deref() == Some(profile.id.as_str())
+        {
+            profile.model_context_window = global_model_context_window;
+            if profile.model_context_window.is_some() {
+                profile.model_context_window_configured = true;
+            }
         }
     }
     synchronize_shared_provider_registry(state)?;
@@ -4312,6 +4393,8 @@ mod tests {
             auth_mode: CodexAuthMode::Official,
             model: "gpt-5.6".to_string(),
             reasoning_effort: "high".to_string(),
+            model_context_window: None,
+            model_context_window_configured: false,
             openai_base_url: String::new(),
             provider_id: String::new(),
             provider_name: String::new(),
@@ -4608,6 +4691,48 @@ mod tests {
         assert_eq!(document["model"].as_str(), Some("gpt-5.6"));
         assert_eq!(document["model_provider"].as_str(), Some("openai"));
         assert_eq!(document["features"]["js_repl"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn official_profile_renders_model_context_window() {
+        let mut profile = official_profile();
+        profile.model_context_window = Some(1_050_000);
+        let rendered = build_profile_toml(None, None, &profile).expect("render");
+        let document = DocumentMut::from_str(&rendered).expect("parse");
+        assert_eq!(
+            document["model_context_window"].as_integer(),
+            Some(1_050_000)
+        );
+    }
+
+    #[test]
+    fn official_profile_can_remove_model_context_window() {
+        let existing = "model_context_window = 1000000\n";
+        let profile = official_profile();
+        let rendered = build_profile_toml(Some(existing), None, &profile).expect("render");
+        let document = DocumentMut::from_str(&rendered).expect("parse");
+        assert!(document.get("model_context_window").is_none());
+    }
+
+    #[test]
+    fn model_context_window_loader_accepts_positive_integers_only() {
+        assert_eq!(
+            model_context_window_from_raw("model_context_window = 1000000\n", "config.toml ")
+                .expect("load context window"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            model_context_window_from_raw("model = \"gpt-5.6\"\n", "config.toml ")
+                .expect("load absent context window"),
+            None
+        );
+        assert!(model_context_window_from_raw("model_context_window = 0\n", "config.toml ")
+            .is_err());
+        assert!(model_context_window_from_raw(
+            "model_context_window = \"1000000\"\n",
+            "config.toml "
+        )
+        .is_err());
     }
 
     #[test]
@@ -5327,6 +5452,12 @@ mod tests {
         assert!(
             global_profile_matches_document(&state, &external.to_string()),
             "official model fields must not require a global re-sync",
+        );
+
+        external["model_context_window"] = value(123_456_i64);
+        assert!(
+            !global_profile_matches_document(&state, &external.to_string()),
+            "official context window must require a global re-sync",
         );
 
         external["model_provider"] = value("unexpected-provider");

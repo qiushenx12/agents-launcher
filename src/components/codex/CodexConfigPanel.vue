@@ -147,6 +147,40 @@
           placeholder="留空则继承下层配置"
         />
 
+        <div v-if="profile.authMode === 'official'" class="field-row">
+          <label class="field-label">上下文长度</label>
+          <div class="field-inline context-window-field">
+            <input
+              :value="profile.modelContextWindow || ''"
+              class="input context-window-custom-input"
+              type="number"
+              min="1"
+              step="1"
+              aria-label="官方模型上下文长度"
+              placeholder="留空使用模型默认值"
+              @input="updateOfficialContextWindow($event)"
+            />
+            <select
+              class="select context-window-preset"
+              :value="contextWindowPresetValue(profile.modelContextWindow, officialContextWindowPresets)"
+              aria-label="官方模型上下文长度预设"
+              @change="updateOfficialContextWindowPreset($event)"
+            >
+              <option value="custom">自定义</option>
+              <option
+                v-for="preset in officialContextWindowPresets"
+                :key="preset.value"
+                :value="preset.value"
+              >
+                {{ preset.label }}
+              </option>
+            </select>
+          </div>
+        </div>
+        <p v-if="profile.authMode === 'official'" class="field-help">
+          写入 Codex 的 model_context_window；留空则使用模型默认值。
+        </p>
+
         <div v-if="profile.authMode === 'custom'" class="model-catalog-editor">
           <div class="field-row model-catalog-header">
             <label class="field-label">模型目录</label>
@@ -465,6 +499,15 @@ const contextWindowPresets = [
   { label: '512k', value: 512 * 1024 },
   { label: '1m', value: 1024 * 1024 },
 ] as const
+const officialContextWindowPresets = [
+  { label: '128k', value: 128 * 1024 },
+  { label: '200k', value: 200 * 1024 },
+  { label: '256k', value: 256 * 1024 },
+  { label: '400k', value: 400_000 },
+  { label: '512k', value: 512 * 1024 },
+  { label: '1m', value: 1_000_000 },
+  { label: '1.05m', value: 1_050_000 },
+] as const
 const appApplied = computed(() => Boolean(
   profile.value.id && store.activeProfileId === profile.value.id,
 ))
@@ -548,8 +591,31 @@ function updateModelName(model: { slug: string; displayName: string }, event: Ev
   }
 }
 
-function contextWindowPresetValue(value: number): string {
-  return contextWindowPresets.find(preset => preset.value === value)?.value.toString() ?? 'custom'
+function contextWindowPresetValue(
+  value: number | null | undefined,
+  presets: readonly { value: number }[] = contextWindowPresets,
+): string {
+  return presets.find(preset => preset.value === value)?.value.toString() ?? 'custom'
+}
+
+function updateOfficialContextWindow(event: Event) {
+  const raw = (event.target as HTMLInputElement).value.trim()
+  const parsed = Number(raw)
+  profile.value.modelContextWindowConfigured = true
+  profile.value.modelContextWindow = raw
+    && Number.isSafeInteger(parsed)
+    && parsed > 0
+    ? parsed
+    : null
+}
+
+function updateOfficialContextWindowPreset(event: Event) {
+  const value = (event.target as HTMLSelectElement).value
+  if (value === 'custom') return
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return
+  profile.value.modelContextWindowConfigured = true
+  profile.value.modelContextWindow = parsed
 }
 
 function updateContextWindowPreset(

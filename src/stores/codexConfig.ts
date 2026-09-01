@@ -74,6 +74,8 @@ function emptyProfile(): CodexProfile {
     authMode: 'official',
     model: '',
     reasoningEffort: '',
+    modelContextWindow: null,
+    modelContextWindowConfigured: false,
     openaiBaseUrl: '',
     providerId: '',
     providerName: '',
@@ -89,8 +91,20 @@ function emptyProfile(): CodexProfile {
   }
 }
 
+function normalizeModelContextWindow(value: unknown): number | null {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value > 0
+    ? value
+    : null
+}
+
 function cloneProfile(profile: CodexProfile): CodexProfile {
-  return JSON.parse(JSON.stringify(profile)) as CodexProfile
+  const cloned = JSON.parse(JSON.stringify(profile)) as CodexProfile
+  cloned.modelContextWindow = normalizeModelContextWindow(cloned.modelContextWindow)
+  cloned.modelContextWindowConfigured = Boolean(cloned.modelContextWindowConfigured)
+    || cloned.modelContextWindow !== null
+  return cloned
 }
 
 function defaultProfileName(): string {
@@ -130,6 +144,8 @@ function serializeDraft(profile: CodexProfile, apiKeyInput: string, clearApiKey:
     authMode: profile.authMode,
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
+    modelContextWindow: profile.modelContextWindow,
+    modelContextWindowConfigured: profile.modelContextWindowConfigured,
     openaiBaseUrl: profile.openaiBaseUrl,
     providerId: profile.providerId,
     providerName: profile.providerName,

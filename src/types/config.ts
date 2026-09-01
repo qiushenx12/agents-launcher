@@ -57,6 +57,8 @@ export interface CodexProfile {
   authMode: CodexAuthMode
   model: string
   reasoningEffort: string
+  modelContextWindow: number | null
+  modelContextWindowConfigured: boolean
   openaiBaseUrl: string
   providerId: string
   providerName: string

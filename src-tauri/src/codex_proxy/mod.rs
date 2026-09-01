@@ -396,6 +396,8 @@ mod tests {
             auth_mode: CodexAuthMode::Custom,
             model: "kimi-k2".to_string(),
             reasoning_effort: "high".to_string(),
+            model_context_window: None,
+            model_context_window_configured: false,
             openai_base_url: String::new(),
             provider_id: "kimi".to_string(),
             provider_name: "Kimi".to_string(),
