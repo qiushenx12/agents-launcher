@@ -398,6 +398,8 @@ mod tests {
             reasoning_effort: "high".to_string(),
             model_context_window: None,
             model_context_window_configured: false,
+            model_auto_compact_ratio: None,
+            model_auto_compact_ratio_configured: false,
             openai_base_url: String::new(),
             provider_id: "kimi".to_string(),
             provider_name: "Kimi".to_string(),

@@ -162,7 +162,7 @@
             />
             <select
               class="select context-window-preset"
-              :value="contextWindowPresetValue(profile.modelContextWindow, officialContextWindowPresets)"
+              :value="numericPresetValue(profile.modelContextWindow, officialContextWindowPresets)"
               aria-label="官方模型上下文长度预设"
               @change="updateOfficialContextWindowPreset($event)"
             >
@@ -179,6 +179,43 @@
         </div>
         <p v-if="profile.authMode === 'official'" class="field-help">
           写入 Codex 的 model_context_window；留空则使用模型默认值。
+        </p>
+
+        <div v-if="profile.authMode === 'official'" class="field-row">
+          <label class="field-label">上下文压缩</label>
+          <div class="field-inline context-window-field">
+            <input
+              :value="profile.modelAutoCompactRatio ?? ''"
+              class="input context-window-custom-input"
+              type="number"
+              min="0"
+              max="1"
+              step="0.01"
+              aria-label="上下文压缩比例"
+              placeholder="留空使用官方默认值"
+              @input="updateOfficialAutoCompactRatio($event)"
+            />
+            <select
+              class="select context-window-preset"
+              :value="numericPresetValue(profile.modelAutoCompactRatio, autoCompactRatioPresets)"
+              aria-label="上下文压缩比例预设"
+              @change="updateOfficialAutoCompactRatioPreset($event)"
+            >
+              <option value="custom">自定义</option>
+              <option
+                v-for="preset in autoCompactRatioPresets"
+                :key="preset.value"
+                :value="preset.value"
+              >
+                {{ preset.label }}
+              </option>
+            </select>
+          </div>
+        </div>
+        <p v-if="profile.authMode === 'official'" class="field-help">
+          填写 0~1 的比例；上下文长度为空时按空值处理，不计算也不写入配置。
+          <span v-if="compactTokenLimitPreview">{{ compactTokenLimitPreview }}</span>
+          留空则使用 Codex 官方默认值。
         </p>
 
         <div v-if="profile.authMode === 'custom'" class="model-catalog-editor">
@@ -277,7 +314,7 @@
                   />
                   <select
                     class="select context-window-preset"
-                    :value="contextWindowPresetValue(model.contextWindow)"
+                    :value="numericPresetValue(model.contextWindow, contextWindowPresets)"
                     aria-label="上下文长度预设"
                     @change="updateContextWindowPreset(model, $event)"
                   >
@@ -489,6 +526,13 @@ watch(
   () => [profile.value.authMode, store.customGlobalSyncSupported] as const,
   ([authMode, supported]) => {
     if (authMode === 'custom' && !supported) store.syncToGlobal = false
+    if (authMode !== 'official') profile.value.modelAutoCompactRatio = null
+  },
+)
+watch(
+  () => profile.value.modelContextWindow,
+  (contextWindow) => {
+    if (contextWindow === null) profile.value.modelAutoCompactRatio = null
   },
 )
 const reasoningEfforts = ['minimal', 'low', 'medium', 'high', 'xhigh', 'ultra', 'max']
@@ -508,6 +552,21 @@ const officialContextWindowPresets = [
   { label: '1m', value: 1_000_000 },
   { label: '1.05m', value: 1_050_000 },
 ] as const
+const autoCompactRatioPresets = [
+  { label: '0.5', value: 0.5 },
+  { label: '0.6', value: 0.6 },
+  { label: '0.7', value: 0.7 },
+  { label: '0.8', value: 0.8 },
+  { label: '0.9', value: 0.9 },
+  { label: '0.95', value: 0.95 },
+  { label: '1', value: 1 },
+] as const
+const compactTokenLimitPreview = computed(() => {
+  const contextWindow = profile.value.modelContextWindow
+  const ratio = profile.value.modelAutoCompactRatio
+  if (contextWindow === null || ratio === null) return ''
+  return `当前将写入 model_auto_compact_token_limit = ${Math.round(contextWindow * ratio).toLocaleString()}`
+})
 const appApplied = computed(() => Boolean(
   profile.value.id && store.activeProfileId === profile.value.id,
 ))
@@ -591,9 +650,9 @@ function updateModelName(model: { slug: string; displayName: string }, event: Ev
   }
 }
 
-function contextWindowPresetValue(
+function numericPresetValue(
   value: number | null | undefined,
-  presets: readonly { value: number }[] = contextWindowPresets,
+  presets: readonly { value: number }[],
 ): string {
   return presets.find(preset => preset.value === value)?.value.toString() ?? 'custom'
 }
@@ -616,6 +675,35 @@ function updateOfficialContextWindowPreset(event: Event) {
   if (!Number.isSafeInteger(parsed) || parsed < 1) return
   profile.value.modelContextWindowConfigured = true
   profile.value.modelContextWindow = parsed
+}
+
+function updateOfficialAutoCompactRatio(event: Event) {
+  const raw = (event.target as HTMLInputElement).value.trim()
+  const parsed = Number(raw)
+  profile.value.modelAutoCompactRatioConfigured = true
+  if (profile.value.modelContextWindow === null) {
+    profile.value.modelAutoCompactRatio = null
+    return
+  }
+  profile.value.modelAutoCompactRatio = raw.length > 0
+    && Number.isFinite(parsed)
+    && parsed >= 0
+    && parsed <= 1
+    ? parsed
+    : null
+}
+
+function updateOfficialAutoCompactRatioPreset(event: Event) {
+  const value = (event.target as HTMLSelectElement).value
+  if (value === 'custom') return
+  profile.value.modelAutoCompactRatioConfigured = true
+  if (profile.value.modelContextWindow === null) {
+    profile.value.modelAutoCompactRatio = null
+    return
+  }
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) return
+  profile.value.modelAutoCompactRatio = parsed
 }
 
 function updateContextWindowPreset(

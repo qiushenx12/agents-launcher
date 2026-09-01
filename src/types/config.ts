@@ -59,6 +59,8 @@ export interface CodexProfile {
   reasoningEffort: string
   modelContextWindow: number | null
   modelContextWindowConfigured: boolean
+  modelAutoCompactRatio: number | null
+  modelAutoCompactRatioConfigured: boolean
   openaiBaseUrl: string
   providerId: string
   providerName: string

@@ -164,6 +164,13 @@ pub struct CodexProfile {
     pub model_context_window: Option<u64>,
     #[serde(default)]
     pub model_context_window_configured: bool,
+    /// Optional fraction of the active model's context window at which
+    /// automatic history compaction starts. It is converted to Codex's
+    /// `model_auto_compact_token_limit` when the TOML is rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_auto_compact_ratio: Option<f64>,
+    #[serde(default)]
+    pub model_auto_compact_ratio_configured: bool,
     #[serde(default)]
     pub openai_base_url: String,
     #[serde(default)]
@@ -1458,6 +1465,20 @@ fn normalize_profile(mut profile: CodexProfile) -> Result<CodexProfile, String> 
         }
         profile.model_context_window_configured = true;
     }
+    if profile.auth_mode != CodexAuthMode::Official || profile.model_context_window.is_none() {
+        // This setting is managed only for official profiles and needs an
+        // explicit context window as its conversion base.
+        profile.model_auto_compact_ratio = None;
+        if profile.model_context_window.is_none() {
+            profile.model_auto_compact_ratio_configured = false;
+        }
+    } else if let Some(ratio) = profile.model_auto_compact_ratio {
+        if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+            return Err("model_auto_compact_ratio 必须是 0 到 1 之间的数值".to_string());
+        }
+        profile.model_auto_compact_ratio = Some(stabilize_model_auto_compact_ratio(ratio));
+        profile.model_auto_compact_ratio_configured = true;
+    }
     profile.chat_upstream_model = profile.chat_upstream_model.trim().to_string();
     profile.prompt_cache_routing = profile.prompt_cache_routing.trim().to_ascii_lowercase();
     if profile.prompt_cache_routing.is_empty() {
@@ -1600,19 +1621,81 @@ fn set_optional_u64(
     Ok(())
 }
 
-fn model_context_window_from_raw(raw: &str, label: &str) -> Result<Option<u64>, String> {
+fn stabilize_model_auto_compact_ratio(ratio: f64) -> f64 {
+    (ratio * 1_000_000_000_000.0).round() / 1_000_000_000_000.0
+}
+
+fn model_auto_compact_token_limit(profile: &CodexProfile) -> Result<Option<u64>, String> {
+    if profile.auth_mode != CodexAuthMode::Official {
+        return Ok(None);
+    }
+    let (Some(context_window), Some(ratio)) = (
+        profile.model_context_window,
+        profile.model_auto_compact_ratio,
+    ) else {
+        return Ok(None);
+    };
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return Err("model_auto_compact_ratio 必须是 0 到 1 之间的数值".to_string());
+    }
+    let token_limit = ((context_window as f64) * ratio).round();
+    if !token_limit.is_finite() || !(0.0..=(i64::MAX as f64)).contains(&token_limit) {
+        return Err("model_auto_compact_token_limit 换算后不是有效的 TOML 整数".to_string());
+    }
+    Ok(Some(token_limit as u64))
+}
+
+fn u64_setting_from_raw(
+    raw: &str,
+    key: &str,
+    label: &str,
+    allow_zero: bool,
+) -> Result<Option<u64>, String> {
     let document = DocumentMut::from_str(raw)
         .map_err(|error| format!("{label}无法解析：{error}"))?;
-    let Some(item) = document.get("model_context_window") else {
+    let Some(item) = document.get(key) else {
         return Ok(None);
     };
     let Some(value_number) = item.as_value().and_then(|item| item.as_integer()) else {
-        return Err(format!("{label}的 model_context_window 必须是正整数"));
+        return Err(format!(
+            "{label}的 {key} 必须是{}",
+            if allow_zero { "非负整数" } else { "正整数" }
+        ));
     };
-    if value_number <= 0 {
-        return Err(format!("{label}的 model_context_window 必须是正整数"));
+    if value_number < 0 || (!allow_zero && value_number == 0) {
+        return Err(format!(
+            "{label}的 {key} 必须是{}",
+            if allow_zero { "非负整数" } else { "正整数" }
+        ));
     }
     Ok(Some(value_number as u64))
+}
+
+fn model_context_window_from_raw(raw: &str, label: &str) -> Result<Option<u64>, String> {
+    u64_setting_from_raw(raw, "model_context_window", label, false)
+}
+
+fn model_auto_compact_token_limit_from_raw(
+    raw: &str,
+    label: &str,
+) -> Result<Option<u64>, String> {
+    u64_setting_from_raw(raw, "model_auto_compact_token_limit", label, true)
+}
+
+fn model_auto_compact_ratio_from_token_limit(
+    token_limit: u64,
+    context_window: u64,
+) -> Option<f64> {
+    if context_window == 0 {
+        return None;
+    }
+    let ratio = token_limit as f64 / context_window as f64;
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return None;
+    }
+    // TOML stores the converted integer threshold. Stabilize the reverse
+    // conversion so values such as 0.8 do not come back as a float tail.
+    Some(stabilize_model_auto_compact_ratio(ratio))
 }
 
 fn model_catalog_json_value(document: &DocumentMut) -> Option<String> {
@@ -1787,6 +1870,16 @@ fn build_codex_toml_with_model_catalog_restore(
             &mut document,
             "model_context_window",
             profile.model_context_window,
+        )?;
+    }
+    if profile.auth_mode == CodexAuthMode::Official
+        || profile.model_auto_compact_ratio_configured
+        || profile.model_auto_compact_ratio.is_some()
+    {
+        set_optional_u64(
+            &mut document,
+            "model_auto_compact_token_limit",
+            model_auto_compact_token_limit(profile)?,
         )?;
     }
     if document
@@ -2846,24 +2939,38 @@ fn prepare_profiles_for_load(state: &mut CodexProfileState) -> Result<(), String
     let previous_managed_api_key = load_managed_global_env()?;
     transition_managed_global_env(None, previous_managed_api_key.as_ref())?;
     migrate_latest_official_auth(state)?;
-    let global_model_context_window = if state.global_profile_id.is_some() {
+    let (global_model_context_window, global_model_auto_compact_token_limit) = if state
+        .global_profile_id
+        .is_some()
+    {
         let path = global_config_path()?;
         if path.exists() {
             let raw = fs::read_to_string(&path).map_err(|error| {
                 format!("无法读取全局 CodeX config.toml：{error}")
             })?;
-            model_context_window_from_raw(&raw, "全局 CodeX config.toml")?
+            (
+                model_context_window_from_raw(&raw, "全局 CodeX config.toml")?,
+                model_auto_compact_token_limit_from_raw(&raw, "全局 CodeX config.toml")?,
+            )
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
     for profile in &mut state.profiles {
+        if let Some(ratio) = profile.model_auto_compact_ratio {
+            if ratio.is_finite() && (0.0..=1.0).contains(&ratio) {
+                profile.model_auto_compact_ratio =
+                    Some(stabilize_model_auto_compact_ratio(ratio));
+            }
+        }
+
         profile.managed_profile_name = managed_profile_name(&profile.id);
         profile.has_stored_api_key = profile_secret_exists(&profile.id)?;
         prepare_shared_profile_storage(profile)?;
         let profile_path = managed_profile_path(&profile.id)?;
+        let mut profile_auto_compact_token_limit = None;
         if profile_path.exists() {
             let raw = fs::read_to_string(&profile_path).map_err(|error| {
                 format!("无法读取 CodeX profile {}：{error}", profile_path.display())
@@ -2875,6 +2982,13 @@ fn prepare_profiles_for_load(state: &mut CodexProfileState) -> Result<(), String
                 &raw,
                 &format!("CodeX profile {} ", profile_path.display()),
             )?;
+            profile_auto_compact_token_limit = model_auto_compact_token_limit_from_raw(
+                &raw,
+                &format!("CodeX profile {} ", profile_path.display()),
+            )?;
+            if profile_auto_compact_token_limit.is_none() {
+                profile.model_auto_compact_ratio = None;
+            }
             if profile.model_context_window.is_some() {
                 profile.model_context_window_configured = true;
             }
@@ -2887,6 +3001,31 @@ fn prepare_profiles_for_load(state: &mut CodexProfileState) -> Result<(), String
             profile.model_context_window = global_model_context_window;
             if profile.model_context_window.is_some() {
                 profile.model_context_window_configured = true;
+            }
+        }
+        if profile.model_context_window.is_none() {
+            profile.model_auto_compact_ratio = None;
+        }
+        let token_limit = if profile.auth_mode == CodexAuthMode::Official
+            && profile.model_auto_compact_ratio.is_none()
+            && !profile.model_auto_compact_ratio_configured
+        {
+            profile_auto_compact_token_limit.or_else(|| {
+                (state.global_profile_id.as_deref() == Some(profile.id.as_str()))
+                    .then_some(global_model_auto_compact_token_limit)
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        if let (Some(token_limit), Some(context_window)) =
+            (token_limit, profile.model_context_window)
+        {
+            if let Some(ratio) =
+                model_auto_compact_ratio_from_token_limit(token_limit, context_window)
+            {
+                profile.model_auto_compact_ratio = Some(ratio);
+                profile.model_auto_compact_ratio_configured = true;
             }
         }
     }
@@ -4395,6 +4534,8 @@ mod tests {
             reasoning_effort: "high".to_string(),
             model_context_window: None,
             model_context_window_configured: false,
+            model_auto_compact_ratio: None,
+            model_auto_compact_ratio_configured: false,
             openai_base_url: String::new(),
             provider_id: String::new(),
             provider_name: String::new(),
@@ -4715,6 +4856,66 @@ mod tests {
     }
 
     #[test]
+    fn official_profile_renders_model_auto_compact_token_limit_from_ratio() {
+        let mut profile = official_profile();
+        profile.model_context_window = Some(1_048_576);
+        profile.model_auto_compact_ratio = Some(0.8);
+        let profile = normalize_profile(profile).expect("valid profile");
+        assert_eq!(profile.model_auto_compact_ratio, Some(0.8));
+        let rendered = build_profile_toml(None, None, &profile).expect("render");
+        let document = DocumentMut::from_str(&rendered).expect("parse");
+        assert_eq!(
+            document["model_auto_compact_token_limit"].as_integer(),
+            Some(838_861)
+        );
+    }
+
+    #[test]
+    fn official_profile_removes_model_auto_compact_token_limit_when_ratio_is_empty() {
+        let existing = "model_auto_compact_token_limit = 800000\n";
+        let profile = official_profile();
+        let rendered = build_profile_toml(Some(existing), None, &profile).expect("render");
+        let document = DocumentMut::from_str(&rendered).expect("parse");
+        assert!(document.get("model_auto_compact_token_limit").is_none());
+    }
+
+    #[test]
+    fn model_auto_compact_ratio_is_ignored_without_context_window() {
+        let mut profile = official_profile();
+        profile.model_auto_compact_ratio = Some(0.8);
+        let normalized = normalize_profile(profile).expect("valid profile");
+        assert_eq!(normalized.model_auto_compact_ratio, None);
+        assert!(!normalized.model_auto_compact_ratio_configured);
+
+        let rendered = build_profile_toml(
+            Some("model_auto_compact_token_limit = 800000\n"),
+            None,
+            &normalized,
+        )
+        .expect("render");
+        let document = DocumentMut::from_str(&rendered).expect("parse");
+        assert!(document.get("model_auto_compact_token_limit").is_none());
+    }
+
+    #[test]
+    fn model_auto_compact_ratio_must_be_between_zero_and_one() {
+        for ratio in [-0.01, 1.01, f64::NAN] {
+            let mut profile = official_profile();
+            profile.model_context_window = Some(1_000_000);
+            profile.model_auto_compact_ratio = Some(ratio);
+            assert!(normalize_profile(profile).is_err());
+        }
+    }
+
+    #[test]
+    fn model_auto_compact_ratio_reverse_conversion_is_stable() {
+        assert_eq!(
+            model_auto_compact_ratio_from_token_limit(840_000, 1_050_000),
+            Some(0.8)
+        );
+    }
+
+    #[test]
     fn model_context_window_loader_accepts_positive_integers_only() {
         assert_eq!(
             model_context_window_from_raw("model_context_window = 1000000\n", "config.toml ")
@@ -4730,6 +4931,36 @@ mod tests {
             .is_err());
         assert!(model_context_window_from_raw(
             "model_context_window = \"1000000\"\n",
+            "config.toml "
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn model_auto_compact_token_limit_loader_accepts_non_negative_integers_only() {
+        assert_eq!(
+            model_auto_compact_token_limit_from_raw(
+                "model_auto_compact_token_limit = 800000\n",
+                "config.toml "
+            )
+            .expect("load token limit"),
+            Some(800_000)
+        );
+        assert_eq!(
+            model_auto_compact_token_limit_from_raw(
+                "model_auto_compact_token_limit = 0\n",
+                "config.toml "
+            )
+            .expect("load zero token limit"),
+            Some(0)
+        );
+        assert!(model_auto_compact_token_limit_from_raw(
+            "model_auto_compact_token_limit = -1\n",
+            "config.toml "
+        )
+        .is_err());
+        assert!(model_auto_compact_token_limit_from_raw(
+            "model_auto_compact_token_limit = 800000.0\n",
             "config.toml "
         )
         .is_err());

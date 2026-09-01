@@ -76,6 +76,8 @@ function emptyProfile(): CodexProfile {
     reasoningEffort: '',
     modelContextWindow: null,
     modelContextWindowConfigured: false,
+    modelAutoCompactRatio: null,
+    modelAutoCompactRatioConfigured: false,
     openaiBaseUrl: '',
     providerId: '',
     providerName: '',
@@ -99,11 +101,27 @@ function normalizeModelContextWindow(value: unknown): number | null {
     : null
 }
 
+function normalizeModelAutoCompactRatio(value: unknown): number | null {
+  if (
+    typeof value !== 'number'
+    || !Number.isFinite(value)
+    || value < 0
+    || value > 1
+  ) {
+    return null
+  }
+
+  return Number(value.toFixed(12))
+}
+
 function cloneProfile(profile: CodexProfile): CodexProfile {
   const cloned = JSON.parse(JSON.stringify(profile)) as CodexProfile
   cloned.modelContextWindow = normalizeModelContextWindow(cloned.modelContextWindow)
   cloned.modelContextWindowConfigured = Boolean(cloned.modelContextWindowConfigured)
     || cloned.modelContextWindow !== null
+  cloned.modelAutoCompactRatio = normalizeModelAutoCompactRatio(cloned.modelAutoCompactRatio)
+  cloned.modelAutoCompactRatioConfigured = Boolean(cloned.modelAutoCompactRatioConfigured)
+    || cloned.modelAutoCompactRatio !== null
   return cloned
 }
 
@@ -146,6 +164,8 @@ function serializeDraft(profile: CodexProfile, apiKeyInput: string, clearApiKey:
     reasoningEffort: profile.reasoningEffort,
     modelContextWindow: profile.modelContextWindow,
     modelContextWindowConfigured: profile.modelContextWindowConfigured,
+    modelAutoCompactRatio: profile.modelAutoCompactRatio,
+    modelAutoCompactRatioConfigured: profile.modelAutoCompactRatioConfigured,
     openaiBaseUrl: profile.openaiBaseUrl,
     providerId: profile.providerId,
     providerName: profile.providerName,
