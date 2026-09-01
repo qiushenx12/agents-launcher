@@ -5,6 +5,11 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::cli_capabilities::OpenCodeSession;
 
+pub struct OpenCodeWorkspaceSnapshot {
+    pub projects: Vec<(String, String)>,
+    pub sessions: Vec<OpenCodeSession>,
+}
+
 fn db_path_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
@@ -38,8 +43,10 @@ fn open_db() -> Result<Connection, String> {
     Ok(connection)
 }
 
-pub fn query_sessions(max_count: u32) -> Result<Vec<OpenCodeSession>, String> {
-    let connection = open_db()?;
+fn query_sessions_with_connection(
+    connection: &Connection,
+    max_count: u32,
+) -> Result<Vec<OpenCodeSession>, String> {
     let mut statement = connection
         .prepare(
             "SELECT id, title, directory, time_created, time_updated, project_id \
@@ -65,8 +72,9 @@ pub fn query_sessions(max_count: u32) -> Result<Vec<OpenCodeSession>, String> {
     Ok(sessions)
 }
 
-pub fn query_projects() -> Result<Vec<(String, String)>, String> {
-    let connection = open_db()?;
+fn query_projects_with_connection(
+    connection: &Connection,
+) -> Result<Vec<(String, String)>, String> {
     let mut statement = connection
         .prepare("SELECT id, worktree FROM project")
         .map_err(|error| format!("OpenCode 本地数据库项目查询不可用: {error}"))?;
@@ -80,6 +88,30 @@ pub fn query_projects() -> Result<Vec<(String, String)>, String> {
         projects.push(row.map_err(|error| format!("OpenCode 本地数据库项目行损坏: {error}"))?);
     }
     Ok(projects)
+}
+
+pub fn query_sessions(max_count: u32) -> Result<Vec<OpenCodeSession>, String> {
+    let connection = open_db()?;
+    query_sessions_with_connection(&connection, max_count)
+}
+
+pub fn query_projects() -> Result<Vec<(String, String)>, String> {
+    let connection = open_db()?;
+    query_projects_with_connection(&connection)
+}
+
+fn query_workspace_with_connection(
+    connection: &Connection,
+    max_session_count: u32,
+) -> Result<OpenCodeWorkspaceSnapshot, String> {
+    let projects = query_projects_with_connection(connection)?;
+    let sessions = query_sessions_with_connection(connection, max_session_count)?;
+    Ok(OpenCodeWorkspaceSnapshot { projects, sessions })
+}
+
+pub fn query_workspace(max_session_count: u32) -> Result<OpenCodeWorkspaceSnapshot, String> {
+    let connection = open_db()?;
+    query_workspace_with_connection(&connection, max_session_count)
 }
 
 #[cfg(test)]
@@ -142,5 +174,23 @@ mod tests {
         assert_eq!(sessions[0].id, "s2");
         assert_eq!(sessions[0].updated, 3000);
         assert_eq!(sessions[1].directory, "D:/Work/demo");
+    }
+
+    #[test]
+    fn workspace_snapshot_reads_projects_and_sessions_from_one_connection() {
+        let (_dir, path) = create_fixture_db();
+        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open fixture");
+
+        let snapshot =
+            query_workspace_with_connection(&connection, 500).expect("query workspace snapshot");
+
+        assert_eq!(snapshot.projects.len(), 2);
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert_eq!(snapshot.sessions[0].id, "s2");
+        assert!(snapshot
+            .projects
+            .iter()
+            .any(|(id, worktree)| id == "p1" && worktree == "D:/Work/demo"));
     }
 }

@@ -38,12 +38,18 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineComponent, h, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, defineComponent, h, ref, watch } from 'vue'
 import { useProjectStore } from '@/stores/project'
 import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import TerminalPane from '@/components/terminal/TerminalPane.vue'
-import FilePanel from '@/components/project/FilePanel.vue'
 import { usePlatform } from '@/composables/usePlatform'
+import AsyncPanelLoading from '@/components/common/AsyncPanelLoading'
+
+const FilePanel = defineAsyncComponent({
+  loader: () => import('@/components/project/FilePanel.vue'),
+  loadingComponent: AsyncPanelLoading,
+  delay: 80,
+})
 
 const store = useProjectStore()
 const addMenuOpen = ref(false)

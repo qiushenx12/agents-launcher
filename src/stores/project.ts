@@ -18,6 +18,8 @@ import {
   rebindClaudeSessionRecordsAfterClear,
 } from '@/utils/claudeSessionLifecycle'
 import type { ClaudeAgentEvent } from '@/types/claudeObserver'
+import { projectStoreFingerprint } from '@/utils/projectStoreFingerprint'
+import { InFlightTaskCache } from '@/utils/inFlightTaskCache'
 
 export type TerminalStatus = 'off' | 'idle' | 'running'
 export type SidebarTabType = 'tools' | 'file' | 'terminal' | 'browser'
@@ -123,6 +125,16 @@ interface CodexThreadEntry {
   cwd: string
   createdAt: number
   updatedAt: number
+}
+
+interface CodexThreadList {
+  threads: CodexThreadEntry[]
+  complete: boolean
+}
+
+interface CodexWorkspaceSnapshot {
+  discovery: CodexProjectDiscovery
+  threads: CodexThreadList
 }
 
 interface CodexProjectEntry {
@@ -294,6 +306,12 @@ export const useProjectStore = defineStore('project', () => {
   const pendingClaudeClearSessionIds = new Map<number, string>()
   let projectsLoaded = false
   let loadPromise: Promise<void> | null = null
+  const cliWorkspaceLoaded: Record<CliKind, boolean> = {
+    claude: false,
+    codex: false,
+    opencode: false,
+  }
+  const cliWorkspaceLoads = new InFlightTaskCache<CliKind, void>()
 
   const visibleProjects = computed(() =>
     projects.value.filter((project) => project.cliKind === activeCliKind.value)
@@ -349,20 +367,27 @@ export const useProjectStore = defineStore('project', () => {
     [...(activeProject.value?.recentItems ?? [])].sort((a, b) => b.openedAt - a.openedAt)
   )
 
-  async function persist() {
-    rememberActiveSelection()
-    const data: ProjectStoreFile = {
+  function currentProjectStoreFile(): ProjectStoreFile {
+    return {
       ...persistedRootExtras.value,
       projects: projects.value,
       sessions: sessions.value,
-      activeProjectId: activeProjectId.value,
-      activeSessionId: activeSessionId.value,
+      ...(activeProjectId.value ? { activeProjectId: activeProjectId.value } : {}),
+      ...(activeSessionId.value ? { activeSessionId: activeSessionId.value } : {}),
       expandedProjectIds: [...expandedProjectIds.value],
       projectSortMode: projectSortMode.value,
       activeProjectIds: compactSelections(activeProjectIds.value),
       activeSessionIds: compactSelections(activeSessionIds.value),
     }
+  }
+
+  async function persistProjectStoreFile(data: ProjectStoreFile) {
     await invoke('save_projects', { data })
+  }
+
+  async function persist() {
+    rememberActiveSelection()
+    await persistProjectStoreFile(currentProjectStoreFile())
   }
 
   function compactSelections(values: Record<CliKind, string | null>) {
@@ -661,10 +686,10 @@ export const useProjectStore = defineStore('project', () => {
     const project = projects.value.find((item) => item.id === projectId && item.cliKind === 'codex')
     if (!project) return false
 
-    let recent: CodexThreadEntry[]
+    let recent: CodexThreadList
     try {
       const profileId = await resolveActiveCodexProfileId()
-      recent = await invoke<CodexThreadEntry[]>('list_codex_threads', {
+      recent = await invoke<CodexThreadList>('list_codex_threads', {
         projectPath: project.path,
         maxCount: 200,
         force: options.force ?? false,
@@ -674,10 +699,14 @@ export const useProjectStore = defineStore('project', () => {
       statusMessage.value = `CodeX 真实会话读取失败，可继续使用新会话或原生恢复：${String(error)}`
       return false
     }
-    return applyCodexThreadEntries(projectId, recent)
+    return applyCodexThreadEntries(projectId, recent.threads, { pruneStale: recent.complete })
   }
 
-  function applyCodexThreadEntries(projectId: string, recent: CodexThreadEntry[]) {
+  function applyCodexThreadEntries(
+    projectId: string,
+    recent: CodexThreadEntry[],
+    options: { pruneStale?: boolean } = {},
+  ) {
     let changed = false
     const current = sessions.value.filter(
       (session) => session.cliKind === 'codex' && session.projectId === projectId,
@@ -778,11 +807,13 @@ export const useProjectStore = defineStore('project', () => {
       }
     }
 
-    for (const session of [...current]) {
-      if (!session.nativeSessionId || recentIds.has(session.nativeSessionId)) continue
-      if (sessionHasLiveTerminal(session.id)) continue
-      sessions.value = sessions.value.filter((item) => item.id !== session.id)
-      changed = true
+    if (options.pruneStale) {
+      for (const session of [...current]) {
+        if (!session.nativeSessionId || recentIds.has(session.nativeSessionId)) continue
+        if (sessionHasLiveTerminal(session.id)) continue
+        sessions.value = sessions.value.filter((item) => item.id !== session.id)
+        changed = true
+      }
     }
 
     const localSessions = sessions.value
@@ -861,15 +892,7 @@ export const useProjectStore = defineStore('project', () => {
     return true
   }
 
-  async function discoverCodexProjects() {
-    let discovery: CodexProjectDiscovery
-    try {
-      const profileId = await resolveActiveCodexProfileId()
-      discovery = await invoke<CodexProjectDiscovery>('discover_codex_projects', { profileId })
-    } catch (error) {
-      statusMessage.value = `CodeX 项目发现不可用，可手动选择目录：${String(error)}`
-      return false
-    }
+  function applyCodexProjectDiscovery(discovery: CodexProjectDiscovery) {
     if (discovery.warning) {
       statusMessage.value = `${discovery.warning}；其余项目仍可使用。`
     }
@@ -877,6 +900,17 @@ export const useProjectStore = defineStore('project', () => {
       .map((entry) => entry.worktree)
       .filter((path) => !!path)
     return mergeRecentProjectPaths(paths, { cliKind: 'codex' })
+  }
+
+  async function discoverCodexProjects() {
+    try {
+      const profileId = await resolveActiveCodexProfileId()
+      const discovery = await invoke<CodexProjectDiscovery>('discover_codex_projects', { profileId })
+      return applyCodexProjectDiscovery(discovery)
+    } catch (error) {
+      statusMessage.value = `CodeX 项目发现不可用，可手动选择目录：${String(error)}`
+      return false
+    }
   }
 
   async function syncProjectSessionsFromOpenCode(projectId: string) {
@@ -1126,12 +1160,8 @@ export const useProjectStore = defineStore('project', () => {
     if (loadPromise) return loadPromise
     loadPromise = (async () => {
       try {
-      // Load the config-side launch directory history first so we can seed the
-      // project list if it is empty.
-      const claudeStore = useClaudeStore()
-      await claudeStore.loadRecentProjects()
-
       const data = await invoke<ProjectStoreFile>('load_projects')
+      const loadedSnapshot = projectStoreFingerprint(data)
       const knownRootKeys = new Set([
         'projects', 'sessions', 'activeProjectId', 'activeSessionId',
         'expandedProjectIds', 'projectSortMode', 'activeProjectIds', 'activeSessionIds',
@@ -1165,19 +1195,12 @@ export const useProjectStore = defineStore('project', () => {
 
       dedupeDuplicateProjects()
 
-      // Merge recent directories from the config-side launch directory history.
-      // This keeps the project list in sync with Claude's own history even when
-      // no projects have been explicitly added in this module. Most recent
-      // directories appear first on initial load.
-      mergeRecentProjectPaths(claudeStore.launchDirHistory, { prepend: true, cliKind: 'claude' })
-
-      for (const project of projects.value.filter((item) => item.cliKind === 'claude')) {
-        await syncProjectSessionsFromClaude(project.id)
-        ensureProjectHasSession(project.id)
-      }
-
       normalizeActiveState()
-      await persist()
+      rememberActiveSelection()
+      const nextData = currentProjectStoreFile()
+      if (projectStoreFingerprint(nextData) !== loadedSnapshot) {
+        await persistProjectStoreFile(nextData)
+      }
       projectsLoaded = true
       } catch (e) {
         statusMessage.value = `加载项目失败：${e}`
@@ -1186,6 +1209,26 @@ export const useProjectStore = defineStore('project', () => {
       }
     })()
     return loadPromise
+  }
+
+  async function prepareClaudeWorkspace(force = false) {
+    const before = projectStoreFingerprint(currentProjectStoreFile())
+    const claudeStore = useClaudeStore()
+    if (force) await invoke('invalidate_claude_history_cache').catch(() => {})
+    await claudeStore.loadRecentProjects()
+    mergeRecentProjectPaths(claudeStore.launchDirHistory, { prepend: true, cliKind: 'claude' })
+
+    for (const project of projects.value.filter((item) => item.cliKind === 'claude')) {
+      await syncProjectSessionsFromClaude(project.id)
+      ensureProjectHasSession(project.id)
+    }
+
+    normalizeActiveState()
+    rememberActiveSelection()
+    const nextData = currentProjectStoreFile()
+    if (projectStoreFingerprint(nextData) !== before) {
+      await persistProjectStoreFile(nextData)
+    }
   }
 
   // Per-project history sync runs a CLI child process, so switching tabs used
@@ -1243,6 +1286,49 @@ export const useProjectStore = defineStore('project', () => {
   // syncing when the batched command is unavailable.
   const batchSyncedAt: Record<string, number> = {}
 
+  async function applyBatchedSessionEntries(
+    kind: 'codex' | 'opencode',
+    all: CodexThreadEntry[] | OpenCodeSessionEntry[],
+    options: {
+      codexResultComplete?: boolean
+      now: number
+      syncKey: string
+      persistChanges?: boolean
+    },
+  ) {
+    const grouped = new Map<string, (CodexThreadEntry | OpenCodeSessionEntry)[]>()
+    for (const entry of all) {
+      const path = kind === 'codex'
+        ? (entry as CodexThreadEntry).cwd
+        : (entry as OpenCodeSessionEntry).directory
+      const key = normalizeFsPath(path)
+      if (!key) continue
+      const bucket = grouped.get(key)
+      if (bucket) bucket.push(entry)
+      else grouped.set(key, [entry])
+    }
+
+    let changed = false
+    const targets = projects.value.filter((item) => item.cliKind === kind)
+    for (const project of targets) {
+      const entries = grouped.get(normalizeFsPath(project.path)) ?? []
+      const applied = kind === 'codex'
+        ? applyCodexThreadEntries(project.id, entries as CodexThreadEntry[], {
+          pruneStale: options.codexResultComplete ?? true,
+        })
+        : applyOpenCodeSessionEntries(project.id, entries as OpenCodeSessionEntry[])
+      if (applied) changed = true
+      historySyncedAt[`${kind}:${project.id}`] = options.now
+      const count = sessions.value.length
+      ensureProjectHasSession(project.id)
+      if (sessions.value.length !== count) changed = true
+    }
+    batchSyncedAt[options.syncKey] = options.now
+    normalizeActiveState()
+    if (changed && options.persistChanges !== false) await persist()
+    return changed
+  }
+
   async function syncCliSessionsBatched(kind: 'codex' | 'opencode', options?: { force?: boolean }) {
     const now = Date.now()
     let profileId: string | null = null
@@ -1258,73 +1344,100 @@ export const useProjectStore = defineStore('project', () => {
       : kind
     if (!options?.force && now - (batchSyncedAt[syncKey] ?? 0) <= HISTORY_SYNC_TTL) return false
 
-    let grouped: Map<string, (CodexThreadEntry | OpenCodeSessionEntry)[]>
+    let codexResultComplete = true
+    let all: CodexThreadEntry[] | OpenCodeSessionEntry[]
     try {
-      const all = kind === 'codex'
-        ? await invoke<CodexThreadEntry[]>('list_all_codex_threads', {
+      if (kind === 'codex') {
+        const result = await invoke<CodexThreadList>('list_all_codex_threads', {
           maxCount: 500,
           force: options?.force ?? false,
           profileId,
         })
-        : await invoke<OpenCodeSessionEntry[]>('list_all_opencode_sessions', { maxCount: 500 })
-      grouped = new Map()
-      for (const entry of all) {
-        const path = kind === 'codex'
-          ? (entry as CodexThreadEntry).cwd
-          : (entry as OpenCodeSessionEntry).directory
-        const key = normalizeFsPath(path)
-        if (!key) continue
-        const bucket = grouped.get(key)
-        if (bucket) bucket.push(entry)
-        else grouped.set(key, [entry])
+        all = result.threads
+        codexResultComplete = result.complete
+      } else {
+        all = await invoke<OpenCodeSessionEntry[]>('list_all_opencode_sessions', { maxCount: 500 })
       }
     } catch {
       return kind === 'codex'
         ? syncCliSessions('codex', syncProjectSessionsFromCodex, { force: options?.force })
         : syncCliSessions('opencode', syncProjectSessionsFromOpenCode, { force: options?.force })
     }
-
-    let changed = false
-    const targets = projects.value.filter((item) => item.cliKind === kind)
-    for (const project of targets) {
-      const entries = grouped.get(normalizeFsPath(project.path)) ?? []
-      const applied = kind === 'codex'
-        ? applyCodexThreadEntries(project.id, entries as CodexThreadEntry[])
-        : applyOpenCodeSessionEntries(project.id, entries as OpenCodeSessionEntry[])
-      if (applied) changed = true
-      historySyncedAt[`${kind}:${project.id}`] = now
-      const count = sessions.value.length
-      ensureProjectHasSession(project.id)
-      if (sessions.value.length !== count) changed = true
-    }
-    batchSyncedAt[syncKey] = now
-    normalizeActiveState()
-    if (changed) await persist()
-    return changed
+    return applyBatchedSessionEntries(kind, all, {
+      codexResultComplete,
+      now,
+      syncKey,
+    })
   }
 
-  async function prepareCliWorkspace(kind: CliKind) {
+  async function prepareCodexWorkspace(force = false) {
+    const now = Date.now()
+    let profileId: string | null
+    try {
+      profileId = await resolveActiveCodexProfileId()
+    } catch {
+      await discoverCliProjects('codex', force)
+      return syncCliSessionsBatched('codex', { force })
+    }
+    const syncKey = `codex:${profileId ?? 'global'}`
+    const discoveryFresh = now - (discoverySyncedAt.codex ?? 0) <= HISTORY_SYNC_TTL
+    const sessionsFresh = now - (batchSyncedAt[syncKey] ?? 0) <= HISTORY_SYNC_TTL
+    if (!force && discoveryFresh && sessionsFresh) return false
+
+    let snapshot: CodexWorkspaceSnapshot
+    try {
+      snapshot = await invoke<CodexWorkspaceSnapshot>('load_codex_workspace', {
+        maxCount: 500,
+        profileId,
+      })
+    } catch {
+      await discoverCliProjects('codex', force)
+      return syncCliSessionsBatched('codex', { force })
+    }
+
+    const projectsChanged = applyCodexProjectDiscovery(snapshot.discovery)
+    discoverySyncedAt.codex = now
+    const sessionsChanged = await applyBatchedSessionEntries('codex', snapshot.threads.threads, {
+      codexResultComplete: snapshot.threads.complete,
+      now,
+      syncKey,
+      persistChanges: false,
+    })
+    if (projectsChanged || sessionsChanged) await persist()
+    return projectsChanged || sessionsChanged
+  }
+
+  async function prepareCliWorkspace(kind: CliKind, options: { force?: boolean } = {}) {
     if (activeCliKind.value !== kind) setActiveCliKind(kind)
     await loadProjects()
+    if (!projectsLoaded) return
     // A slower CLI probe/load must not switch the workspace back after the
     // user has already selected another CLI entry.
     if (activeCliKind.value !== kind) return
-    if (kind === 'codex') {
-      await discoverCliProjects('codex', false)
-      await syncCliSessionsBatched('codex')
-      return
-    }
-    if (kind === 'opencode') {
-      await discoverCliProjects('opencode', false)
-      await syncCliSessionsBatched('opencode')
-    }
+    const existing = cliWorkspaceLoads.get(kind)
+    if (existing) return existing
+    if (kind === 'claude' && cliWorkspaceLoaded.claude && !options.force) return
+
+    return cliWorkspaceLoads.run(kind, async () => {
+      if (kind === 'claude') {
+        await prepareClaudeWorkspace(options.force)
+      } else if (kind === 'codex') {
+        await prepareCodexWorkspace(options.force)
+      } else {
+        await discoverCliProjects('opencode', options.force ?? false)
+        await syncCliSessionsBatched('opencode', { force: options.force })
+      }
+      cliWorkspaceLoaded[kind] = true
+    })
   }
 
   async function refreshActiveCliHistory() {
-    if (activeCliKind.value === 'claude') return refreshClaudeHistory()
+    if (activeCliKind.value === 'claude') {
+      await invoke('invalidate_claude_history_cache').catch(() => {})
+      return refreshClaudeHistory()
+    }
     if (activeCliKind.value === 'codex') {
-      await discoverCliProjects('codex', true)
-      return syncCliSessionsBatched('codex', { force: true })
+      return prepareCodexWorkspace(true)
     }
     if (activeCliKind.value === 'opencode') {
       await discoverCliProjects('opencode', true)
@@ -1334,27 +1447,12 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   async function refreshCodexProfileSessions() {
-    const codexSessions = sessions.value.filter((session) => session.cliKind === 'codex')
-    const terminalStore = useTerminalStore()
-    const terminalIds = codexSessions
-      .map((session) => sessionTerminalIds.value[session.id])
-      .filter((tabId): tabId is number => typeof tabId === 'number')
-
-    // A native Codex session is tied to the profile that started its process.
-    // Drop the launcher bindings before loading the next provider so an old
-    // native id cannot be resumed with the new profile.
-    sessions.value = sessions.value.filter((session) => session.cliKind !== 'codex')
-    for (const session of codexSessions) {
-      delete sessionTerminalIds.value[session.id]
-    }
-    normalizeActiveState()
-    await Promise.all(terminalIds.map((tabId) => terminalStore.closeTab(tabId)))
-    await persist()
-
+    // Official Codex profiles share one CODEX_HOME. Existing PTYs keep the
+    // configuration they started with; switching only refreshes the shared
+    // catalog and affects newly launched/resumed processes.
     try {
       await loadProjects()
-      await discoverCliProjects('codex', true)
-      await syncCliSessionsBatched('codex', { force: true })
+      await prepareCodexWorkspace(true)
     } catch (error) {
       statusMessage.value = `CodeX 配置切换后会话刷新失败：${String(error)}`
     }

@@ -42,12 +42,17 @@ export const useTopBarStore = defineStore('topBar', () => {
     order.value.filter((item) => item === 'config' || !hidden.value.includes(item))
   )
 
+  function hydrateLayout(layout: PersistedTopBarLayout) {
+    order.value = normalizeTopBarOrder(layout.order)
+    hidden.value = normalizeTopBarHidden(layout.hidden)
+    loaded.value = true
+  }
+
   async function loadOrder() {
     if (loaded.value) return
     try {
       const layout = await invoke<PersistedTopBarLayout>('load_top_bar_layout')
-      order.value = normalizeTopBarOrder(layout.order)
-      hidden.value = normalizeTopBarHidden(layout.hidden)
+      hydrateLayout(layout)
     } catch {
       order.value = [...DEFAULT_TOP_BAR_ORDER]
       hidden.value = []
@@ -72,6 +77,7 @@ export const useTopBarStore = defineStore('topBar', () => {
     loaded,
     cliOrder,
     visibleOrder,
+    hydrateLayout,
     loadOrder,
     saveLayout,
   }

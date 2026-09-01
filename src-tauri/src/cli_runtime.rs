@@ -4,8 +4,8 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{mpsc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -46,6 +46,13 @@ pub struct CodexThreadSummary {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexThreadList {
+    pub threads: Vec<CodexThreadSummary>,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexDiscoveredProject {
@@ -61,6 +68,13 @@ pub struct CodexProjectDiscovery {
     pub warning: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexWorkspaceSnapshot {
+    pub discovery: CodexProjectDiscovery,
+    pub threads: CodexThreadList,
+}
+
 #[derive(Debug, Deserialize)]
 struct CodexSessionMetaEnvelope {
     #[serde(rename = "type")]
@@ -68,7 +82,7 @@ struct CodexSessionMetaEnvelope {
     payload: CodexSessionMeta,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct CodexSessionMeta {
     #[serde(default)]
     id: Option<String>,
@@ -79,9 +93,47 @@ struct CodexSessionMeta {
     model_provider: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CodexRolloutRecord {
+    path: PathBuf,
+    meta: CodexSessionMeta,
+    updated_at: i64,
+    revision: Option<CodexRolloutFileRevision>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexRolloutIndex {
+    records: Vec<CodexRolloutRecord>,
+    skipped: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexRolloutFileRevision {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexRolloutFileCacheEntry {
+    revision: CodexRolloutFileRevision,
+    meta: Option<CodexSessionMeta>,
+    preview: Option<String>,
+}
+
+static CODEX_ROLLOUT_FILE_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, CodexRolloutFileCacheEntry>>,
+> = OnceLock::new();
+
+fn codex_rollout_file_cache(
+) -> &'static Mutex<HashMap<PathBuf, CodexRolloutFileCacheEntry>> {
+    CODEX_ROLLOUT_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[derive(Debug, Deserialize)]
 struct CodexThreadListResponse {
     data: Vec<CodexThreadSummary>,
+    #[serde(default, rename = "nextCursor", alias = "next_cursor")]
+    next_cursor: Option<String>,
 }
 
 #[allow(unused_mut)]
@@ -271,6 +323,7 @@ struct CodexThreadsCacheEntry {
     fetched_at: Instant,
     cache_key: String,
     threads: Vec<CodexThreadSummary>,
+    complete: bool,
 }
 
 static CODEX_THREADS_CACHE: Mutex<Option<CodexThreadsCacheEntry>> = Mutex::new(None);
@@ -279,7 +332,7 @@ fn all_codex_threads(
     max_count: u32,
     force: bool,
     profile_id: Option<String>,
-) -> Result<Vec<CodexThreadSummary>, String> {
+) -> Result<CodexThreadList, String> {
     let runtime = crate::codex_config::resolve_codex_runtime_context(profile_id.as_deref())?;
     let mut guard = CODEX_THREADS_CACHE
         .lock()
@@ -289,41 +342,39 @@ fn all_codex_threads(
             if entry.cache_key == runtime.cache_key
                 && entry.fetched_at.elapsed() < CODEX_THREADS_CACHE_TTL
             {
-                return Ok(entry.threads.clone());
+                return Ok(CodexThreadList {
+                    threads: entry.threads.clone(),
+                    complete: entry.complete,
+                });
             }
         }
     }
-    let threads = match query_all_codex_threads(max_count, &runtime) {
-        Ok(threads) => {
-            let rollout_threads =
-                codex_threads_from_rollouts(max_count, &runtime).unwrap_or_default();
-            let threads = enrich_codex_thread_titles(threads, &rollout_threads);
-            let filtered = filter_codex_threads_by_provider(threads, &runtime.model_provider);
-            if filtered.is_empty() {
-                let fallback = filter_codex_threads_by_provider(
-                    rollout_threads,
-                    &runtime.model_provider,
-                );
-                if fallback.is_empty() {
-                    filtered
-                } else {
-                    fallback
-                }
-            } else {
-                filtered
-            }
+    let result = match query_all_codex_threads(max_count, &runtime) {
+        Ok(app_server) => {
+            let rollout = codex_threads_from_rollouts(max_count, &runtime).ok();
+            let threads = merge_codex_thread_lists(
+                app_server.threads,
+                rollout.as_ref().map(|result| result.threads.as_slice()),
+                max_count,
+            );
+            let complete = rollout
+                .as_ref()
+                .map(|result| result.complete)
+                // Without the rollout scan we cannot prove that the shared
+                // app-server result covers every provider, even when its own
+                // pagination is complete.
+                .unwrap_or(false);
+            CodexThreadList { threads, complete }
         }
-        Err(_) => filter_codex_threads_by_provider(
-            codex_threads_from_rollouts(max_count, &runtime)?,
-            &runtime.model_provider,
-        ),
+        Err(_) => codex_threads_from_rollouts(max_count, &runtime)?,
     };
     *guard = Some(CodexThreadsCacheEntry {
         fetched_at: Instant::now(),
         cache_key: runtime.cache_key,
-        threads: threads.clone(),
+        threads: result.threads.clone(),
+        complete: result.complete,
     });
-    Ok(threads)
+    Ok(result)
 }
 
 #[tauri::command]
@@ -331,7 +382,7 @@ pub async fn list_all_codex_threads(
     max_count: Option<u32>,
     force: Option<bool>,
     profile_id: Option<String>,
-) -> Result<Vec<CodexThreadSummary>, String> {
+) -> Result<CodexThreadList, String> {
     tokio::task::spawn_blocking(move || {
         all_codex_threads(
             max_count.unwrap_or(500),
@@ -349,7 +400,7 @@ pub async fn list_codex_threads(
     max_count: Option<u32>,
     force: Option<bool>,
     profile_id: Option<String>,
-) -> Result<Vec<CodexThreadSummary>, String> {
+) -> Result<CodexThreadList, String> {
     tokio::task::spawn_blocking(move || {
         let cwd = PathBuf::from(&project_path);
         if !cwd.is_dir() {
@@ -358,19 +409,21 @@ pub async fn list_codex_threads(
         let max_count = max_count.unwrap_or(100);
         let normalized_target = normalize_path(&project_path);
         match all_codex_threads(max_count, force.unwrap_or(false), profile_id.clone()) {
-            Ok(threads) => Ok(threads
-                .into_iter()
-                .filter(|thread| normalize_path(&thread.cwd) == normalized_target)
-                .collect()),
+            Ok(mut threads) => {
+                threads
+                    .threads
+                    .retain(|thread| normalize_path(&thread.cwd) == normalized_target);
+                Ok(threads)
+            }
             Err(_) => {
                 let runtime = crate::codex_config::resolve_codex_runtime_context(
                     profile_id.as_deref(),
                 )?;
-                let threads = query_codex_threads(&cwd, max_count, &runtime)?;
-                Ok(filter_codex_threads_by_provider(
-                    threads,
-                    &runtime.model_provider,
-                ))
+                let mut threads = query_codex_threads(&cwd, max_count, &runtime)?;
+                threads
+                    .threads
+                    .retain(|thread| normalize_path(&thread.cwd) == normalized_target);
+                Ok(threads)
             }
         }
     })
@@ -390,6 +443,61 @@ pub async fn discover_codex_projects(
     .map_err(|error| format!("CodeX 项目发现任务异常结束: {error}"))?
 }
 
+#[tauri::command]
+pub async fn load_codex_workspace(
+    max_count: Option<u32>,
+    profile_id: Option<String>,
+) -> Result<CodexWorkspaceSnapshot, String> {
+    tokio::task::spawn_blocking(move || {
+        let runtime = crate::codex_config::resolve_codex_runtime_context(profile_id.as_deref())?;
+        let sessions_root = codex_sessions_root(&runtime)
+            .ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
+        let index = sessions_root
+            .is_dir()
+            .then(|| build_codex_rollout_index(&sessions_root));
+        let discovery = index
+            .as_ref()
+            .map(discover_codex_projects_from_rollout_index)
+            .unwrap_or_else(|| CodexProjectDiscovery {
+                projects: Vec::new(),
+                warning: Some(format!(
+                    "未找到 CodeX 会话目录: {}",
+                    sessions_root.display()
+                )),
+            });
+        let max_count = max_count.unwrap_or(500);
+        let app_server = query_all_codex_threads(max_count, &runtime);
+        let rollout = index
+            .as_ref()
+            .map(|index| codex_threads_from_rollout_index(index, max_count));
+        let threads = match app_server {
+            Ok(app_server) => {
+                let merged = merge_codex_thread_lists(
+                    app_server.threads,
+                    rollout.as_ref().map(|(threads, _)| threads.as_slice()),
+                    max_count,
+                );
+                CodexThreadList {
+                    threads: merged,
+                    complete: rollout.as_ref().is_some_and(|(_, complete)| *complete),
+                }
+            }
+            Err(_) => {
+                let Some((threads, complete)) = rollout else {
+                    return Err(format!(
+                        "未找到 CodeX 会话目录: {}",
+                        sessions_root.display()
+                    ));
+                };
+                CodexThreadList { threads, complete }
+            }
+        };
+        Ok(CodexWorkspaceSnapshot { discovery, threads })
+    })
+    .await
+    .map_err(|error| format!("CodeX 工作区读取任务异常结束: {error}"))?
+}
+
 fn discover_codex_projects_from_session_meta(
     runtime: &crate::codex_config::CodexRuntimeContext,
 ) -> Result<CodexProjectDiscovery, String> {
@@ -405,18 +513,20 @@ fn discover_codex_projects_from_session_meta(
         });
     }
 
-    let mut files = Vec::new();
-    let mut skipped = 0_u32;
-    collect_codex_jsonl_files(&sessions_root, &mut files, &mut skipped);
+    Ok(discover_codex_projects_from_rollout_index(
+        &build_codex_rollout_index(&sessions_root),
+    ))
+}
+
+fn discover_codex_projects_from_rollout_index(
+    index: &CodexRolloutIndex,
+) -> CodexProjectDiscovery {
+    let mut skipped = index.skipped;
     let mut by_path: HashMap<String, CodexDiscoveredProject> = HashMap::new();
     let mut validated_worktrees: HashMap<String, bool> = HashMap::new();
 
-    for file_path in files {
-        let Some(meta) = read_codex_session_meta(&file_path) else {
-            skipped = skipped.saturating_add(1);
-            continue;
-        };
-        let worktree = clean_codex_worktree(&meta.cwd);
+    for record in &index.records {
+        let worktree = clean_codex_worktree(&record.meta.cwd);
         let worktree_exists = *validated_worktrees
             .entry(worktree.clone())
             .or_insert_with(|| !worktree.is_empty() && Path::new(&worktree).is_dir());
@@ -425,7 +535,8 @@ fn discover_codex_projects_from_session_meta(
             continue;
         }
         let key = normalize_path(&worktree);
-        let updated_at = meta
+        let updated_at = record
+            .meta
             .timestamp
             .as_deref()
             .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
@@ -454,7 +565,115 @@ fn discover_codex_projects_from_session_meta(
     });
     let warning = (skipped > 0)
         .then(|| format!("已跳过 {skipped} 个无法读取、格式不兼容或目录已不存在的 CodeX 会话记录"));
-    Ok(CodexProjectDiscovery { projects, warning })
+    CodexProjectDiscovery { projects, warning }
+}
+
+fn build_codex_rollout_index(root: &Path) -> CodexRolloutIndex {
+    let mut files = Vec::new();
+    let mut skipped = 0_u32;
+    collect_codex_jsonl_files(root, &mut files, &mut skipped);
+    let mut records = Vec::with_capacity(files.len());
+    for path in files {
+        let Some(record) = load_codex_rollout_record(&path) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        records.push(record);
+    }
+    CodexRolloutIndex { records, skipped }
+}
+
+fn codex_rollout_file_revision(path: &Path) -> Option<CodexRolloutFileRevision> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(CodexRolloutFileRevision {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn load_codex_rollout_record(path: &Path) -> Option<CodexRolloutRecord> {
+    let revision = codex_rollout_file_revision(path);
+    if let Some(revision) = revision.as_ref() {
+        let cache = codex_rollout_file_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache
+            .get(path)
+            .filter(|entry| &entry.revision == revision)
+        {
+            return entry.meta.clone().map(|meta| CodexRolloutRecord {
+                path: path.to_path_buf(),
+                updated_at: rollout_updated_at(path, &meta),
+                meta,
+                revision: Some(revision.clone()),
+            });
+        }
+    }
+
+    let meta = read_codex_session_meta(path);
+    if let Some(revision) = revision.as_ref() {
+        codex_rollout_file_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                path.to_path_buf(),
+                CodexRolloutFileCacheEntry {
+                    revision: revision.clone(),
+                    meta: meta.clone(),
+                    preview: None,
+                },
+            );
+    }
+    meta.map(|meta| CodexRolloutRecord {
+        path: path.to_path_buf(),
+        updated_at: rollout_updated_at(path, &meta),
+        meta,
+        revision,
+    })
+}
+
+fn rollout_updated_at(path: &Path, meta: &CodexSessionMeta) -> i64 {
+    let created_at = meta
+        .timestamp
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp())
+        .unwrap_or(0);
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(created_at)
+}
+
+fn read_cached_codex_rollout_preview(record: &CodexRolloutRecord) -> String {
+    if let Some(revision) = record.revision.as_ref() {
+        let cache = codex_rollout_file_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(preview) = cache
+            .get(&record.path)
+            .filter(|entry| &entry.revision == revision)
+            .and_then(|entry| entry.preview.clone())
+        {
+            return preview;
+        }
+    }
+
+    let preview = read_codex_rollout_preview(&record.path);
+    if let Some(revision) = record.revision.as_ref() {
+        let mut cache = codex_rollout_file_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache
+            .get_mut(&record.path)
+            .filter(|entry| &entry.revision == revision)
+        {
+            entry.preview = Some(preview.clone());
+        }
+    }
+    preview
 }
 
 fn collect_codex_jsonl_files(root: &Path, files: &mut Vec<PathBuf>, skipped: &mut u32) {
@@ -511,11 +730,11 @@ fn spawn_codex_app_server(
     let path =
         locate_cli(CliKind::Codex).ok_or_else(|| "未检测到 CodeX，无法读取会话。".to_string())?;
     let mut command = hidden_command(&path);
-    // --profile is a top-level Codex option and must precede app-server.
-    // CODEX_HOME provides physical session isolation; the profile layer keeps
-    // the app-server configuration identical to the interactive terminal.
+    // All profiles use the same CODEX_HOME. Current Codex releases do not
+    // accept --profile for app-server, so the shared home is the source of
+    // truth and rollout metadata supplies the cross-provider catalog.
     command
-        .args(codex_app_server_args(runtime.profile_name.as_deref()))
+        .args(codex_app_server_args())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -528,21 +747,15 @@ fn spawn_codex_app_server(
         .map_err(|error| format!("无法启动 CodeX App Server: {error}"))
 }
 
-fn codex_app_server_args(profile_name: Option<&str>) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(profile_name) = profile_name {
-        args.push("--profile".to_string());
-        args.push(profile_name.to_string());
-    }
-    args.push("app-server".to_string());
-    args
+fn codex_app_server_args() -> [&'static str; 1] {
+    ["app-server"]
 }
 
 fn query_codex_threads(
     cwd: &Path,
     max_count: u32,
     runtime: &crate::codex_config::CodexRuntimeContext,
-) -> Result<Vec<CodexThreadSummary>, String> {
+) -> Result<CodexThreadList, String> {
     let mut child = spawn_codex_app_server(Some(cwd), runtime)?;
     let result = exchange_codex_thread_list(&mut child, Some(cwd), max_count.clamp(1, 500));
     terminate_child(&mut child);
@@ -552,7 +765,7 @@ fn query_codex_threads(
 fn query_all_codex_threads(
     max_count: u32,
     runtime: &crate::codex_config::CodexRuntimeContext,
-) -> Result<Vec<CodexThreadSummary>, String> {
+) -> Result<CodexThreadList, String> {
     let mut child = spawn_codex_app_server(None, runtime)?;
     let result = exchange_codex_thread_list(&mut child, None, max_count.clamp(1, 2000));
     terminate_child(&mut child);
@@ -562,7 +775,7 @@ fn query_all_codex_threads(
 fn codex_threads_from_rollouts(
     max_count: u32,
     runtime: &crate::codex_config::CodexRuntimeContext,
-) -> Result<Vec<CodexThreadSummary>, String> {
+) -> Result<CodexThreadList, String> {
     let sessions_root = codex_sessions_root(runtime)
         .ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
     if !sessions_root.is_dir() {
@@ -571,48 +784,51 @@ fn codex_threads_from_rollouts(
             sessions_root.display()
         ));
     }
-    Ok(codex_threads_from_rollout_root(&sessions_root, max_count))
+    let (threads, complete) = codex_threads_from_rollout_root_with_completeness(
+        &sessions_root,
+        max_count,
+    );
+    Ok(CodexThreadList { threads, complete })
 }
 
-fn codex_threads_from_rollout_root(
+fn codex_threads_from_rollout_root_with_completeness(
     sessions_root: &Path,
     max_count: u32,
-) -> Vec<CodexThreadSummary> {
-    let mut files = Vec::new();
-    let mut skipped = 0_u32;
-    collect_codex_jsonl_files(sessions_root, &mut files, &mut skipped);
+) -> (Vec<CodexThreadSummary>, bool) {
+    codex_threads_from_rollout_index(&build_codex_rollout_index(sessions_root), max_count)
+}
+
+fn codex_threads_from_rollout_index(
+    index: &CodexRolloutIndex,
+    max_count: u32,
+) -> (Vec<CodexThreadSummary>, bool) {
     let mut threads = Vec::new();
-    for file_path in files {
-        let Some(meta) = read_codex_session_meta(&file_path) else {
+    for indexed_record in &index.records {
+        let Some(record) = load_codex_rollout_record(&indexed_record.path) else {
             continue;
         };
-        let Some(id) = meta.id.filter(|id| !id.is_empty()) else {
+        let Some(id) = record.meta.id.as_ref().filter(|id| !id.is_empty()) else {
             continue;
         };
-        let worktree = clean_codex_worktree(&meta.cwd);
+        let worktree = clean_codex_worktree(&record.meta.cwd);
         if worktree.is_empty() {
             continue;
         }
-        let created_at = meta
+        let created_at = record
+            .meta
             .timestamp
             .as_deref()
             .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.timestamp())
             .unwrap_or(0);
-        let updated_at = fs::metadata(&file_path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(created_at);
         threads.push(CodexThreadSummary {
-            id,
+            id: id.clone(),
             name: None,
-            preview: read_codex_rollout_preview(&file_path),
-            model_provider: meta.model_provider,
+            preview: read_cached_codex_rollout_preview(&record),
+            model_provider: record.meta.model_provider.clone(),
             cwd: worktree,
             created_at,
-            updated_at,
+            updated_at: record.updated_at,
         });
     }
     threads.sort_by(|left, right| {
@@ -621,8 +837,10 @@ fn codex_threads_from_rollout_root(
             .cmp(&left.updated_at)
             .then_with(|| left.id.cmp(&right.id))
     });
-    threads.truncate(max_count.clamp(1, 2000) as usize);
-    threads
+    let limit = max_count.clamp(1, 2000) as usize;
+    let complete = threads.len() <= limit;
+    threads.truncate(limit);
+    (threads, complete)
 }
 
 fn read_codex_rollout_preview(path: &Path) -> String {
@@ -705,6 +923,38 @@ fn enrich_codex_thread_titles(
     threads
 }
 
+fn merge_codex_thread_lists(
+    app_server_threads: Vec<CodexThreadSummary>,
+    rollout_threads: Option<&[CodexThreadSummary]>,
+    max_count: u32,
+) -> Vec<CodexThreadSummary> {
+    let rollout_threads = rollout_threads.unwrap_or(&[]);
+    let mut by_id: HashMap<String, CodexThreadSummary> = HashMap::new();
+
+    for thread in rollout_threads {
+        match by_id.get(&thread.id) {
+            Some(existing) if existing.updated_at >= thread.updated_at => {}
+            _ => {
+                by_id.insert(thread.id.clone(), thread.clone());
+            }
+        }
+    }
+
+    for thread in enrich_codex_thread_titles(app_server_threads, rollout_threads) {
+        by_id.insert(thread.id.clone(), thread);
+    }
+
+    let mut merged: Vec<_> = by_id.into_values().collect();
+    merged.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    merged.truncate(max_count.clamp(1, 2000) as usize);
+    merged
+}
+
 fn codex_sessions_root(runtime: &crate::codex_config::CodexRuntimeContext) -> Option<PathBuf> {
     runtime
         .env_vars
@@ -714,24 +964,11 @@ fn codex_sessions_root(runtime: &crate::codex_config::CodexRuntimeContext) -> Op
         .map(|home| home.join("sessions"))
 }
 
-fn filter_codex_threads_by_provider(
-    threads: Vec<CodexThreadSummary>,
-    model_provider: &str,
-) -> Vec<CodexThreadSummary> {
-    threads
-        .into_iter()
-        .filter(|thread| match thread.model_provider.as_deref() {
-            Some(provider) => provider == model_provider,
-            None => model_provider == "openai",
-        })
-        .collect()
-}
-
 fn exchange_codex_thread_list(
     child: &mut Child,
     cwd: Option<&Path>,
     max_count: u32,
-) -> Result<Vec<CodexThreadSummary>, String> {
+) -> Result<CodexThreadList, String> {
     let stdout = child
         .stdout
         .take()
@@ -754,19 +991,9 @@ fn exchange_codex_thread_list(
         }
     });
 
-    let mut thread_list_params = json!({
-        "limit": max_count,
-        "archived": false,
-        "sourceKinds": ["cli", "vscode", "appServer"],
-        "sortKey": "updated_at",
-        "sortDirection": "desc"
-    });
-    if let Some(cwd) = cwd {
-        thread_list_params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
-    }
-
-    for message in [
-        json!({
+    write_codex_app_server_message(
+        &mut stdin,
+        &json!({
             "method": "initialize",
             "id": 0,
             "params": {
@@ -777,24 +1004,94 @@ fn exchange_codex_thread_list(
                 }
             }
         }),
-        json!({ "method": "initialized", "params": {} }),
-        json!({
-            "method": "thread/list",
-            "id": 1,
-            "params": thread_list_params
-        }),
-    ] {
-        serde_json::to_writer(&mut stdin, &message)
-            .map_err(|error| format!("CodeX App Server 请求序列化失败: {error}"))?;
-        stdin
-            .write_all(b"\n")
-            .map_err(|error| format!("CodeX App Server 请求写入失败: {error}"))?;
+    )?;
+    write_codex_app_server_message(&mut stdin, &json!({ "method": "initialized", "params": {} }))?;
+
+    let limit = max_count.clamp(1, 2000) as usize;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut request_id = 1_i64;
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut seen_ids = HashSet::new();
+    let mut threads = Vec::new();
+
+    loop {
+        let mut params = json!({
+            "limit": max_count,
+            "archived": false,
+            "sourceKinds": ["cli", "vscode", "appServer"],
+            "sortKey": "updated_at",
+            "sortDirection": "desc"
+        });
+        if let Some(cursor) = cursor.as_deref() {
+            params["cursor"] = Value::String(cursor.to_string());
+        }
+        if let Some(cwd) = cwd {
+            params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+        }
+
+        write_codex_app_server_message(
+            &mut stdin,
+            &json!({
+                "method": "thread/list",
+                "id": request_id,
+                "params": params
+            }),
+        )?;
+        let response = receive_codex_thread_list_page(
+            &receiver,
+            request_id,
+            deadline,
+        )?;
+        for thread in response.data {
+            if seen_ids.insert(thread.id.clone()) {
+                threads.push(thread);
+            }
+        }
+
+        let next_cursor = response
+            .next_cursor
+            .filter(|cursor| !cursor.trim().is_empty());
+        if threads.len() >= limit {
+            threads.truncate(limit);
+            return Ok(CodexThreadList {
+                threads,
+                complete: next_cursor.is_none(),
+            });
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Ok(CodexThreadList {
+                threads,
+                complete: true,
+            });
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err("CodeX App Server 会话列表分页游标重复。".to_string());
+        }
+        cursor = Some(next_cursor);
+        request_id += 1;
     }
+}
+
+fn write_codex_app_server_message<W: Write>(
+    stdin: &mut W,
+    message: &Value,
+) -> Result<(), String> {
+    serde_json::to_writer(&mut *stdin, message)
+        .map_err(|error| format!("CodeX App Server 请求序列化失败: {error}"))?;
+    stdin
+        .write_all(b"\n")
+        .map_err(|error| format!("CodeX App Server 请求写入失败: {error}"))?;
     stdin
         .flush()
-        .map_err(|error| format!("CodeX App Server 请求刷新失败: {error}"))?;
+        .map_err(|error| format!("CodeX App Server 请求刷新失败: {error}"))
+}
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn receive_codex_thread_list_page(
+    receiver: &mpsc::Receiver<String>,
+    request_id: i64,
+    deadline: Instant,
+) -> Result<CodexThreadListResponse, String> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -803,18 +1100,21 @@ fn exchange_codex_thread_list(
         let line = receiver
             .recv_timeout(remaining)
             .map_err(|_| "CodeX App Server 会话列表请求超时或连接关闭。".to_string())?;
-        if let Some(response) = parse_codex_thread_list_message(&line)? {
+        if let Some(response) = parse_codex_thread_list_message_for_id(&line, request_id)? {
             return Ok(response);
         }
     }
 }
 
-fn parse_codex_thread_list_message(line: &str) -> Result<Option<Vec<CodexThreadSummary>>, String> {
+fn parse_codex_thread_list_message_for_id(
+    line: &str,
+    request_id: i64,
+) -> Result<Option<CodexThreadListResponse>, String> {
     let message: Value = match serde_json::from_str(line) {
         Ok(message) => message,
         Err(_) => return Ok(None),
     };
-    if message.get("id").and_then(Value::as_i64) != Some(1) {
+    if message.get("id").and_then(Value::as_i64) != Some(request_id) {
         return Ok(None);
     }
     if let Some(error) = message.get("error") {
@@ -826,7 +1126,7 @@ fn parse_codex_thread_list_message(line: &str) -> Result<Option<Vec<CodexThreadS
         .ok_or_else(|| "CodeX App Server 会话列表缺少 result。".to_string())?;
     let response: CodexThreadListResponse = serde_json::from_value(result)
         .map_err(|error| format!("CodeX App Server 会话列表格式不兼容: {error}"))?;
-    Ok(Some(response.data))
+    Ok(Some(response))
 }
 
 fn terminate_child(child: &mut Child) {
@@ -870,8 +1170,9 @@ fn clean_opencode_worktree(path: &str) -> String {
 }
 
 fn discover_opencode_projects_from_db() -> Result<OpenCodeProjectDiscovery, String> {
-    let projects = crate::opencode_db::query_projects()?;
-    let sessions = crate::opencode_db::query_sessions(2000)?;
+    let snapshot = crate::opencode_db::query_workspace(2000)?;
+    let projects = snapshot.projects;
+    let sessions = snapshot.sessions;
     let mut seen_paths = HashSet::new();
     let mut discovered = Vec::new();
     let mut skipped = 0_u32;
@@ -1157,62 +1458,35 @@ mod tests {
     #[test]
     fn codex_app_server_thread_list_sample_maps_desktop_and_cli_threads() {
         let sample = include_str!("../tests/fixtures/cli/codex-app-server-thread-list.sample.json");
-        let threads = parse_codex_thread_list_message(sample)
+        let threads = parse_codex_thread_list_message_for_id(sample, 1)
             .expect("sample should parse")
             .expect("sample should be a thread/list response");
-        assert_eq!(threads.len(), 2);
-        assert_eq!(threads[0].id, "019f5f28-5a4d-71b2-8d69-5f7d8b2c9da1");
-        assert_eq!(threads[0].cwd, r"D:\project\cc-launcher");
-        assert_eq!(threads[0].name.as_deref(), Some("Desktop task"));
-        assert_eq!(threads[0].model_provider.as_deref(), Some("openai"));
-        assert_eq!(threads[1].preview, "CLI task prompt");
+        assert_eq!(threads.data.len(), 2);
+        assert_eq!(threads.data[0].id, "019f5f28-5a4d-71b2-8d69-5f7d8b2c9da1");
+        assert_eq!(threads.data[0].cwd, r"D:\project\cc-launcher");
+        assert_eq!(threads.data[0].name.as_deref(), Some("Desktop task"));
+        assert_eq!(threads.data[0].model_provider.as_deref(), Some("openai"));
+        assert_eq!(threads.data[1].preview, "CLI task prompt");
+        assert!(threads.next_cursor.is_none());
     }
 
     #[test]
-    fn codex_app_server_receives_profile_before_the_subcommand() {
+    fn codex_app_server_uses_the_shared_home_without_a_profile_flag() {
         assert_eq!(
-            codex_app_server_args(Some("agents-launcher-test")),
-            ["--profile", "agents-launcher-test", "app-server"]
+            codex_app_server_args(),
+            ["app-server"]
         );
-        assert_eq!(codex_app_server_args(None), ["app-server"]);
     }
 
     #[test]
-    fn codex_thread_filter_isolates_the_active_model_provider() {
-        let thread = |id: &str, model_provider: Option<&str>| CodexThreadSummary {
-            id: id.to_string(),
-            name: None,
-            preview: String::new(),
-            model_provider: model_provider.map(str::to_string),
-            cwd: r"D:\project\cc-launcher".to_string(),
-            created_at: 0,
-            updated_at: 0,
-        };
-
-        let custom = filter_codex_threads_by_provider(
-            vec![
-                thread("custom", Some("company_proxy")),
-                thread("official", Some("openai")),
-                thread("legacy", None),
-            ],
-            "company_proxy",
-        );
-        assert_eq!(
-            custom.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
-            vec!["custom"]
-        );
-
-        let official = filter_codex_threads_by_provider(
-            vec![thread("official", Some("openai")), thread("legacy", None)],
-            "openai",
-        );
-        assert_eq!(
-            official
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["official", "legacy"]
-        );
+    fn codex_thread_list_parser_preserves_the_next_cursor() {
+        let page = parse_codex_thread_list_message_for_id(
+            r#"{"id":1,"result":{"data":[],"nextCursor":"2026-07-07T01:28:04.235Z"}}"#,
+            1,
+        )
+        .expect("page should parse")
+        .expect("page should be a thread/list response");
+        assert_eq!(page.next_cursor.as_deref(), Some("2026-07-07T01:28:04.235Z"));
     }
 
     #[test]
@@ -1242,6 +1516,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_thread_merge_keeps_rollouts_missing_from_the_app_server_page() {
+        let app_server = CodexThreadSummary {
+            id: "current".to_string(),
+            name: Some("Current".to_string()),
+            preview: String::new(),
+            model_provider: Some("openai".to_string()),
+            cwd: r"D:\project\cc-launcher".to_string(),
+            created_at: 2,
+            updated_at: 2,
+        };
+        let older_rollout = CodexThreadSummary {
+            id: "older".to_string(),
+            name: None,
+            preview: "历史会话".to_string(),
+            model_provider: Some("openai".to_string()),
+            cwd: r"D:\project\cc-launcher".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        let merged = merge_codex_thread_lists(vec![app_server], Some(&[older_rollout]), 100);
+        assert_eq!(
+            merged.iter().map(|thread| thread.id.as_str()).collect::<Vec<_>>(),
+            vec!["current", "older"]
+        );
+    }
+
+    #[test]
     fn codex_rollout_fallback_builds_threads_from_session_files() {
         let dir = tempfile::tempdir().expect("temp dir");
         let nested = dir.path().join("2026").join("07").join("17");
@@ -1258,13 +1560,85 @@ mod tests {
         )
         .expect("write rollout");
 
-        let threads = codex_threads_from_rollout_root(dir.path(), 100);
+        let (threads, complete) = codex_threads_from_rollout_root_with_completeness(dir.path(), 100);
         assert_eq!(threads.len(), 1);
+        assert!(complete);
         assert_eq!(threads[0].id, "019f6c13-d886-7521-a0de-90cfe0a99c67");
         assert_eq!(threads[0].cwd, r"D:\Project\demo");
         assert_eq!(threads[0].created_at, 1784253467);
         assert!(threads[0].updated_at >= threads[0].created_at);
         assert_eq!(threads[0].preview, "把当前项目的git更新到最新");
+    }
+
+    #[test]
+    fn codex_rollout_index_feeds_discovery_and_threads_without_reenumeration() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sessions_root = dir.path().join("sessions");
+        let worktree = dir.path().join("worktree");
+        fs::create_dir_all(&sessions_root).expect("create sessions");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        let rollout = sessions_root.join("rollout.jsonl");
+        let meta = json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "thread-1",
+                "timestamp": "2026-08-31T01:02:03Z",
+                "cwd": worktree.to_string_lossy(),
+                "model_provider": "provider-a"
+            }
+        });
+        let message = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "真实问题" }]
+            }
+        });
+        fs::write(&rollout, format!("{meta}\n{message}\n")).expect("write rollout");
+
+        let index = build_codex_rollout_index(&sessions_root);
+        let discovery = discover_codex_projects_from_rollout_index(&index);
+        let (threads, complete) = codex_threads_from_rollout_index(&index, 100);
+
+        assert_eq!(index.records.len(), 1);
+        assert_eq!(discovery.projects.len(), 1);
+        assert_eq!(discovery.projects[0].session_count, 1);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "thread-1");
+        assert_eq!(threads[0].preview, "真实问题");
+        assert_eq!(threads[0].model_provider.as_deref(), Some("provider-a"));
+        assert!(complete);
+
+        let updated_meta = json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "thread-1",
+                "timestamp": "2026-08-31T01:02:04Z",
+                "cwd": worktree.to_string_lossy(),
+                "model_provider": "provider-b"
+            }
+        });
+        let updated_message = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "更新后的真实问题" }]
+            }
+        });
+        fs::write(
+            &rollout,
+            format!("{updated_meta}\n{updated_message}\n"),
+        )
+        .expect("update rollout");
+
+        let (updated_threads, _) = codex_threads_from_rollout_index(&index, 100);
+        assert_eq!(updated_threads[0].preview, "更新后的真实问题");
+        assert_eq!(
+            updated_threads[0].model_provider.as_deref(),
+            Some("provider-b")
+        );
     }
 
     #[test]

@@ -122,13 +122,16 @@
 
       <!-- Terminal panel — always mounted to preserve state -->
       <div v-show="mainTab === 'terminal'" class="app-panel">
-        <TerminalManager ref="terminalManagerRef" :launch-dir="activeLaunchDir" />
+        <TerminalManager
+          v-if="mountedMainPanels.terminal"
+          :launch-dir="activeLaunchDir"
+        />
       </div>
 
       <!-- Shared CLI workspace — keep mounted while on the config tab so
            xterm instances (scrollback, mouse modes) survive tab switches. -->
       <div
-        v-if="workspaceCliKind && workspaceCliStatus?.state === 'ready'"
+        v-if="mountedMainPanels.project && workspaceCliKind && workspaceCliStatus?.state === 'ready'"
         v-show="workspaceMode === 'project'"
         class="app-panel"
       >
@@ -141,7 +144,11 @@
       </div>
 
       <!-- Orchestration panel -->
-      <div v-show="mainTab === 'orchestration'" class="app-panel">
+      <div
+        v-if="mountedMainPanels.orchestration"
+        v-show="mainTab === 'orchestration'"
+        class="app-panel"
+      >
         <OrchestrationManager />
       </div>
     </main>
@@ -387,6 +394,7 @@
     </div>
 
     <TopBarOrderModal
+      v-if="topBarOrderModalMounted"
       :visible="topBarOrderModalOpen"
       @close="topBarOrderModalOpen = false"
     />
@@ -394,16 +402,22 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, onBeforeUnmount, watch } from 'vue'
+import {
+  ref,
+  computed,
+  defineAsyncComponent,
+  nextTick,
+  onMounted,
+  onBeforeUnmount,
+  reactive,
+  watch,
+} from 'vue'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import ConfigWorkspace from './components/config/ConfigWorkspace.vue'
-import TerminalManager from './components/terminal/TerminalManager.vue'
-import ProjectPanel from './components/project/ProjectPanel.vue'
-import OrchestrationManager from './components/orchestration/OrchestrationManager.vue'
-import TopBarOrderModal from './components/common/TopBarOrderModal.vue'
+import AsyncPanelLoading from './components/common/AsyncPanelLoading'
 import { useClaudeStore } from './stores/claude'
 import { useClaudeObserverStore } from './stores/claudeObserver'
 import { useClaudeViewModeStore, type ClaudeView } from './stores/claudeViewMode'
@@ -421,6 +435,8 @@ import {
   shouldStartTitleBarDrag,
   shouldToggleTitleBarMaximize,
 } from './utils/windowTitleBar'
+import { beginStartupMeasure, markStartup, measureStartup } from './utils/startupMetrics'
+import { scheduleIdleTask } from './utils/idleTask'
 import {
   CLI_DESCRIPTORS,
   isCliKind,
@@ -429,6 +445,24 @@ import {
   type MainTab,
 } from './types/cli'
 import type { ClaudeAgentEvent } from './types/claudeObserver'
+
+const loadTerminalManager = () => import('./components/terminal/TerminalManager.vue')
+const loadProjectPanel = () => import('./components/project/ProjectPanel.vue')
+const loadOrchestrationManager = () => import('./components/orchestration/OrchestrationManager.vue')
+const loadTopBarOrderModal = () => import('./components/common/TopBarOrderModal.vue')
+const asyncPanelOptions = {
+  loadingComponent: AsyncPanelLoading,
+  delay: 80,
+}
+const TerminalManager = defineAsyncComponent({ ...asyncPanelOptions, loader: loadTerminalManager })
+const ProjectPanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadProjectPanel })
+const OrchestrationManager = defineAsyncComponent({
+  ...asyncPanelOptions,
+  loader: loadOrchestrationManager,
+})
+const TopBarOrderModal = defineAsyncComponent({ loader: loadTopBarOrderModal })
+
+markStartup('app-script-setup')
 
 type DependencyName = 'node' | 'git'
 type DependencyStatus = 'installed' | 'missing' | 'unsupported' | 'error'
@@ -465,9 +499,19 @@ const topBarStore = useTopBarStore()
 const appSettingsStore = useAppSettingsStore()
 const { isWindows, isMacOS } = usePlatform()
 const usesNativeMacTitleBar = computed(() => isMacOS.value)
-const terminalManagerRef = ref<InstanceType<typeof TerminalManager> | null>(null)
-const projectPanelRef = ref<InstanceType<typeof ProjectPanel> | null>(null)
+interface ProjectPanelExpose {
+  showClaudeViewControls: boolean
+  selectClaudeView: (view: ClaudeView) => Promise<void>
+}
+
+const projectPanelRef = ref<ProjectPanelExpose | null>(null)
 const topBarOrderModalOpen = ref(false)
+const topBarOrderModalMounted = ref(false)
+const mountedMainPanels = reactive({
+  terminal: false,
+  project: false,
+  orchestration: false,
+})
 const sharedSidebarHeaderWidth = ref(285)
 const dependencyState = ref<DependencyGateState>('checking')
 const dependencyResult = ref<DependencyCheckResult | null>(null)
@@ -482,6 +526,25 @@ const appReady = computed(() => dependencyState.value === 'ready')
 const workspaceMode = computed<'config' | 'project' | 'other'>(() => {
   if (mainTab.value === 'config') return 'config'
   return isCliKind(mainTab.value) ? 'project' : 'other'
+})
+let cancelMainPanelPreload: (() => void) | undefined
+let mainPanelPreloadScheduled = false
+watch(mainTab, (tab) => {
+  if (tab === 'terminal') mountedMainPanels.terminal = true
+  else if (tab === 'orchestration') mountedMainPanels.orchestration = true
+  else if (isCliKind(tab)) mountedMainPanels.project = true
+}, { immediate: true })
+watch(appReady, (ready) => {
+  if (!ready || mainPanelPreloadScheduled) return
+  mainPanelPreloadScheduled = true
+  cancelMainPanelPreload = scheduleIdleTask(() => {
+    void Promise.allSettled([
+      loadTerminalManager(),
+      loadProjectPanel(),
+      loadOrchestrationManager(),
+      loadTopBarOrderModal(),
+    ])
+  })
 })
 const activeCliKind = computed<CliKind>(() => configWorkspaceStore.activeKind)
 const activeCliStatus = computed(() => cliRuntimeStore.statuses[activeCliKind.value] ?? null)
@@ -711,51 +774,69 @@ function setBlockedDependency(result: DependencyCheckResult) {
       : 'missing'
 }
 
+let dependencyCheckPromise: Promise<void> | null = null
+
 async function runDependencyCheck() {
+  if (dependencyCheckPromise) return dependencyCheckPromise
+  dependencyCheckPromise = performDependencyCheck()
+  try {
+    await dependencyCheckPromise
+  } finally {
+    dependencyCheckPromise = null
+  }
+}
+
+async function performDependencyCheck() {
   dependencyState.value = 'checking'
   dependencyResult.value = null
   dependencyActionMessage.value = ''
 
-  let nodeResult: DependencyCheckResult
-  try {
-    nodeResult = await invoke<DependencyCheckResult>('check_node_dependency')
-  } catch (error) {
+  const [nodeOutcome, gitOutcome] = await Promise.all([
+    measureStartup('dependency-node', () =>
+      invoke<DependencyCheckResult>('check_node_dependency'))
+      .then(result => ({ result } as const), error => ({ error } as const)),
+    measureStartup('dependency-git', () =>
+      invoke<DependencyCheckResult>('check_git_dependency'))
+      .then(result => ({ result } as const), error => ({ error } as const)),
+  ])
+
+  if ('error' in nodeOutcome) {
     setBlockedDependency({
       dependency: 'node',
       status: 'error',
       path: null,
       version: null,
-      message: `无法检查 Node.js：${String(error)}`,
+      message: `无法检查 Node.js：${String(nodeOutcome.error)}`,
     })
     return
   }
 
+  const nodeResult = nodeOutcome.result
   if (nodeResult.status !== 'installed') {
     setBlockedDependency(nodeResult)
     return
   }
 
-  let gitResult: DependencyCheckResult
-  try {
-    gitResult = await invoke<DependencyCheckResult>('check_git_dependency')
-  } catch (error) {
+  if ('error' in gitOutcome) {
     setBlockedDependency({
       dependency: 'git',
       status: 'error',
       path: null,
       version: null,
-      message: `无法检查 Git：${String(error)}`,
+      message: `无法检查 Git：${String(gitOutcome.error)}`,
     })
     return
   }
 
+  const gitResult = gitOutcome.result
   if (gitResult.status !== 'installed') {
     setBlockedDependency(gitResult)
     return
   }
 
   dependencyState.value = 'ready'
-  await initializeReadyApp()
+  markStartup('app-ready')
+  await measureStartup('initialize-ready-app', initializeReadyApp)
 }
 
 async function retryDependencyCheck() {
@@ -924,6 +1005,7 @@ async function setClaudeBusyInputMode(mode: 'native' | 'after-stop') {
 
 function openTopBarOrderModal() {
   showSettings.value = false
+  topBarOrderModalMounted.value = true
   topBarOrderModalOpen.value = true
 }
 
@@ -986,6 +1068,7 @@ async function openCliTab(kind: CliKind, forceCheck = false) {
   }
   const requestId = ++cliOpenRequestId
   const gateStartedAt = performance.now()
+  const finishWorkspaceMeasure = beginStartupMeasure(`cli-workspace-${kind}`)
   mainTab.value = kind
   projectStore.setActiveCliKind(kind)
   cliInstallHelpVisible.value = false
@@ -1020,6 +1103,7 @@ async function openCliTab(kind: CliKind, forceCheck = false) {
         terminalStore.triggerRefit()
       }
     }
+    finishWorkspaceMeasure()
   }
 }
 
@@ -1132,9 +1216,43 @@ interface WindowState {
   y?: number
 }
 
-async function loadWindowState() {
+interface StartupBootstrapPayload {
+  claudeStartupView: string
+  claudeLogOutputEnabled: boolean
+  claudeBusyInputMode: string
+  claudeLaunchDir: string
+  claudeProjectDropPathMode: string
+  topBarLayout: {
+    order: string[]
+    hidden: string[]
+  }
+  minimizeToTray: boolean
+  terminalFontSize: number
+  windowState: WindowState
+  lastActiveMainTab: string
+}
+
+function isStartupBootstrapPayload(value: unknown): value is StartupBootstrapPayload {
+  if (!value || typeof value !== 'object') return false
+  const payload = value as Partial<StartupBootstrapPayload>
+  return typeof payload.claudeStartupView === 'string'
+    && typeof payload.claudeLogOutputEnabled === 'boolean'
+    && typeof payload.claudeBusyInputMode === 'string'
+    && typeof payload.claudeLaunchDir === 'string'
+    && typeof payload.claudeProjectDropPathMode === 'string'
+    && typeof payload.minimizeToTray === 'boolean'
+    && typeof payload.terminalFontSize === 'number'
+    && typeof payload.lastActiveMainTab === 'string'
+    && !!payload.windowState
+    && typeof payload.windowState === 'object'
+    && !!payload.topBarLayout
+    && Array.isArray(payload.topBarLayout.order)
+    && Array.isArray(payload.topBarLayout.hidden)
+}
+
+async function loadWindowState(providedState?: WindowState) {
   try {
-    const state = await invoke<WindowState>('load_window_state')
+    const state = providedState ?? await invoke<WindowState>('load_window_state')
     const win = getCurrentWindow()
     if (state && state.width && state.height) {
       const { LogicalSize } = await import('@tauri-apps/api/dpi')
@@ -1168,9 +1286,9 @@ async function saveWindowState() {
   }
 }
 
-async function loadLastMainTab() {
+async function loadLastMainTab(providedTab?: string) {
   try {
-    const savedTab = await invoke<string>('load_last_active_main_tab')
+    const savedTab = providedTab ?? await invoke<string>('load_last_active_main_tab')
     const tab = normalizePersistedMainTab(savedTab)
     if (isCliKind(tab)) {
       await configWorkspaceStore.selectKind(tab)
@@ -1183,6 +1301,47 @@ async function loadLastMainTab() {
     projectStore.setActiveCliKind(activeCliKind.value)
   } catch {
     // keep default
+  }
+}
+
+async function loadLegacyStartupState() {
+  await Promise.all([
+    claudeViewModeStore.load(),
+    claudeObserverStore.loadBusyInputMode(),
+    topBarStore.loadOrder(),
+    appSettingsStore.load(),
+    claudeStore.loadLaunchDir(),
+    terminalStore.loadFontSize(),
+  ])
+  await Promise.all([
+    loadWindowState(),
+    loadLastMainTab(),
+  ])
+}
+
+async function loadStartupState() {
+  try {
+    const payload = await invoke<StartupBootstrapPayload>('load_startup_bootstrap')
+    if (!isStartupBootstrapPayload(payload)) throw new Error('启动状态快照格式无效')
+
+    claudeViewModeStore.hydrate(
+      payload.claudeStartupView,
+      payload.claudeLogOutputEnabled,
+    )
+    claudeObserverStore.hydrateBusyInputMode(payload.claudeBusyInputMode)
+    claudeStore.hydrateGlobalUiState(
+      payload.claudeLaunchDir,
+      payload.claudeProjectDropPathMode,
+    )
+    topBarStore.hydrateLayout(payload.topBarLayout)
+    appSettingsStore.hydrate(payload.minimizeToTray)
+    terminalStore.hydrateFontSize(payload.terminalFontSize)
+    await Promise.all([
+      loadWindowState(payload.windowState),
+      loadLastMainTab(payload.lastActiveMainTab),
+    ])
+  } catch {
+    await loadLegacyStartupState()
   }
 }
 
@@ -1270,14 +1429,10 @@ async function initializeReadyApp() {
 }
 
 onMounted(async () => {
+  const finishMountedMeasure = beginStartupMeasure('app-mounted-bootstrap')
   loadTheme()
   loadAppFontSize()
-  await claudeViewModeStore.load()
-  await claudeObserverStore.loadBusyInputMode()
-  await topBarStore.loadOrder()
-  await appSettingsStore.load()
-  await loadWindowState()
-  await loadLastMainTab()
+  await measureStartup('startup-state', loadStartupState)
   if (usesNativeMacTitleBar.value) {
     isMacFullscreen.value = await win.isFullscreen().catch(() => false)
     isMaximized.value = isMacFullscreen.value
@@ -1288,35 +1443,42 @@ onMounted(async () => {
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('resize', onWindowResize)
   document.addEventListener('click', onDocumentClick)
-  unlistenClaudeSessionLifecycle = await listen<ClaudeAgentEvent>('claude_agent_event', (event) => {
-    projectStore.handleClaudeSessionLifecycleEvent(event.payload).catch((error) => {
-      console.error('Failed to synchronize Claude session after /clear:', error)
-    })
-  }).catch(() => undefined)
-  unlistenClaudeHistory = await listen('claude_history_changed', () => {
-    if (!appReady.value) return
-    refreshClaudeHistory().catch((error) => {
-      console.error('Failed to refresh Claude history:', error)
-    })
-  }).catch(() => undefined)
-  unlistenTrayQuit = await listen('tray-quit-requested', () => {
-    void handleTrayQuitRequest()
-  }).catch(() => undefined)
-
-  unlistenMacFullscreenRequest = await listen<boolean>(
-    'macos-fullscreen-toggle-requested',
-    ({ payload }) => {
-      requestAnimatedFullscreenToggle(payload).catch(() => {})
-    },
-  ).catch(() => undefined)
-
-  // Query only after resizing has settled. This tracks native fullscreen
-  // completion without accumulating an IPC request for every resize frame.
-  unlistenWindowResized = await win.onResized(() => {
-    if (usesNativeMacTitleBar.value) {
-      scheduleMacFullscreenSync()
-    }
-  }).catch(() => undefined)
+  const finishListenerMeasure = beginStartupMeasure('startup-listeners')
+  ;[
+    unlistenClaudeSessionLifecycle,
+    unlistenClaudeHistory,
+    unlistenTrayQuit,
+    unlistenMacFullscreenRequest,
+    unlistenWindowResized,
+  ] = await Promise.all([
+    listen<ClaudeAgentEvent>('claude_agent_event', (event) => {
+      projectStore.handleClaudeSessionLifecycleEvent(event.payload).catch((error) => {
+        console.error('Failed to synchronize Claude session after /clear:', error)
+      })
+    }).catch(() => undefined),
+    listen('claude_history_changed', () => {
+      if (!appReady.value) return
+      refreshClaudeHistory().catch((error) => {
+        console.error('Failed to refresh Claude history:', error)
+      })
+    }).catch(() => undefined),
+    listen('tray-quit-requested', () => {
+      void handleTrayQuitRequest()
+    }).catch(() => undefined),
+    listen<boolean>(
+      'macos-fullscreen-toggle-requested',
+      ({ payload }) => {
+        requestAnimatedFullscreenToggle(payload).catch(() => {})
+      },
+    ).catch(() => undefined),
+    // Query only after resizing has settled. This tracks native fullscreen
+    // completion without accumulating an IPC request for every resize frame.
+    win.onResized(() => {
+      if (usesNativeMacTitleBar.value) {
+        scheduleMacFullscreenSync()
+      }
+    }).catch(() => undefined),
+  ])
 
   // Save window state on close, then explicitly close the window.
   // In Tauri v2, registering onCloseRequested prevents the default close —
@@ -1350,10 +1512,13 @@ onMounted(async () => {
     await win.destroy()
   })
 
-  await runDependencyCheck()
+  finishListenerMeasure()
+  await measureStartup('dependency-checks', runDependencyCheck)
+  finishMountedMeasure()
 })
 
 onBeforeUnmount(() => {
+  cancelMainPanelPreload?.()
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('resize', onWindowResize)
   document.removeEventListener('click', onDocumentClick)

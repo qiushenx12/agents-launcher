@@ -1,7 +1,7 @@
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 
-const PANE_KEY = 'workspace-left-sidebar'
+export const SHARED_LEFT_SIDEBAR_PANE_KEY = 'workspace-left-sidebar'
 const DEFAULT_WIDTH = 280
 const MIN_WIDTH = 200
 const MAX_WIDTH = 400
@@ -16,19 +16,25 @@ function clampWidth(width: number) {
   return Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, width))
 }
 
+function hydrateWidth(saved: number | null | undefined) {
+  if (saved !== null && saved !== undefined) leftWidth.value = clampWidth(saved)
+  if (!initialized) initialized = Promise.resolve()
+}
+
 async function loadWidth() {
   if (!initialized) {
-    initialized = invoke<number | null>('load_pane_width', { key: PANE_KEY })
-      .then((saved) => {
-        if (saved !== null && saved !== undefined) leftWidth.value = clampWidth(saved)
-      })
+    initialized = invoke<number | null>('load_pane_width', { key: SHARED_LEFT_SIDEBAR_PANE_KEY })
+      .then(hydrateWidth)
       .catch(() => {})
   }
   await initialized
 }
 
 async function saveWidth() {
-  await invoke('save_pane_width', { key: PANE_KEY, width: leftWidth.value }).catch(() => {})
+  await invoke('save_pane_width', {
+    key: SHARED_LEFT_SIDEBAR_PANE_KEY,
+    width: leftWidth.value,
+  }).catch(() => {})
 }
 
 function onMouseMove(event: MouseEvent) {
@@ -52,5 +58,5 @@ function onMouseDown(event: MouseEvent) {
 }
 
 export function useSharedLeftSidebarWidth() {
-  return { leftWidth, isDragging, onMouseDown, loadWidth }
+  return { leftWidth, isDragging, onMouseDown, loadWidth, hydrateWidth }
 }

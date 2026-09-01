@@ -7,6 +7,12 @@ export const useAppSettingsStore = defineStore('appSettings', () => {
   const loaded = ref(false)
   let loadPromise: Promise<void> | null = null
 
+  function hydrate(nextMinimizeToTray: boolean) {
+    minimizeToTray.value = nextMinimizeToTray
+    loaded.value = true
+    loadPromise = null
+  }
+
   async function load() {
     if (loaded.value) return
     if (loadPromise) return loadPromise
@@ -39,6 +45,7 @@ export const useAppSettingsStore = defineStore('appSettings', () => {
   return {
     minimizeToTray,
     loaded,
+    hydrate,
     load,
     setMinimizeToTray,
   }

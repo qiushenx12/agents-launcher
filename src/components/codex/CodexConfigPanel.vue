@@ -348,7 +348,7 @@
           class="scope-warning"
         >
           <template v-if="profile.authMode === 'official' && store.platform === 'windows'">
-            将更新该方案独立的 CODEX_HOME/config.toml，并隔离桌面端会话；auth.json 保持只读。
+            将更新共享的 Codex config.toml；所有配置共用会话，auth.json 保持只读。
           </template>
           <template v-else-if="profile.authMode === 'official'">
             将更新 Codex 全局 config.toml；auth.json 保持只读。
@@ -356,8 +356,11 @@
           <template v-else-if="store.secretStorageKind === 'macos_plaintext' && profile.hasStoredApiKey">
             将把第三方 Provider 和模型同步到 Codex 全局 config.toml，并配置 Codex 的命令式认证从启动器凭据文件读取 Key。明文不会写入 TOML 或 shell，不使用 Keychain。
           </template>
+          <template v-else-if="store.secretStorageKind === 'windows_dpapi' && profile.hasStoredApiKey">
+            将把第三方 Provider 和模型同步到共享的 Codex config.toml，并通过命令式认证按 profile 解密 DPAPI 凭据；不会把 Key 写入 TOML 或用户环境变量。
+          </template>
           <template v-else-if="store.platform === 'windows'">
-            将把第三方 Provider 和模型同步到该方案独立的 CODEX_HOME/config.toml，并隔离桌面端会话；完全退出（含后台）并重新打开 Codex 桌面端后生效。
+            将把第三方 Provider 和模型同步到共享的 Codex config.toml；所有配置共用会话，完全退出（含后台）并重新打开 Codex 桌面端后生效。
           </template>
           <template v-else>
             将把第三方 Provider 和模型同步到 Codex 全局 config.toml；外部 Codex 仍需自行提供对应的 API Key。
@@ -415,6 +418,7 @@ import SecretField from '@/components/config/SecretField.vue'
 import { useDragReorder } from '@/composables/useDragReorder'
 import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
 import { useSettingsPopover } from '@/composables/useSettingsPopover'
+import { beginStartupMeasure } from '@/utils/startupMetrics'
 import type { CodexModelDefinition } from '@/types/config'
 
 const { toggleSettings } = useSettingsPopover()
@@ -603,9 +607,16 @@ function onEffortSelect(event: Event) {
 
 const { leftWidth, isDragging, onMouseDown, loadWidth } = useSharedLeftSidebarWidth()
 
-onMounted(() => {
-  loadWidth().catch(() => {})
-  store.loadProfiles().catch(() => {})
+onMounted(async () => {
+  const finish = beginStartupMeasure('codex-config-panel')
+  try {
+    await Promise.all([
+      loadWidth().catch(() => {}),
+      store.loadProfiles().catch(() => {}),
+    ])
+  } finally {
+    finish()
+  }
 })
 
 watch(leftWidth, (width) => {

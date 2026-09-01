@@ -21,7 +21,7 @@ pub(crate) mod transform;
 
 use crate::codex_config::{CodexAuthMode, CodexProfile};
 use server::{router, ProxyState};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener as StdTcpListener;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -30,7 +30,7 @@ use std::time::Duration;
 enum ProxyMode {
     /// 启动器终端启动路径（resolve 每次重渲染 profile TOML，随机端口无缓存问题）。
     Managed,
-    /// 全局配置接管路径（Codex 桌面端缓存 base_url，必须固定端口防漂移断连）。
+    /// 全局配置接管路径（Codex 桌面端缓存 base_url，使用 profile 稳定端口）。
     Global,
 }
 
@@ -40,14 +40,19 @@ pub(crate) struct ProxyInstance {
     upstream_base_url: String,
     /// 注册时的 API key，用于检测 key 变更后重建实例。
     api_key: String,
+    provider_name: String,
+    default_model: String,
+    chat_upstream_model: Option<String>,
+    catalog_model_ids: Vec<String>,
+    prompt_cache_routing: String,
     reasoning_override: Option<reasoning::CodexChatReasoningConfig>,
     mode: ProxyMode,
 }
 
-/// 全局接管的固定端口。Codex 桌面端 / VSCode 扩展在加载配置时读取一次
-/// base_url 并缓存，随机端口在 launcher 重启后漂移会导致"连接被拒/重连失败"。
-/// 避开 cc-switch 的默认端口 15721。
+/// 全局接管的稳定端口区间起点。Codex 桌面端 / VSCode 扩展会缓存 base_url，
+/// 因此每个 profile 通过稳定哈希获得自己的端口；区间避开 cc-switch 的 15721。
 pub(crate) const GLOBAL_PROXY_PORT: u16 = 15800;
+const GLOBAL_PROXY_PORT_SPAN: u16 = 10_000;
 
 type ProxyKey = (String, ProxyMode);
 
@@ -103,11 +108,58 @@ pub(crate) fn ensure_conversion(profile: &CodexProfile) -> Result<Option<String>
     ensure_conversion_on(profile, None, ProxyMode::Managed)
 }
 
-/// 确保 profile 的转换代理在运行（全局接管路径，固定端口防漂移）。
+/// 确保 profile 的转换代理在运行（全局接管路径，profile 稳定端口防漂移）。
 pub(crate) fn ensure_conversion_fixed_port(
     profile: &CodexProfile,
 ) -> Result<Option<String>, String> {
-    ensure_conversion_on(profile, Some(GLOBAL_PROXY_PORT), ProxyMode::Global)
+    ensure_conversion_on(
+        profile,
+        Some(global_proxy_port(&profile.id)),
+        ProxyMode::Global,
+    )
+}
+
+pub(crate) fn global_proxy_port(profile_id: &str) -> u16 {
+    let hash = profile_id.as_bytes().iter().fold(2_166_136_261_u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(16_777_619)
+    });
+    GLOBAL_PROXY_PORT + (hash % u32::from(GLOBAL_PROXY_PORT_SPAN)) as u16
+}
+
+pub(crate) fn global_proxy_url(profile_id: &str) -> String {
+    local_base_url(global_proxy_port(profile_id))
+}
+
+pub(crate) fn is_global_proxy_port(port: u16) -> bool {
+    (GLOBAL_PROXY_PORT..GLOBAL_PROXY_PORT + GLOBAL_PROXY_PORT_SPAN).contains(&port)
+}
+
+pub(crate) fn global_instances_match(profiles: &[CodexProfile]) -> bool {
+    let Ok(guard) = registry().lock() else {
+        return false;
+    };
+    let global_count = guard
+        .keys()
+        .filter(|(_, mode)| *mode == ProxyMode::Global)
+        .count();
+    if global_count != profiles.len() {
+        return false;
+    }
+    profiles.iter().all(|profile| {
+        guard
+            .get(&(profile.id.clone(), ProxyMode::Global))
+            .is_some_and(|instance| {
+                !instance.task.inner().is_finished()
+                    && instance.port == global_proxy_port(&profile.id)
+                    && instance.upstream_base_url == profile.base_url
+                    && instance.provider_name == profile.provider_name
+                    && instance.default_model == profile.model
+                    && instance.chat_upstream_model == profile_chat_upstream_model(profile)
+                    && instance.catalog_model_ids == profile_catalog_model_ids(profile)
+                    && instance.prompt_cache_routing == profile.prompt_cache_routing
+                    && instance.reasoning_override == reasoning_override_from_profile(profile)
+            })
+    })
 }
 
 fn ensure_conversion_on(
@@ -128,6 +180,8 @@ fn ensure_conversion_on(
     // Authorization——Codex 桌面端读取不到启动器加密保存的 key。
     let api_key = crate::codex_config::resolve_profile_api_key(profile)?;
     let reasoning_override = reasoning_override_from_profile(profile);
+    let chat_upstream_model = profile_chat_upstream_model(profile);
+    let catalog_model_ids = profile_catalog_model_ids(profile);
 
     {
         let Ok(guard) = registry().lock() else {
@@ -139,6 +193,11 @@ fn ensure_conversion_on(
                 && instance.mode == mode
                 && instance.upstream_base_url == profile.base_url
                 && instance.api_key == api_key
+                && instance.provider_name == profile.provider_name
+                && instance.default_model == profile.model
+                && instance.chat_upstream_model == chat_upstream_model
+                && instance.catalog_model_ids == catalog_model_ids
+                && instance.prompt_cache_routing == profile.prompt_cache_routing
                 && instance.reasoning_override == reasoning_override
                 && port.is_none_or(|expected| instance.port == expected)
             {
@@ -157,25 +216,13 @@ fn ensure_conversion_on(
         .map_err(|error| format!("无法获取转换代理端口：{error}"))?
         .port();
     let history = history_for_profile(&profile.id);
-    let catalog_model_ids = profile
-        .model_catalog
-        .as_ref()
-        .map(|catalog| {
-            catalog
-                .models
-                .iter()
-                .map(|model| model.slug.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let state = Arc::new(ProxyState {
         upstream_base_url: profile.base_url.clone(),
         api_key: Some(api_key.clone()),
         provider_name: profile.provider_name.clone(),
         default_model: profile.model.clone(),
-        chat_upstream_model: (!profile.chat_upstream_model.trim().is_empty())
-            .then(|| profile.chat_upstream_model.trim().to_string()),
-        catalog_model_ids,
+        chat_upstream_model: chat_upstream_model.clone(),
+        catalog_model_ids: catalog_model_ids.clone(),
         prompt_cache_routing: profile.prompt_cache_routing.clone(),
         reasoning_override: reasoning_override.clone(),
         history: history.clone(),
@@ -196,6 +243,11 @@ fn ensure_conversion_on(
             task,
             upstream_base_url: profile.base_url.clone(),
             api_key,
+            provider_name: profile.provider_name.clone(),
+            default_model: profile.model.clone(),
+            chat_upstream_model,
+            catalog_model_ids,
+            prompt_cache_routing: profile.prompt_cache_routing.clone(),
             reasoning_override,
             mode,
         },
@@ -207,8 +259,27 @@ fn ensure_conversion_on(
     Ok(Some(local_base_url(actual_port)))
 }
 
-/// 绑定固定端口。被本进程其他全局实例占用时先停掉它再重试（全局 profile
-/// 切换场景）；被外部进程占用时短暂等待（TIME_WAIT / 端口释放延迟）后重试。
+fn profile_catalog_model_ids(profile: &CodexProfile) -> Vec<String> {
+    profile
+        .model_catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .map(|model| model.slug.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn profile_chat_upstream_model(profile: &CodexProfile) -> Option<String> {
+    (!profile.chat_upstream_model.trim().is_empty())
+        .then(|| profile.chat_upstream_model.trim().to_string())
+}
+
+/// 绑定 profile 的稳定端口。被本进程冲突实例占用时先停掉它再重试；
+/// 被外部进程占用时短暂等待（TIME_WAIT / 端口释放延迟）后重试。
 fn bind_fixed_with_preemption(port: u16) -> Result<StdTcpListener, String> {
     for attempt in 0..10 {
         match StdTcpListener::bind(("127.0.0.1", port)) {
@@ -219,7 +290,7 @@ fn bind_fixed_with_preemption(port: u16) -> Result<StdTcpListener, String> {
                         "协议转换代理端口 {port} 被占用（请关闭占用该端口的程序后重试）：{error}"
                     ));
                 }
-                // 本进程其他全局实例占用（全局 profile 切换）→ 停掉它；
+                // 本进程其他全局实例占用（哈希冲突）→ 停掉它；
                 // 外部进程占用 → 等待端口释放（TIME_WAIT）后重试。
                 if let Ok(mut guard) = registry().lock() {
                     let stale: Vec<ProxyKey> = guard
@@ -260,7 +331,7 @@ pub(crate) fn stop(profile_id: &str) {
     stop_mode_unlocked(profile_id, ProxyMode::Global);
 }
 
-/// 停止所有转换代理（应用退出 / 无全局 profile 时调用）。
+/// 停止所有转换代理（应用退出时调用）。
 pub(crate) fn stop_all() {
     let Ok(_ensure_guard) = ensure_lock().lock() else {
         return;
@@ -272,9 +343,9 @@ pub(crate) fn stop_all() {
     }
 }
 
-/// 停止全局接管模式下、不属于当前全局 profile 的代理实例（全局 profile 切换
-/// 后清理残留；Managed 实例由 resolve 路径管理，不受影响）。
-pub(crate) fn stop_global_instances_except(keep_profile_id: Option<&str>) {
+/// 停止全局接管模式下、不再被共享 provider 注册表引用的代理实例。
+/// Managed 实例由 resolve 路径管理，不受影响。
+pub(crate) fn stop_global_instances_except(keep_profile_ids: &HashSet<String>) {
     let Ok(_ensure_guard) = ensure_lock().lock() else {
         return;
     };
@@ -282,7 +353,7 @@ pub(crate) fn stop_global_instances_except(keep_profile_id: Option<&str>) {
         let stale: Vec<ProxyKey> = guard
             .iter()
             .filter(|((id, mode), _)| {
-                *mode == ProxyMode::Global && Some(id.as_str()) != keep_profile_id
+                *mode == ProxyMode::Global && !keep_profile_ids.contains(id)
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -339,6 +410,17 @@ mod tests {
             prompt_cache_routing: "auto".to_string(),
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn global_proxy_ports_are_stable_and_profile_scoped() {
+        let first = global_proxy_port("profile-first");
+        let second = global_proxy_port("profile-second");
+        assert_eq!(first, global_proxy_port("profile-first"));
+        assert_ne!(first, second);
+        assert!(is_global_proxy_port(first));
+        assert!(is_global_proxy_port(second));
+        assert_eq!(global_proxy_url("profile-first"), local_base_url(first));
     }
 
     #[tokio::test]
@@ -403,6 +485,9 @@ mod tests {
         assert!(guard.contains_key(&(profile.id.clone(), ProxyMode::Managed)));
         assert!(guard.contains_key(&(profile.id.clone(), ProxyMode::Global)));
         drop(guard);
+        assert!(global_instances_match(std::slice::from_ref(&profile)));
+        let changed = profile_with("profile-e", true, "https://api.deepseek.com/v1");
+        assert!(!global_instances_match(&[changed]));
         stop(&profile.id);
     }
 

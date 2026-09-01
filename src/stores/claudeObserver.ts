@@ -937,6 +937,10 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     }
   }
 
+  function hydrateBusyInputMode(saved: string) {
+    busyInputMode.value = normalizeClaudeBusyInputMode(saved)
+  }
+
   async function setBusyInputMode(mode: ClaudeBusyInputMode) {
     const normalized = normalizeClaudeBusyInputMode(mode)
     const previous = busyInputMode.value
@@ -1556,6 +1560,7 @@ export const useClaudeObserverStore = defineStore('claudeObserver', () => {
     refreshTerminalLog,
     openLogDirectory,
     loadBusyInputMode,
+    hydrateBusyInputMode,
     setBusyInputMode,
     submitPrompt,
     changeModel,

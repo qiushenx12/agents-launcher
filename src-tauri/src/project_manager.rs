@@ -425,6 +425,10 @@ fn repair_project_store(data: &mut ProjectStoreFile) -> bool {
 #[tauri::command]
 pub fn load_projects() -> Result<ProjectStoreFile, String> {
     let path = projects_path()?;
+    load_projects_from_path(&path)
+}
+
+fn load_projects_from_path(path: &Path) -> Result<ProjectStoreFile, String> {
     if !path.exists() {
         return Ok(ProjectStoreFile::default());
     }
@@ -433,29 +437,39 @@ pub fn load_projects() -> Result<ProjectStoreFile, String> {
         fs::read_to_string(&path).map_err(|e| format!("Failed to read projects file: {e}"))?;
     let value: Value =
         serde_json::from_str(&raw).map_err(|e| format!("Failed to parse projects file: {e}"))?;
-    let (migrated, _) = migrate_project_store_value(value)?;
+    let (migrated, migration) = migrate_project_store_value(value)?;
     let mut data: ProjectStoreFile = serde_json::from_value(migrated)
         .map_err(|e| format!("Failed to decode projects file: {e}"))?;
+    let before_repair = serde_json::to_value(&data)
+        .map_err(|e| format!("Failed to snapshot projects before repair: {e}"))?;
     repair_project_store(&mut data);
     for session in &mut data.sessions {
         if session.native_session_id.is_none() && session.cli_kind == CliKind::Claude {
             session.native_session_id = session.claude_session_id.clone();
         }
     }
+    let after_repair = serde_json::to_value(&data)
+        .map_err(|e| format!("Failed to snapshot projects after repair: {e}"))?;
+    if migration.changed || before_repair != after_repair {
+        save_projects_to_path(data.clone(), path)?;
+    }
     Ok(data)
 }
 
 #[tauri::command]
-pub fn save_projects(mut data: ProjectStoreFile) -> Result<(), String> {
+pub fn save_projects(data: ProjectStoreFile) -> Result<(), String> {
+    save_projects_to_path(data, &projects_path()?)
+}
+
+fn save_projects_to_path(mut data: ProjectStoreFile, path: &Path) -> Result<(), String> {
     repair_project_store(&mut data);
-    let path = projects_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create projects directory: {e}"))?;
     }
     let json = serde_json::to_string_pretty(&data)
         .map_err(|e| format!("Failed to serialise projects: {e}"))?;
-    transactional_write(&path, json.as_bytes())
+    transactional_write(path, json.as_bytes())
 }
 
 fn transactional_write(path: &Path, content: &[u8]) -> Result<(), String> {
@@ -771,5 +785,45 @@ mod tests {
         );
         assert!(!data.active_session_ids.contains_key(&CliKind::Claude));
         assert!(!repair_project_store(&mut data));
+    }
+
+    #[test]
+    fn canonical_project_store_is_not_rewritten_during_load() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("projects.json");
+        let original = serde_json::to_string(&ProjectStoreFile::default())
+            .expect("serialize canonical project store");
+        fs::write(&path, &original).expect("write canonical project store");
+
+        load_projects_from_path(&path).expect("load canonical project store");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read canonical project store"),
+            original
+        );
+    }
+
+    #[test]
+    fn repaired_project_store_is_persisted_once() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("projects.json");
+        let legacy = r#"{
+            "projects": [],
+            "sessions": [],
+            "activeProjectId": "missing-project",
+            "activeSessionId": "missing-session",
+            "expandedProjectIds": []
+        }"#;
+        fs::write(&path, legacy).expect("write repair fixture");
+
+        let repaired = load_projects_from_path(&path).expect("repair project store");
+        let first_persisted = fs::read_to_string(&path).expect("read repaired project store");
+        load_projects_from_path(&path).expect("reload repaired project store");
+        let second_persisted = fs::read_to_string(&path).expect("read stable project store");
+
+        assert!(repaired.active_project_id.is_none());
+        assert!(repaired.active_session_id.is_none());
+        assert_ne!(first_persisted, legacy);
+        assert_eq!(second_persisted, first_persisted);
     }
 }

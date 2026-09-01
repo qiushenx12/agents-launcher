@@ -28,6 +28,16 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
 
+fn record_startup_duration(stage: &str, started_at: std::time::Instant) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[startup] {stage}: {:.1} ms",
+        started_at.elapsed().as_secs_f64() * 1000.0
+    );
+    #[cfg(not(debug_assertions))]
+    let _ = (stage, started_at);
+}
+
 mod window_theme {
     #[cfg(target_os = "windows")]
     fn set_titlebar_dark_mode(hwnd: windows::Win32::Foundation::HWND, dark: bool) {
@@ -119,19 +129,34 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let process_started_at = std::time::Instant::now();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
+            let setup_started_at = std::time::Instant::now();
+
+            let watcher_started_at = std::time::Instant::now();
             session_manager::start_history_watcher(app.handle().clone());
+            record_startup_duration("history-watcher", watcher_started_at);
+
+            let tray_started_at = std::time::Instant::now();
             setup_tray(app)?;
+            record_startup_duration("tray", tray_started_at);
+
             // 恢复/接管全局 CodeX 协议转换代理（best-effort：失败不阻止启动）。
+            let proxy_started_at = std::time::Instant::now();
             if let Err(error) = codex_config::sync_global_conversion_proxy() {
                 eprintln!("CodeX 全局协议转换代理同步失败：{error}");
             }
+            record_startup_duration("codex-global-proxy", proxy_started_at);
+
+            let observer_started_at = std::time::Instant::now();
             app.manage(claude_observer::ClaudeObserverManager::start(
                 app.handle().clone(),
             ));
+            record_startup_duration("claude-observer", observer_started_at);
+
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "macos")]
                 {
@@ -153,9 +178,13 @@ pub fn run() {
                         }
                     }
                 }
+                let window_started_at = std::time::Instant::now();
                 window.show()?;
                 let _ = window.set_focus();
+                record_startup_duration("window-show", window_started_at);
             }
+            record_startup_duration("tauri-setup", setup_started_at);
+            record_startup_duration("process-to-window", process_started_at);
             Ok(())
         })
         .manage(std::sync::Mutex::new(pty::PtyManager::new()))
@@ -164,6 +193,7 @@ pub fn run() {
             cli_contract::get_cli_contract,
             cli_runtime::check_cli,
             cli_runtime::discover_codex_projects,
+            cli_runtime::load_codex_workspace,
             cli_runtime::list_codex_threads,
             cli_runtime::list_all_codex_threads,
             cli_runtime::discover_opencode_projects,
@@ -204,6 +234,7 @@ pub fn run() {
             settings_manager::load_claude_env,
             settings_manager::save_claude_env,
             // persistent_state commands
+            persistent_state::load_startup_bootstrap,
             persistent_state::load_window_state,
             persistent_state::save_window_state,
             persistent_state::load_minimize_to_tray,
@@ -213,6 +244,7 @@ pub fn run() {
             persistent_state::load_terminal_font_size,
             persistent_state::save_terminal_font_size,
             persistent_state::load_pane_width,
+            persistent_state::load_pane_widths,
             persistent_state::save_pane_width,
             persistent_state::load_config_order,
             persistent_state::save_config_order,
@@ -246,6 +278,7 @@ pub fn run() {
             // session_manager commands
             session_manager::load_claude_sessions,
             session_manager::load_claude_recent_projects,
+            session_manager::invalidate_claude_history_cache,
             // claude_launcher commands
             claude_launcher::launch_claude,
             claude_launcher::find_claude_executable,

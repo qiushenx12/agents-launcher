@@ -93,9 +93,13 @@ import { useProjectStore } from '@/stores/project'
 import { useClaudeObserverStore } from '@/stores/claudeObserver'
 import { useClaudeViewModeStore, type ClaudeView } from '@/stores/claudeViewMode'
 import { useResizableDivider } from '@/composables/useResizableDivider'
-import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
+import {
+  SHARED_LEFT_SIDEBAR_PANE_KEY,
+  useSharedLeftSidebarWidth,
+} from '@/composables/useSharedLeftSidebarWidth'
 import { useTauriDrop } from '@/composables/useTauriDrop'
 import { isInSidebarDropZone, isInTopSidebarDropZone } from '@/composables/useSidebarDropZone'
+import { measureStartup } from '@/utils/startupMetrics'
 import ProjectSidebar from './ProjectSidebar.vue'
 import ModuleToolbar from './ModuleToolbar.vue'
 import ProjectTerminalArea from './ProjectTerminalArea.vue'
@@ -120,6 +124,15 @@ const TOP_KEY = 'project-top-sidebar'
 const TOP_RATIO_KEY = 'project-top-sidebar-ratio'
 const BOTTOM_KEY = 'project-bottom-sidebar'
 const BOTTOM_RATIO_KEY = 'project-bottom-sidebar-ratio'
+const PROJECT_PANE_KEYS = [
+  SHARED_LEFT_SIDEBAR_PANE_KEY,
+  RIGHT_KEY,
+  RIGHT_RATIO_KEY,
+  TOP_KEY,
+  TOP_RATIO_KEY,
+  BOTTOM_KEY,
+  BOTTOM_RATIO_KEY,
+]
 
 const MIN_RIGHT = 200
 const MIN_MAIN_CONTENT = 400
@@ -211,6 +224,7 @@ const {
   isDragging: sharedLeftSidebarDragging,
   onMouseDown: startSharedLeftSidebarResize,
   loadWidth: loadSharedLeftSidebarWidth,
+  hydrateWidth: hydrateSharedLeftSidebarWidth,
 } = useSharedLeftSidebarWidth()
 
 const rightDivider = useResizableDivider(320, {
@@ -301,6 +315,44 @@ useTauriDrop((paths, position) => {
 })
 
 async function loadWidths() {
+  try {
+    const snapshot = await measureStartup('project-layout', () =>
+      invoke<Record<string, number>>('load_pane_widths', { keys: PROJECT_PANE_KEYS }))
+    hydrateSharedLeftSidebarWidth(snapshot[SHARED_LEFT_SIDEBAR_PANE_KEY])
+    const savedRight = snapshot[RIGHT_KEY]
+    if (savedRight !== undefined) {
+      rightWidth.value = clampRight(savedRight)
+      rightWidthRatio.value = rightWidth.value / availableRightSidebarWidth()
+    }
+    const savedRatio = snapshot[RIGHT_RATIO_KEY]
+    if (savedRatio !== undefined && Number.isFinite(savedRatio) && savedRatio > 0) {
+      rightWidthRatio.value = savedRatio
+      scaleRightSidebar()
+    }
+    const savedTop = snapshot[TOP_KEY]
+    if (savedTop !== undefined) {
+      topHeight.value = clampTop(savedTop)
+      topHeightRatio.value = topHeight.value / availableVerticalSidebarHeight()
+    }
+    const savedTopRatio = snapshot[TOP_RATIO_KEY]
+    if (savedTopRatio !== undefined && Number.isFinite(savedTopRatio) && savedTopRatio > 0) {
+      topHeightRatio.value = savedTopRatio
+      topHeight.value = clampTop(availableVerticalSidebarHeight() * topHeightRatio.value)
+    }
+    const savedBottom = snapshot[BOTTOM_KEY]
+    if (savedBottom !== undefined) {
+      bottomHeight.value = clampBottom(savedBottom)
+      bottomHeightRatio.value = bottomHeight.value / availableVerticalSidebarHeight()
+    }
+    const savedBottomRatio = snapshot[BOTTOM_RATIO_KEY]
+    if (savedBottomRatio !== undefined && Number.isFinite(savedBottomRatio) && savedBottomRatio > 0) {
+      bottomHeightRatio.value = savedBottomRatio
+      bottomHeight.value = clampBottom(availableVerticalSidebarHeight() * bottomHeightRatio.value)
+    }
+    return
+  } catch {
+    // Older backends fall back to the original per-key reads below.
+  }
   await loadSharedLeftSidebarWidth()
   try {
     const savedRight = await invoke<number | null>('load_pane_width', { key: RIGHT_KEY })

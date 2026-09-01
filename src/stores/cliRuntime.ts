@@ -8,6 +8,7 @@ import {
   type CliKind,
   type CliStatus,
 } from '@/types/cli'
+import { InFlightTaskCache } from '@/utils/inFlightTaskCache'
 
 type CliStatusMap = Record<CliKind, CliStatus | null>
 
@@ -22,6 +23,7 @@ export const useCliRuntimeStore = defineStore('cliRuntime', () => {
     codex: false,
     opencode: false,
   })
+  const inFlight = new InFlightTaskCache<CliKind, CliStatus>()
 
   const readyKinds = computed(() =>
     CLI_KINDS.filter((kind) => statuses[kind]?.state === 'ready'),
@@ -30,31 +32,32 @@ export const useCliRuntimeStore = defineStore('cliRuntime', () => {
   async function check(kind: CliKind, force = false): Promise<CliStatus> {
     const cached = statuses[kind]
     if (!force && cached && cached.state !== 'checking') return cached
-    if (checking[kind]) {
-      return statuses[kind] ?? checkingStatus(kind)
-    }
+    const existing = inFlight.get(kind)
+    if (existing) return existing
 
     checking[kind] = true
     statuses[kind] = checkingStatus(kind)
-    try {
-      const status = await invoke<CliStatus>('check_cli', { kind })
-      statuses[kind] = status
-      return status
-    } catch (error) {
-      const definition = getCliIssueDefinition('version_command_failed')
-      const status: CliStatus = {
-        kind,
-        state: definition.state,
-        issueCode: definition.code,
-        message: `${definition.messages[kind]} ${String(error)}`,
-        executablePath: null,
-        version: null,
+    return inFlight.run(kind, async () => {
+      try {
+        const status = await invoke<CliStatus>('check_cli', { kind })
+        statuses[kind] = status
+        return status
+      } catch (error) {
+        const definition = getCliIssueDefinition('version_command_failed')
+        const status: CliStatus = {
+          kind,
+          state: definition.state,
+          issueCode: definition.code,
+          message: `${definition.messages[kind]} ${String(error)}`,
+          executablePath: null,
+          version: null,
+        }
+        statuses[kind] = status
+        return status
+      } finally {
+        checking[kind] = false
       }
-      statuses[kind] = status
-      return status
-    } finally {
-      checking[kind] = false
-    }
+    })
   }
 
   function checkingStatus(kind: CliKind): CliStatus {

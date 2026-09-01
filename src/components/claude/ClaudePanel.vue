@@ -44,6 +44,7 @@ import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWid
 import ConfigList from './ConfigList.vue'
 import ConfigEditor from './ConfigEditor.vue'
 import { useSettingsPopover } from '@/composables/useSettingsPopover'
+import { beginStartupMeasure } from '@/utils/startupMetrics'
 
 const { toggleSettings } = useSettingsPopover()
 
@@ -57,15 +58,19 @@ const emit = defineEmits<{
 const { leftWidth, isDragging, onMouseDown, loadWidth } = useSharedLeftSidebarWidth()
 
 onMounted(async () => {
-  await loadWidth()
-  await Promise.all([
-    store.loadConfigs(),
-    store.loadSettings(),
-    store.findClaudeExe(),
-    store.loadLaunchDir(),
-    store.loadRecentProjects(),
-  ])
-  await store.loadSessions()
+  const finish = beginStartupMeasure('claude-config-panel')
+  try {
+    await loadWidth()
+    await Promise.all([
+      store.loadConfigs(),
+      store.loadSettings(),
+      store.findClaudeExe(),
+      store.loadRecentProjects(),
+    ])
+    await store.loadSessions()
+  } finally {
+    finish()
+  }
 })
 
 watch(leftWidth, (width) => {

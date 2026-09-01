@@ -6,6 +6,7 @@ import type { ClaudeSettings, CliProfileRef, SessionEntry } from '@/types/config
 import { formatRedactedEntries } from '@/utils/configSecurity'
 import { useConfigWorkspaceStore } from './configWorkspace'
 import { useProjectStore } from './project'
+import { useCliRuntimeStore } from './cliRuntime'
 
 export interface ClaudeCodeCheckResult {
   installed: boolean
@@ -589,9 +590,20 @@ export const useClaudeStore = defineStore('claude', () => {
 
   async function checkClaudeCode(): Promise<ClaudeCodeCheckResult> {
     try {
-      const result = await invoke<ClaudeCodeCheckResult>('check_claude_code_installed')
-      claudeExePath.value = result.installed ? result.path : null
-      claudeInstalled.value = result.installed
+      const status = await useCliRuntimeStore().check('claude')
+      const installed = status.state === 'ready'
+      const result: ClaudeCodeCheckResult = {
+        installed,
+        path: installed ? status.executablePath : null,
+        version: status.version,
+        message: installed
+          ? 'Claude Code 已就绪。'
+          : status.issueCode === 'executable_missing'
+            ? '未检测到 Claude Code。'
+            : 'Claude Code 无法正常执行版本检测。',
+      }
+      claudeExePath.value = result.path
+      claudeInstalled.value = installed
       return result
     } catch (error) {
       claudeExePath.value = null
@@ -672,6 +684,13 @@ export const useClaudeStore = defineStore('claude', () => {
     }
   }
 
+  function hydrateGlobalUiState(dir: string, dropPathMode: string) {
+    launchDir.value = dir
+    if (dropPathMode === 'filename' || dropPathMode === 'relative') {
+      projectDropPathMode.value = dropPathMode
+    }
+  }
+
   async function saveLaunchDir() {
     try {
       await invoke('save_launch_dir', { key: 'claude', dir: launchDir.value })
@@ -729,6 +748,7 @@ export const useClaudeStore = defineStore('claude', () => {
     checkClaudeCode,
     findClaudeExe,
     launchClaude,
+    hydrateGlobalUiState,
     loadLaunchDir,
     saveLaunchDir,
     discardConfigChanges,

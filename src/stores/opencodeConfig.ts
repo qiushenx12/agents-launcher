@@ -76,6 +76,7 @@ export const useOpencodeConfigStore = defineStore('opencodeConfig', () => {
   const baseline = ref(editableSnapshot(editingConfig.value))
   const loaded = ref(false)
   const loading = ref(false)
+  let loadPromise: Promise<void> | null = null
   const saving = ref(false)
   const modelsFetchingId = ref<string | null>(null)
   const availableModels = ref<Record<string, string[]>>({})
@@ -219,24 +220,29 @@ export const useOpencodeConfigStore = defineStore('opencodeConfig', () => {
   }
 
   async function loadConfig(force = false) {
-    if (loading.value || (loaded.value && !force)) return
+    if (loadPromise) return loadPromise
+    if (loaded.value && !force) return
     loading.value = true
-    try {
-      const [payload, savedOrder] = await Promise.all([
-        invoke<OpencodeGlobalConfigPayload>('load_opencode_global_config'),
-        invoke<string[]>('load_config_order', { key: 'opencode' }).catch(() => []),
-      ])
-      providerOrder.value = savedOrder
-      const preferredProviderId = selectedProvider.value?.originalId || selectedProvider.value?.id
-      applyPayload(payload, preferredProviderId)
-      statusMessage.value = `已从 ${payload.configPath} 读取 ${payload.providers.length} 个自定义 Provider`
-    } catch (error) {
-      loaded.value = false
-      loadError.value = `读取 opencode.jsonc 失败：${await permissionAwareError(error)}`
-      statusMessage.value = loadError.value
-    } finally {
-      loading.value = false
-    }
+    loadPromise = (async () => {
+      try {
+        const [payload, savedOrder] = await Promise.all([
+          invoke<OpencodeGlobalConfigPayload>('load_opencode_global_config'),
+          invoke<string[]>('load_config_order', { key: 'opencode' }).catch(() => []),
+        ])
+        providerOrder.value = savedOrder
+        const preferredProviderId = selectedProvider.value?.originalId || selectedProvider.value?.id
+        applyPayload(payload, preferredProviderId)
+        statusMessage.value = `已从 ${payload.configPath} 读取 ${payload.providers.length} 个自定义 Provider`
+      } catch (error) {
+        loaded.value = false
+        loadError.value = `读取 opencode.jsonc 失败：${await permissionAwareError(error)}`
+        statusMessage.value = loadError.value
+      } finally {
+        loading.value = false
+        loadPromise = null
+      }
+    })()
+    return loadPromise
   }
 
   async function ensureLoaded() {

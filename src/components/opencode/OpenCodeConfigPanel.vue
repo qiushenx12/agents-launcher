@@ -371,6 +371,7 @@ import SecretField from '@/components/config/SecretField.vue'
 import { useDragReorder } from '@/composables/useDragReorder'
 import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
 import { useSettingsPopover } from '@/composables/useSettingsPopover'
+import { beginStartupMeasure } from '@/utils/startupMetrics'
 
 const { toggleSettings } = useSettingsPopover()
 import { usePlatform } from '@/composables/usePlatform'
@@ -461,10 +462,17 @@ async function openConfigDirectory() {
 
 const { leftWidth, isDragging, onMouseDown, loadWidth } = useSharedLeftSidebarWidth()
 
-onMounted(() => {
-  loadWidth().catch(() => {})
-  store.checkPermissions().catch(() => {})
-  store.loadConfig(true).catch(() => {})
+onMounted(async () => {
+  const finish = beginStartupMeasure('opencode-config-panel')
+  try {
+    await Promise.all([
+      loadWidth().catch(() => {}),
+      store.checkPermissions().catch(() => {}),
+      store.loadConfig(true).catch(() => {}),
+    ])
+  } finally {
+    finish()
+  }
 })
 
 watch(leftWidth, (width) => {

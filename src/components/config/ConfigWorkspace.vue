@@ -2,16 +2,19 @@
   <div class="config-workspace">
     <div class="config-workspace__body">
       <CliClaudePanel
+        v-if="mountedKinds.claude"
         v-show="workspaceStore.activeKind === 'claude'"
         :sidebar-collapsed="sidebarCollapsed"
         @left-width-change="emit('left-width-change', $event)"
       />
       <CliCodexPanel
+        v-if="mountedKinds.codex"
         v-show="workspaceStore.activeKind === 'codex'"
         :sidebar-collapsed="sidebarCollapsed"
         @left-width-change="emit('left-width-change', $event)"
       />
       <CliOpencodePanel
+        v-if="mountedKinds.opencode"
         v-show="workspaceStore.activeKind === 'opencode'"
         :sidebar-collapsed="sidebarCollapsed"
         @left-width-change="emit('left-width-change', $event)"
@@ -82,19 +85,29 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, watch } from 'vue'
-import { CLI_DESCRIPTORS } from '@/types/cli'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, watch } from 'vue'
+import { CLI_DESCRIPTORS, type CliKind } from '@/types/cli'
 import { useClaudeStore } from '@/stores/claude'
 import { useCodexConfigStore } from '@/stores/codexConfig'
 import { useOpencodeConfigStore } from '@/stores/opencodeConfig'
 import { useCliRuntimeStore } from '@/stores/cliRuntime'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
 import { redactConfigRecord } from '@/utils/configSecurity'
-import CliClaudePanel from '@/components/cli/CliClaudePanel.vue'
-import CliCodexPanel from '@/components/cli/CliCodexPanel.vue'
-import CliOpencodePanel from '@/components/cli/CliOpencodePanel.vue'
 import { usePlatform } from '@/composables/usePlatform'
+import { scheduleIdleTask } from '@/utils/idleTask'
+import AsyncPanelLoading from '@/components/common/AsyncPanelLoading'
 import ConfigStatusBanner from './ConfigStatusBanner.vue'
+
+const loadClaudePanel = () => import('@/components/cli/CliClaudePanel.vue')
+const loadCodexPanel = () => import('@/components/cli/CliCodexPanel.vue')
+const loadOpencodePanel = () => import('@/components/cli/CliOpencodePanel.vue')
+const asyncPanelOptions = {
+  loadingComponent: AsyncPanelLoading,
+  delay: 80,
+}
+const CliClaudePanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadClaudePanel })
+const CliCodexPanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadCodexPanel })
+const CliOpencodePanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadOpencodePanel })
 
 defineProps<{
   sidebarCollapsed?: boolean
@@ -104,11 +117,17 @@ const emit = defineEmits<{
 }>()
 
 const workspaceStore = useConfigWorkspaceStore()
+const mountedKinds = reactive<Record<CliKind, boolean>>({
+  claude: false,
+  codex: false,
+  opencode: false,
+})
 const runtimeStore = useCliRuntimeStore()
 const claudeStore = useClaudeStore()
 const codexStore = useCodexConfigStore()
 const opencodeStore = useOpencodeConfigStore()
 const { isMacOS } = usePlatform()
+let cancelIdlePreload: (() => void) | undefined
 const unregisterClaudeGuard = workspaceStore.registerDraftGuard('claude', {
   isDirty: () => claudeStore.isConfigDirty,
   discard: () => claudeStore.discardConfigChanges(),
@@ -227,7 +246,22 @@ watch(() => workspaceStore.preflightVisible, (visible) => {
   if (visible) checkActive(true).catch(() => {})
 })
 
+watch(() => workspaceStore.activeKind, (kind) => {
+  mountedKinds[kind] = true
+}, { immediate: true })
+
+onMounted(() => {
+  cancelIdlePreload = scheduleIdleTask(() => {
+    void Promise.allSettled([
+      loadClaudePanel(),
+      loadCodexPanel(),
+      loadOpencodePanel(),
+    ])
+  })
+})
+
 onBeforeUnmount(() => {
+  cancelIdlePreload?.()
   unregisterClaudeGuard()
   unregisterCodexGuard()
   unregisterOpencodeGuard()

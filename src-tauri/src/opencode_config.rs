@@ -1130,19 +1130,45 @@ fn connection_status_from_document(
     }
 }
 
-fn load_connection_status() -> Result<OpencodeConnectionStatusPayload, String> {
-    let (path, raw, value) = read_auth_document()?;
-    let mut status = connection_status_from_document(&path, &raw, &value);
-    let (_, config_raw, config) = read_global_config_document()?;
-    status.config_revision = document_revision(&config_raw);
-    status.disabled_provider_ids = disabled_provider_ids(&config)?;
+fn connection_status_from_documents(
+    auth_path: &Path,
+    auth_raw: &str,
+    auth: &Value,
+    config_raw: &str,
+    config: &Value,
+) -> Result<OpencodeConnectionStatusPayload, String> {
+    let mut status = connection_status_from_document(auth_path, auth_raw, auth);
+    status.config_revision = document_revision(config_raw);
+    status.disabled_provider_ids = disabled_provider_ids(config)?;
     Ok(status)
+}
+
+fn connection_status_with_config(
+    config_raw: &str,
+    config: &Value,
+) -> Result<OpencodeConnectionStatusPayload, String> {
+    let (path, raw, value) = read_auth_document()?;
+    connection_status_from_documents(&path, &raw, &value, config_raw, config)
+}
+
+fn load_connection_status() -> Result<OpencodeConnectionStatusPayload, String> {
+    let (auth_path, auth_raw, auth) = read_auth_document()?;
+    let (_, config_raw, config) = read_global_config_document()?;
+    connection_status_from_documents(
+        &auth_path,
+        &auth_raw,
+        &auth,
+        &config_raw,
+        &config,
+    )
 }
 
 fn enrich_global_connection_status(
     mut payload: OpencodeGlobalConfigPayload,
+    config_raw: &str,
+    config: &Value,
 ) -> Result<OpencodeGlobalConfigPayload, String> {
-    let status = load_connection_status()?;
+    let status = connection_status_with_config(config_raw, config)?;
     payload.auth_path = status.auth_path;
     payload.auth_revision = status.auth_revision;
     payload.connected_provider_ids = status.connected_provider_ids;
@@ -1573,7 +1599,11 @@ fn write_global_config_atomic(path: &Path, content: &[u8]) -> Result<(), String>
 #[tauri::command]
 pub fn load_opencode_global_config() -> Result<OpencodeGlobalConfigPayload, String> {
     let (path, raw, value) = read_global_config_document()?;
-    enrich_global_connection_status(payload_from_global_document(&path, &raw, &value)?)
+    enrich_global_connection_status(
+        payload_from_global_document(&path, &raw, &value)?,
+        &raw,
+        &value,
+    )
 }
 
 #[tauri::command]
@@ -3167,6 +3197,27 @@ mod tests {
             Some(&"new-key".to_string())
         );
         assert!(!status.connection_keys.contains_key("builtin-oauth"));
+    }
+
+    #[test]
+    fn connection_status_reuses_the_supplied_config_document() {
+        let auth_raw = r#"{"custom":{"type":"api","key":"secret"}}"#;
+        let auth: Value = serde_json::from_str(auth_raw).expect("auth json");
+        let config_raw = r#"{"disabled_providers":["custom"]}"#;
+        let config: Value = serde_json::from_str(config_raw).expect("config json");
+
+        let status = connection_status_from_documents(
+            Path::new("auth.json"),
+            auth_raw,
+            &auth,
+            config_raw,
+            &config,
+        )
+        .expect("connection status");
+
+        assert_eq!(status.config_revision, document_revision(config_raw));
+        assert_eq!(status.disabled_provider_ids, vec!["custom"]);
+        assert_eq!(status.connection_keys.get("custom"), Some(&"secret".to_string()));
     }
 
     #[cfg(windows)]

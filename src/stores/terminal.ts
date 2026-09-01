@@ -21,6 +21,7 @@ export const useTerminalStore = defineStore('terminal', () => {
   const fontSize = ref(10)
   const refitSignal = ref(0)
   let listenerReady = false
+  let fontSizeLoaded = false
 
   // Per-tab output buffers: collect data before xterm is ready
   const outputBuffers = new Map<number, Uint8Array[]>()
@@ -231,16 +232,25 @@ export const useTerminalStore = defineStore('terminal', () => {
   async function setFontSize(size: number) {
     const clamped = Math.max(6, Math.min(28, size))
     fontSize.value = clamped
+    fontSizeLoaded = true
     await invoke('save_terminal_font_size', { fontSize: clamped }).catch(() => {})
   }
 
   async function loadFontSize() {
+    if (fontSizeLoaded) return
     try {
       const size = await invoke<number>('load_terminal_font_size')
       fontSize.value = Math.max(6, Math.min(28, size))
     } catch {
       // keep default
+    } finally {
+      fontSizeLoaded = true
     }
+  }
+
+  function hydrateFontSize(size: number) {
+    fontSize.value = Math.max(6, Math.min(28, size))
+    fontSizeLoaded = true
   }
 
   function reorderTabs(newTabs: TerminalTab[]) {
@@ -270,6 +280,7 @@ export const useTerminalStore = defineStore('terminal', () => {
     updateTabStatus,
     updateTabTitle,
     setFontSize,
+    hydrateFontSize,
     loadFontSize,
     registerWriter,
     unregisterWriter,

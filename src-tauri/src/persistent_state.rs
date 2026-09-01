@@ -30,7 +30,7 @@ fn app_state_path() -> Result<PathBuf, String> {
 // AppState structure
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq)]
 pub struct WindowState {
     pub width: Option<f64>,
     pub height: Option<f64>,
@@ -201,11 +201,26 @@ fn normalize_top_bar_hidden(hidden: &[String]) -> Vec<String> {
         .collect()
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TopBarLayout {
     pub order: Vec<String>,
     pub hidden: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupBootstrapState {
+    pub claude_startup_view: String,
+    pub claude_log_output_enabled: bool,
+    pub claude_busy_input_mode: String,
+    pub claude_launch_dir: String,
+    pub claude_project_drop_path_mode: String,
+    pub top_bar_layout: TopBarLayout,
+    pub minimize_to_tray: bool,
+    pub terminal_font_size: f64,
+    pub window_state: WindowState,
+    pub last_active_main_tab: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +257,88 @@ fn update_state<F: FnOnce(&mut AppState)>(f: F) -> Result<(), String> {
     let mut state = load_state()?;
     f(&mut state);
     save_state(&state)
+}
+
+fn validated_window_state(state: &AppState) -> WindowState {
+    let window = state.window.clone();
+    let invalid = window.width.is_some_and(|value| value <= 50.0)
+        || window.height.is_some_and(|value| value <= 50.0)
+        || window.x.is_some_and(|value| value < -10000.0)
+        || window.y.is_some_and(|value| value < -10000.0);
+    if invalid {
+        WindowState::default()
+    } else {
+        window
+    }
+}
+
+fn claude_busy_input_mode_from_state(state: &AppState) -> String {
+    normalize_claude_busy_input_mode(
+        state
+            .claude
+            .claude_busy_input_mode
+            .as_deref()
+            .unwrap_or("native"),
+    )
+}
+
+fn claude_startup_view_from_state(state: &AppState) -> String {
+    normalize_claude_startup_view(
+        state
+            .claude
+            .claude_startup_view
+            .as_deref()
+            .unwrap_or("conversation"),
+    )
+}
+
+fn top_bar_layout_from_state(state: &AppState) -> TopBarLayout {
+    TopBarLayout {
+        order: normalize_top_bar_order(&state.top_bar_order),
+        hidden: normalize_top_bar_hidden(&state.top_bar_hidden),
+    }
+}
+
+fn last_active_main_tab_from_state(state: &AppState) -> String {
+    normalize_main_tab(&state.last_active_main_tab)
+        .as_str()
+        .to_string()
+}
+
+fn startup_bootstrap_from_state(state: &AppState) -> StartupBootstrapState {
+    StartupBootstrapState {
+        claude_startup_view: claude_startup_view_from_state(state),
+        claude_log_output_enabled: state.claude.claude_log_output_enabled.unwrap_or(false),
+        claude_busy_input_mode: claude_busy_input_mode_from_state(state),
+        claude_launch_dir: state.claude.launch_dir.clone(),
+        claude_project_drop_path_mode: state.claude.project_drop_path_mode.clone(),
+        top_bar_layout: top_bar_layout_from_state(state),
+        minimize_to_tray: state.minimize_to_tray,
+        terminal_font_size: state.terminal.font_size,
+        window_state: validated_window_state(state),
+        last_active_main_tab: last_active_main_tab_from_state(state),
+    }
+}
+
+fn pane_width_from_state(state: &AppState, key: &str) -> Result<f64, String> {
+    if let Ok(tool) = tool_state_ref(state, key) {
+        return Ok(tool.pane_width);
+    }
+    state
+        .pane_widths
+        .get(key)
+        .copied()
+        .ok_or_else(|| format!("No saved pane width for key: {key}"))
+}
+
+fn pane_widths_from_state(state: &AppState, keys: Vec<String>) -> BTreeMap<String, f64> {
+    keys.into_iter()
+        .filter_map(|key| {
+            pane_width_from_state(state, &key)
+                .ok()
+                .map(|width| (key, width))
+        })
+        .collect()
 }
 
 // PLACEHOLDER_MIGRATION
@@ -393,17 +490,13 @@ pub(crate) fn save_profile_index_state(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+pub fn load_startup_bootstrap() -> Result<StartupBootstrapState, String> {
+    Ok(startup_bootstrap_from_state(&load_state()?))
+}
+
+#[tauri::command]
 pub fn load_window_state() -> Result<WindowState, String> {
-    let state = load_state()?.window;
-    // Guard against corrupted state (zero size or way off-screen).
-    let invalid = state.width.map_or(false, |v| v <= 50.0)
-        || state.height.map_or(false, |v| v <= 50.0)
-        || state.x.map_or(false, |v| v < -10000.0)
-        || state.y.map_or(false, |v| v < -10000.0);
-    if invalid {
-        return Ok(WindowState::default());
-    }
-    Ok(state)
+    Ok(validated_window_state(&load_state()?))
 }
 
 #[tauri::command]
@@ -456,14 +549,13 @@ pub fn save_launch_dir(key: String, dir: String) -> Result<(), String> {
 #[tauri::command]
 pub fn load_pane_width(key: String) -> Result<f64, String> {
     let state = load_state()?;
-    if let Ok(tool) = tool_state_ref(&state, &key) {
-        return Ok(tool.pane_width);
-    }
-    state
-        .pane_widths
-        .get(&key)
-        .copied()
-        .ok_or_else(|| format!("No saved pane width for key: {key}"))
+    pane_width_from_state(&state, &key)
+}
+
+#[tauri::command]
+pub fn load_pane_widths(keys: Vec<String>) -> Result<BTreeMap<String, f64>, String> {
+    let state = load_state()?;
+    Ok(pane_widths_from_state(&state, keys))
 }
 
 #[tauri::command]
@@ -581,13 +673,7 @@ pub fn save_project_drop_path_mode(key: String, value: String) -> Result<(), Str
 
 #[tauri::command]
 pub fn load_claude_busy_input_mode() -> Result<String, String> {
-    Ok(normalize_claude_busy_input_mode(
-        load_state()?
-            .claude
-            .claude_busy_input_mode
-            .as_deref()
-            .unwrap_or("native"),
-    ))
+    Ok(claude_busy_input_mode_from_state(&load_state()?))
 }
 
 #[tauri::command]
@@ -602,13 +688,7 @@ pub fn save_claude_busy_input_mode(mode: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn load_claude_startup_view() -> Result<String, String> {
-    Ok(normalize_claude_startup_view(
-        load_state()?
-            .claude
-            .claude_startup_view
-            .as_deref()
-            .unwrap_or("conversation"),
-    ))
+    Ok(claude_startup_view_from_state(&load_state()?))
 }
 
 #[tauri::command]
@@ -641,9 +721,7 @@ pub fn save_claude_log_output_enabled(enabled: bool) -> Result<(), String> {
 
 #[tauri::command]
 pub fn load_last_active_main_tab() -> Result<String, String> {
-    Ok(normalize_main_tab(&load_state()?.last_active_main_tab)
-        .as_str()
-        .to_string())
+    Ok(last_active_main_tab_from_state(&load_state()?))
 }
 
 #[tauri::command]
@@ -658,11 +736,7 @@ pub fn save_last_active_main_tab(tab: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn load_top_bar_layout() -> Result<TopBarLayout, String> {
-    let state = load_state()?;
-    Ok(TopBarLayout {
-        order: normalize_top_bar_order(&state.top_bar_order),
-        hidden: normalize_top_bar_hidden(&state.top_bar_hidden),
-    })
+    Ok(top_bar_layout_from_state(&load_state()?))
 }
 
 #[tauri::command]
@@ -819,5 +893,119 @@ mod tests {
     fn claude_log_output_defaults_to_disabled() {
         let state = ToolState::default();
         assert_eq!(state.claude_log_output_enabled, None);
+    }
+
+    #[test]
+    fn startup_bootstrap_matches_individual_state_normalizers() {
+        let mut state = AppState {
+            minimize_to_tray: true,
+            last_active_main_tab: "codex".to_string(),
+            top_bar_order: vec!["codex".to_string(), "config".to_string()],
+            top_bar_hidden: vec!["claude".to_string(), "unknown".to_string()],
+            window: WindowState {
+                width: Some(1280.0),
+                height: Some(800.0),
+                x: Some(120.0),
+                y: Some(80.0),
+                extra: Map::new(),
+            },
+            ..AppState::default()
+        };
+        state.claude.claude_startup_view = Some("conversation".to_string());
+        state.claude.claude_log_output_enabled = Some(true);
+        state.claude.claude_busy_input_mode = Some("after-stop".to_string());
+        state.claude.launch_dir = "D:/workspace".to_string();
+        state.claude.project_drop_path_mode = "filename".to_string();
+        state.terminal.font_size = 14.0;
+
+        let bootstrap = startup_bootstrap_from_state(&state);
+
+        assert_eq!(
+            bootstrap.claude_startup_view,
+            claude_startup_view_from_state(&state)
+        );
+        assert_eq!(
+            bootstrap.claude_log_output_enabled,
+            state.claude.claude_log_output_enabled.unwrap_or(false)
+        );
+        assert_eq!(
+            bootstrap.claude_busy_input_mode,
+            claude_busy_input_mode_from_state(&state)
+        );
+        assert_eq!(bootstrap.claude_launch_dir, state.claude.launch_dir);
+        assert_eq!(
+            bootstrap.claude_project_drop_path_mode,
+            state.claude.project_drop_path_mode
+        );
+        assert_eq!(bootstrap.top_bar_layout, top_bar_layout_from_state(&state));
+        assert_eq!(bootstrap.minimize_to_tray, state.minimize_to_tray);
+        assert_eq!(bootstrap.terminal_font_size, state.terminal.font_size);
+        assert_eq!(bootstrap.window_state, validated_window_state(&state));
+        assert_eq!(
+            bootstrap.last_active_main_tab,
+            last_active_main_tab_from_state(&state)
+        );
+    }
+
+    #[test]
+    fn startup_bootstrap_preserves_invalid_window_fallback() {
+        let state = AppState {
+            window: WindowState {
+                width: Some(40.0),
+                height: Some(800.0),
+                x: Some(0.0),
+                y: Some(0.0),
+                extra: Map::new(),
+            },
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            startup_bootstrap_from_state(&state).window_state,
+            WindowState::default()
+        );
+    }
+
+    #[test]
+    fn startup_bootstrap_serializes_with_frontend_field_names() {
+        let value = serde_json::to_value(startup_bootstrap_from_state(&AppState::default()))
+            .expect("serialize startup bootstrap");
+
+        assert!(value.get("claudeStartupView").is_some());
+        assert!(value.get("claudeLogOutputEnabled").is_some());
+        assert!(value.get("claudeBusyInputMode").is_some());
+        assert!(value.get("claudeLaunchDir").is_some());
+        assert!(value.get("claudeProjectDropPathMode").is_some());
+        assert!(value.get("topBarLayout").is_some());
+        assert!(value.get("minimizeToTray").is_some());
+        assert!(value.get("terminalFontSize").is_some());
+        assert!(value.get("windowState").is_some());
+        assert!(value.get("lastActiveMainTab").is_some());
+    }
+
+    #[test]
+    fn pane_width_snapshot_matches_individual_reads_and_omits_missing_keys() {
+        let mut state = AppState::default();
+        state.claude.pane_width = 315.0;
+        state
+            .pane_widths
+            .insert("project-right-sidebar".to_string(), 340.0);
+        let keys = vec![
+            "claude".to_string(),
+            "project-right-sidebar".to_string(),
+            "missing".to_string(),
+        ];
+
+        let snapshot = pane_widths_from_state(&state, keys);
+
+        assert_eq!(
+            snapshot.get("claude").copied(),
+            Some(pane_width_from_state(&state, "claude").expect("claude width"))
+        );
+        assert_eq!(
+            snapshot.get("project-right-sidebar").copied(),
+            Some(pane_width_from_state(&state, "project-right-sidebar").expect("project width"))
+        );
+        assert!(!snapshot.contains_key("missing"));
     }
 }

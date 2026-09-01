@@ -164,6 +164,7 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
   const loaded = ref(false)
   const loadError = ref('')
   const loading = ref(false)
+  let loadPromise: Promise<void> | null = null
   const saving = ref(false)
   const applying = ref(false)
   const modelsFetching = ref(false)
@@ -386,25 +387,30 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
   }
 
   async function loadProfiles(force = false) {
-    if (loading.value || (loaded.value && !force)) return
+    if (loadPromise) return loadPromise
+    if (loaded.value && !force) return
     const initialLoad = !loaded.value
     loading.value = true
-    try {
-      const payload = await invoke<CodexProfilesPayload>('load_codex_profiles')
-      applyPayload(payload)
-      loaded.value = true
-      loadError.value = ''
-      if (payload.globalConfigError) statusMessage.value = payload.globalConfigError
-      if (initialLoad && payload.globalSyncRepairRequired) {
-        void promptGlobalSyncRepair()
+    loadPromise = (async () => {
+      try {
+        const payload = await invoke<CodexProfilesPayload>('load_codex_profiles')
+        applyPayload(payload)
+        loaded.value = true
+        loadError.value = ''
+        if (payload.globalConfigError) statusMessage.value = payload.globalConfigError
+        if (initialLoad && payload.globalSyncRepairRequired) {
+          void promptGlobalSyncRepair()
+        }
+      } catch (error) {
+        loaded.value = false
+        loadError.value = `加载 CodeX 配置失败：${error}`
+        statusMessage.value = loadError.value
+      } finally {
+        loading.value = false
+        loadPromise = null
       }
-    } catch (error) {
-      loaded.value = false
-      loadError.value = `加载 CodeX 配置失败：${error}`
-      statusMessage.value = loadError.value
-    } finally {
-      loading.value = false
-    }
+    })()
+    return loadPromise
   }
 
   async function promptGlobalSyncRepair(): Promise<void> {
@@ -632,7 +638,8 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
       syncToGlobal.value = applyToGlobal
       if (applyToGlobal
         && profile.authMode === 'custom'
-        && secretStorageKind.value === 'macos_plaintext'
+        && (secretStorageKind.value === 'macos_plaintext'
+          || secretStorageKind.value === 'windows_dpapi')
         && profile.hasStoredApiKey) {
         statusMessage.value = `CodeX 配置 '${profile.name}' 已同步到启动器和全局；Codex 将通过命令式认证从启动器凭据文件读取 Key`
       } else if (applyToGlobal

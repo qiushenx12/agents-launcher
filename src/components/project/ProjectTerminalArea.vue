@@ -106,7 +106,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useProjectStore } from '@/stores/project'
 import { useClaudeStore } from '@/stores/claude'
@@ -115,11 +115,17 @@ import { useClaudeObserverStore } from '@/stores/claudeObserver'
 import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import { isInSidebarDropZone, isInTopSidebarDropZone } from '@/composables/useSidebarDropZone'
 import TerminalPane from '@/components/terminal/TerminalPane.vue'
-import ClaudeConversationPane from '@/components/claude/conversation/ClaudeConversationPane.vue'
+import AsyncPanelLoading from '@/components/common/AsyncPanelLoading'
 import {
   ClaudeStartupPromptCancelledError,
   waitForClaudePromptReady,
 } from '@/utils/claudeStartupPrompt'
+
+const ClaudeConversationPane = defineAsyncComponent({
+  loader: () => import('@/components/claude/conversation/ClaudeConversationPane.vue'),
+  loadingComponent: AsyncPanelLoading,
+  delay: 80,
+})
 
 type ClaudeView = 'conversation' | 'terminal'
 type ClaudeDefaultPermissionMode = 'bypassPermissions' | 'auto' | 'default' | 'acceptEdits' | 'plan'
@@ -128,8 +134,11 @@ const store = useProjectStore()
 const claudeStore = useClaudeStore()
 const claudeObserverStore = useClaudeObserverStore()
 const terminalRef = ref<HTMLElement | null>(null)
-const conversationPaneRef = ref<InstanceType<typeof ClaudeConversationPane> | null>(null)
-const conversationEmptyPaneRef = ref<InstanceType<typeof ClaudeConversationPane> | null>(null)
+interface ClaudeConversationPaneExpose {
+  appendDroppedFiles: (paths: string[]) => void
+}
+const conversationPaneRef = ref<ClaudeConversationPaneExpose | null>(null)
+const conversationEmptyPaneRef = ref<ClaudeConversationPaneExpose | null>(null)
 const dragOver = ref(false)
 const claudeEmptyError = ref('')
 const claudeEmptyPending = ref(false)

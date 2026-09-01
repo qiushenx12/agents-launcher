@@ -30,6 +30,16 @@ export const useClaudeViewModeStore = defineStore('claude-view-mode', () => {
       : null
   ))
 
+  function hydrate(viewValue: string, logOutput: boolean) {
+    const view = FORCE_TERMINAL_VIEW ? 'terminal' : normalizeClaudeView(viewValue)
+    startupView.value = view
+    savedView.value = view
+    runtimeView.value = view
+    logOutputEnabled.value = logOutput
+    loaded.value = true
+    loadPromise = null
+  }
+
   async function load() {
     if (loaded.value) return
     if (loadPromise) return loadPromise
@@ -40,11 +50,7 @@ export const useClaudeViewModeStore = defineStore('claude-view-mode', () => {
           invoke<string>('load_claude_startup_view'),
           invoke<boolean>('load_claude_log_output_enabled'),
         ])
-        const view = FORCE_TERMINAL_VIEW ? 'terminal' : normalizeClaudeView(viewValue)
-        startupView.value = view
-        savedView.value = view
-        runtimeView.value = view
-        logOutputEnabled.value = logOutput
+        hydrate(viewValue, logOutput)
       } catch {
         // Keep the terminal defaults when persisted state is unavailable.
       } finally {
@@ -77,6 +83,7 @@ export const useClaudeViewModeStore = defineStore('claude-view-mode', () => {
     loaded,
     structuredCaptureEnabled,
     pendingRestartView,
+    hydrate,
     load,
     save,
     setRuntimeView,
