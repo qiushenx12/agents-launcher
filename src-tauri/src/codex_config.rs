@@ -1465,13 +1465,11 @@ fn normalize_profile(mut profile: CodexProfile) -> Result<CodexProfile, String> 
         }
         profile.model_context_window_configured = true;
     }
-    if profile.auth_mode != CodexAuthMode::Official || profile.model_context_window.is_none() {
-        // This setting is managed only for official profiles and needs an
-        // explicit context window as its conversion base.
+    if profile.model_context_window.is_none() {
+        // The auto compact ratio needs an explicit context window as its
+        // conversion base; clear it when the context window is empty.
         profile.model_auto_compact_ratio = None;
-        if profile.model_context_window.is_none() {
-            profile.model_auto_compact_ratio_configured = false;
-        }
+        profile.model_auto_compact_ratio_configured = false;
     } else if let Some(ratio) = profile.model_auto_compact_ratio {
         if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
             return Err("model_auto_compact_ratio 必须是 0 到 1 之间的数值".to_string());
@@ -1626,9 +1624,6 @@ fn stabilize_model_auto_compact_ratio(ratio: f64) -> f64 {
 }
 
 fn model_auto_compact_token_limit(profile: &CodexProfile) -> Result<Option<u64>, String> {
-    if profile.auth_mode != CodexAuthMode::Official {
-        return Ok(None);
-    }
     let (Some(context_window), Some(ratio)) = (
         profile.model_context_window,
         profile.model_auto_compact_ratio,
@@ -1862,20 +1857,20 @@ fn build_codex_toml_with_model_catalog_restore(
         "model_reasoning_effort",
         &profile.reasoning_effort,
     );
-    if profile.auth_mode == CodexAuthMode::Official
+    // The two keys derive from each other (limit = window x ratio), so
+    // whichever context setting the profile manages, both keys must stay
+    // in sync with the profile state.
+    let context_settings_managed = profile.auth_mode == CodexAuthMode::Official
         || profile.model_context_window_configured
         || profile.model_context_window.is_some()
-    {
+        || profile.model_auto_compact_ratio_configured
+        || profile.model_auto_compact_ratio.is_some();
+    if context_settings_managed {
         set_optional_u64(
             &mut document,
             "model_context_window",
             profile.model_context_window,
         )?;
-    }
-    if profile.auth_mode == CodexAuthMode::Official
-        || profile.model_auto_compact_ratio_configured
-        || profile.model_auto_compact_ratio.is_some()
-    {
         set_optional_u64(
             &mut document,
             "model_auto_compact_token_limit",
@@ -3006,8 +3001,7 @@ fn prepare_profiles_for_load(state: &mut CodexProfileState) -> Result<(), String
         if profile.model_context_window.is_none() {
             profile.model_auto_compact_ratio = None;
         }
-        let token_limit = if profile.auth_mode == CodexAuthMode::Official
-            && profile.model_auto_compact_ratio.is_none()
+        let token_limit = if profile.model_auto_compact_ratio.is_none()
             && !profile.model_auto_compact_ratio_configured
         {
             profile_auto_compact_token_limit.or_else(|| {
@@ -4894,6 +4888,58 @@ mod tests {
         )
         .expect("render");
         let document = DocumentMut::from_str(&rendered).expect("parse");
+        assert!(document.get("model_auto_compact_token_limit").is_none());
+    }
+
+    fn custom_profile_for_context_tests() -> CodexProfile {
+        let mut profile = official_profile();
+        profile.auth_mode = CodexAuthMode::Custom;
+        profile.name = "Kimi".to_string();
+        profile.provider_id = "kimi".to_string();
+        profile.provider_name = "Kimi".to_string();
+        profile.base_url = "https://api.moonshot.cn/v1/".to_string();
+        profile.model = "k3-256k".to_string();
+        profile
+    }
+
+    #[test]
+    fn custom_profile_renders_model_context_window_and_auto_compact_token_limit() {
+        let mut profile = custom_profile_for_context_tests();
+        profile.model_context_window = Some(262_144);
+        profile.model_auto_compact_ratio = Some(0.9);
+        let profile = normalize_profile(profile).expect("valid profile");
+        assert_eq!(profile.model_auto_compact_ratio, Some(0.9));
+        assert!(profile.model_auto_compact_ratio_configured);
+
+        let rendered = build_profile_toml(None, None, &profile).expect("render");
+        let document = DocumentMut::from_str(&rendered).expect("parse");
+        assert_eq!(
+            document["model_context_window"].as_integer(),
+            Some(262_144)
+        );
+        assert_eq!(
+            document["model_auto_compact_token_limit"].as_integer(),
+            Some(235_930)
+        );
+    }
+
+    #[test]
+    fn custom_profile_removes_context_settings_when_window_is_cleared() {
+        let mut profile = custom_profile_for_context_tests();
+        // 用户曾在 UI 里填过两项设置，随后清空上下文长度（configured 标志保留）。
+        profile.model_context_window = None;
+        profile.model_context_window_configured = true;
+        profile.model_auto_compact_ratio = None;
+        profile.model_auto_compact_ratio_configured = true;
+        let profile = normalize_profile(profile).expect("valid profile");
+        assert_eq!(profile.model_auto_compact_ratio, None);
+        assert!(!profile.model_auto_compact_ratio_configured);
+
+        let existing =
+            "model_context_window = 262144\nmodel_auto_compact_token_limit = 235930\n";
+        let rendered = build_profile_toml(Some(existing), None, &profile).expect("render");
+        let document = DocumentMut::from_str(&rendered).expect("parse");
+        assert!(document.get("model_context_window").is_none());
         assert!(document.get("model_auto_compact_token_limit").is_none());
     }
 

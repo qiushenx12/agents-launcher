@@ -147,7 +147,7 @@
           placeholder="留空则继承下层配置"
         />
 
-        <div v-if="profile.authMode === 'official'" class="field-row">
+        <div class="field-row">
           <label class="field-label">上下文长度</label>
           <div class="field-inline context-window-field">
             <input
@@ -156,14 +156,14 @@
               type="number"
               min="1"
               step="1"
-              aria-label="官方模型上下文长度"
+              aria-label="上下文长度"
               placeholder="留空使用模型默认值"
               @input="updateOfficialContextWindow($event)"
             />
             <select
               class="select context-window-preset"
               :value="numericPresetValue(profile.modelContextWindow, officialContextWindowPresets)"
-              aria-label="官方模型上下文长度预设"
+              aria-label="上下文长度预设"
               @change="updateOfficialContextWindowPreset($event)"
             >
               <option value="custom">自定义</option>
@@ -177,11 +177,12 @@
             </select>
           </div>
         </div>
-        <p v-if="profile.authMode === 'official'" class="field-help">
+        <p class="field-help">
           写入 Codex 的 model_context_window；留空则使用模型默认值。
+          <span v-if="profile.authMode === 'custom'">同时配置模型目录时，此顶层值优先于目录内的每模型上下文长度。</span>
         </p>
 
-        <div v-if="profile.authMode === 'official'" class="field-row">
+        <div class="field-row">
           <label class="field-label">上下文压缩</label>
           <div class="field-inline context-window-field">
             <input
@@ -192,7 +193,7 @@
               max="1"
               step="0.01"
               aria-label="上下文压缩比例"
-              placeholder="留空使用官方默认值"
+              placeholder="留空使用默认值"
               @input="updateOfficialAutoCompactRatio($event)"
             />
             <select
@@ -212,10 +213,10 @@
             </select>
           </div>
         </div>
-        <p v-if="profile.authMode === 'official'" class="field-help">
+        <p class="field-help">
           填写 0~1 的比例；上下文长度为空时按空值处理，不计算也不写入配置。
           <span v-if="compactTokenLimitPreview">{{ compactTokenLimitPreview }}</span>
-          留空则使用 Codex 官方默认值。
+          留空则使用 Codex 默认值。
         </p>
 
         <div v-if="profile.authMode === 'custom'" class="model-catalog-editor">
@@ -526,7 +527,6 @@ watch(
   () => [profile.value.authMode, store.customGlobalSyncSupported] as const,
   ([authMode, supported]) => {
     if (authMode === 'custom' && !supported) store.syncToGlobal = false
-    if (authMode !== 'official') profile.value.modelAutoCompactRatio = null
   },
 )
 watch(
