@@ -10,10 +10,23 @@
         :title="projectListExpanded ? '收起项目列表' : '展开项目列表'"
         @click="projectListExpanded = !projectListExpanded"
       >
-        {{ CLI_DESCRIPTORS[store.activeCliKind].label }} 项目
+        {{ CLI_DESCRIPTORS[store.activeCliKind].label }} 项目{{ store.activeCliKind === 'claude' && store.claudeWslMode ? '（WSL）' : '' }}
         <span>{{ projectListExpanded ? '▾' : '▸' }}</span>
       </button>
       <div class="project-sidebar__actions">
+        <button
+          v-if="store.activeCliKind === 'claude'"
+          class="icon-btn"
+          :class="{ 'icon-btn--primary': store.claudeWslMode }"
+          :title="store.claudeWslMode ? '切换回 Windows 项目' : '切换到 WSL 项目'"
+          :aria-label="store.claudeWslMode ? '切换回 Windows 项目' : '切换到 WSL 项目'"
+          @click="store.toggleClaudeWslMode()"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg">
+            <path d="M2.5 4.5 5.5 7.5 2.5 10.5"/>
+            <path d="M7.5 11.5h6"/>
+          </svg>
+        </button>
         <button
           class="icon-btn project-sidebar__menu-btn"
           title="项目功能"
@@ -88,7 +101,7 @@
 
         <div v-if="openMenuProjectId === project.id" class="project-actions-menu">
           <button @click="renameProject(project.id)">✎ 重命名项目</button>
-          <button @click="openProjectDirectory(project.path)">↗ 打开项目目录</button>
+          <button @click="openProjectDirectory(project.id)">↗ 打开项目目录</button>
           <button class="danger" @click="removeProject(project.id)">⌫ 删除项目</button>
         </div>
 
@@ -654,8 +667,16 @@ async function removeProject(projectId: string) {
   }
 }
 
-async function openProjectDirectory(path: string) {
+async function openProjectDirectory(projectId: string) {
   openMenuProjectId.value = null
+  const project = store.projects.find((item) => item.id === projectId)
+  if (!project) return
+  let path = project.path
+  // Distro-local paths (e.g. /home/paul/foo) can't be opened directly from
+  // Windows Explorer — route them through the distro's UNC share.
+  if (project.wsl && path.startsWith('/') && store.wslUncRoot) {
+    path = `${store.wslUncRoot}${path.replace(/\//g, '\\')}`
+  }
   await invoke('open_directory', { path }).catch(() => {})
 }
 

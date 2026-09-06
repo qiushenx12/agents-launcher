@@ -38,6 +38,7 @@ export interface Project {
   id: string
   name: string
   path: string
+  wsl?: boolean
   createdAt: number
   updatedAt: number
   order: number
@@ -146,6 +147,31 @@ interface CodexProjectEntry {
 interface CodexProjectDiscovery {
   projects: CodexProjectEntry[]
   warning?: string | null
+}
+
+interface WslClaudeProjectList {
+  distro: string
+  home: string
+  uncRoot: string
+  homeUnc: string
+  projects: string[]
+}
+
+// A project path lives inside WSL when it is a distro-local absolute path or
+// already a \\wsl… UNC path picked from the distro share.
+function isWslProjectPath(path: string) {
+  return path.startsWith('/') || /^\\\\wsl/i.test(path)
+}
+
+// The distro-local form of a stored WSL project path: Linux paths pass
+// through; \\wsl.localhost\<distro>\… UNC paths drop the share/distro parts.
+function wslDistroPath(path: string) {
+  if (path.startsWith('/')) return path
+  const parts = path.split(/[\\/]+/).filter(Boolean)
+  if (parts.length > 2 && /^wsl/i.test(parts[0])) {
+    return `/${parts.slice(2).join('/')}`
+  }
+  return path
 }
 
 const EMPTY_SELECTIONS: Record<CliKind, string | null> = {
@@ -275,6 +301,13 @@ export const useProjectStore = defineStore('project', () => {
   const activeProjectIds = ref<Record<CliKind, string | null>>({ ...EMPTY_SELECTIONS })
   const activeSessionIds = ref<Record<CliKind, string | null>>({ ...EMPTY_SELECTIONS })
   const projectSortMode = ref<ProjectSortMode>('manual')
+  // Claude Code only: when on, the sidebar lists projects inside the default
+  // WSL distro instead of Windows projects. Not persisted — every launch
+  // starts on the Windows list.
+  const claudeWslMode = ref(false)
+  const wslUncRoot = ref('')
+  const wslHomeUnc = ref('')
+  let wslProjectsLoaded = false
   const sidebarOpen = ref(false)
   const sidebarPlacement = ref<SidebarPlacement>('right')
   const leftSidebarCollapsed = ref(false)
@@ -314,7 +347,9 @@ export const useProjectStore = defineStore('project', () => {
   const cliWorkspaceLoads = new InFlightTaskCache<CliKind, void>()
 
   const visibleProjects = computed(() =>
-    projects.value.filter((project) => project.cliKind === activeCliKind.value)
+    projects.value.filter((project) =>
+      project.cliKind === activeCliKind.value
+      && (activeCliKind.value !== 'claude' || !!project.wsl === claudeWslMode.value))
   )
 
   const visibleSessions = computed(() =>
@@ -450,11 +485,14 @@ export const useProjectStore = defineStore('project', () => {
 
   function mergeRecentProjectPaths(
     paths: string[],
-    options: { prepend?: boolean; cliKind?: CliKind } = {},
+    options: { prepend?: boolean; cliKind?: CliKind; wsl?: boolean } = {},
   ) {
     const cliKind = options.cliKind ?? 'claude'
+    const wantWsl = options.wsl ?? false
     const incoming: Project[] = []
-    const existingForKind = projects.value.filter((project) => project.cliKind === cliKind)
+    const existingForKind = projects.value.filter(
+      (project) => project.cliKind === cliKind && !!project.wsl === wantWsl,
+    )
 
     for (const path of paths) {
       if (!path) continue
@@ -475,6 +513,7 @@ export const useProjectStore = defineStore('project', () => {
         id: makeId('project'),
         name: basename(normalized),
         path: normalized,
+        wsl: wantWsl || undefined,
         createdAt: ts,
         updatedAt: ts,
         order: options.prepend ? incoming.length : existingForKind.length + incoming.length,
@@ -554,9 +593,15 @@ export const useProjectStore = defineStore('project', () => {
 
     let recent: SessionEntry[] = []
     try {
-      recent = await invoke<SessionEntry[]>('load_claude_sessions', {
-        targetDir: project.path,
-      }) ?? []
+      // WSL projects read the distro's own ~/.claude/history.jsonl — the
+      // Windows history never contains distro-local paths.
+      recent = project.wsl
+        ? await invoke<SessionEntry[]>('load_wsl_claude_sessions', {
+          targetDir: wslDistroPath(project.path),
+        }) ?? []
+        : await invoke<SessionEntry[]>('load_claude_sessions', {
+          targetDir: project.path,
+        }) ?? []
     } catch {
       return false
     }
@@ -1459,6 +1504,7 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   async function refreshClaudeHistory() {
+    await invoke('invalidate_wsl_history_cache').catch(() => {})
     const claudeStore = useClaudeStore()
     let changed = mergeRecentProjectPaths(claudeStore.launchDirHistory, { cliKind: 'claude' })
 
@@ -1489,11 +1535,52 @@ export const useProjectStore = defineStore('project', () => {
     return changed
   }
 
+  async function loadWslClaudeProjects(force = false) {
+    if (wslProjectsLoaded && !force) return false
+    const info = await invoke<WslClaudeProjectList>('list_wsl_claude_projects')
+    wslUncRoot.value = info.uncRoot
+    wslHomeUnc.value = info.homeUnc
+    wslProjectsLoaded = true
+    return mergeRecentProjectPaths(info.projects, { prepend: true, cliKind: 'claude', wsl: true })
+  }
+
+  async function toggleClaudeWslMode() {
+    if (activeCliKind.value !== 'claude') return
+    if (claudeWslMode.value) {
+      claudeWslMode.value = false
+      normalizeActiveState()
+      return
+    }
+    try {
+      const changed = await loadWslClaudeProjects()
+      claudeWslMode.value = true
+      normalizeActiveState()
+      if (changed) await persist()
+    } catch (error) {
+      statusMessage.value = `WSL 项目加载失败：${String(error)}`
+    }
+  }
+
   async function pickAndAddProject() {
+    let defaultPath: string | undefined
+    if (activeCliKind.value === 'claude' && claudeWslMode.value) {
+      // The WSL picker must start from the distro's home directory, not a
+      // Windows directory — refuse to fall back to a local picker.
+      if (!wslHomeUnc.value) {
+        try {
+          await loadWslClaudeProjects()
+        } catch (error) {
+          statusMessage.value = `WSL 主目录获取失败：${String(error)}`
+          return
+        }
+      }
+      defaultPath = wslHomeUnc.value || undefined
+    }
     const selected = await open({
       directory: true,
       multiple: false,
       title: `选择 ${CLI_DESCRIPTORS[activeCliKind.value].label} 项目目录`,
+      ...(defaultPath ? { defaultPath } : {}),
     })
     if (typeof selected === 'string') {
       await addProject(selected)
@@ -1503,8 +1590,10 @@ export const useProjectStore = defineStore('project', () => {
   async function addProject(path: string, name?: string) {
     const normalizedPath = normalizeProjectPath(path)
     const normalizedKey = normalizeFsPath(normalizedPath)
+    const wsl = activeCliKind.value === 'claude' && isWslProjectPath(normalizedPath)
     const existing = projects.value.find(
       (p) => p.cliKind === activeCliKind.value
+        && !!p.wsl === wsl
         && normalizeFsPath(p.path) === normalizedKey,
     )
     if (existing) {
@@ -1522,6 +1611,7 @@ export const useProjectStore = defineStore('project', () => {
       id: makeId('project'),
       name: name?.trim() || basename(normalizedPath),
       path: normalizedPath,
+      wsl: wsl || undefined,
       createdAt: ts,
       updatedAt: ts,
       order: visibleProjects.value.length,
@@ -1531,7 +1621,7 @@ export const useProjectStore = defineStore('project', () => {
     activeProjectId.value = project.id
     expandedProjectIds.value.add(project.id)
 
-    if (project.cliKind === 'claude') {
+    if (project.cliKind === 'claude' && !project.wsl) {
       const claudeStore = useClaudeStore()
       updateClaudeLaunchHistory(claudeStore, project.path)
       await claudeStore.saveLaunchDir().catch(() => {})
@@ -1691,7 +1781,7 @@ export const useProjectStore = defineStore('project', () => {
 
     const project = projects.value.find((p) => p.id === projectId)
     if (project) {
-      if (project.cliKind === 'claude') {
+      if (project.cliKind === 'claude' && !project.wsl) {
         const claudeStore = useClaudeStore()
         updateClaudeLaunchHistory(claudeStore, project.path)
         await claudeStore.saveLaunchDir().catch(() => {})
@@ -1872,9 +1962,22 @@ export const useProjectStore = defineStore('project', () => {
 
     const launch = (async (): Promise<number | null> => {
       const runtimeStore = useCliRuntimeStore()
-      const runtimeStatus = await runtimeStore.check(session.cliKind)
-      if (runtimeStatus.state !== 'ready') {
-        return failSessionTerminalLaunch(runtimeStatus.message, options)
+      if (session.cliKind === 'claude' && project.wsl) {
+        // WSL sessions run inside the default distro; the Windows claude
+        // probe is irrelevant there.
+        const wslCheck = await invoke<{ wslAvailable: boolean; claudeFound: boolean }>('check_wsl_claude')
+          .catch(() => ({ wslAvailable: false, claudeFound: false }))
+        if (!wslCheck.wslAvailable) {
+          return failSessionTerminalLaunch('WSL 不可用，请确认已安装并设置了默认发行版', options)
+        }
+        if (!wslCheck.claudeFound) {
+          return failSessionTerminalLaunch('WSL 默认发行版内未找到 claude 命令，请先在 WSL 内安装 Claude Code', options)
+        }
+      } else {
+        const runtimeStatus = await runtimeStore.check(session.cliKind)
+        if (runtimeStatus.state !== 'ready') {
+          return failSessionTerminalLaunch(runtimeStatus.message, options)
+        }
       }
       const envVars: Record<string, string> = {}
       let cmd: string[]
@@ -1884,15 +1987,24 @@ export const useProjectStore = defineStore('project', () => {
         const claudeViewModeStore = useClaudeViewModeStore()
         await claudeViewModeStore.load()
         observeClaude = claudeViewModeStore.structuredCaptureEnabled
-        const profileVars = claudeStore.editingConfig.vars
-        for (const [key, value] of Object.entries(profileVars)) {
-          if (value) envVars[key] = value
-        }
         const args: string[] = []
         if (claudeStore.skipPermissions) args.push('--dangerously-skip-permissions')
         const nativeSessionId = session.nativeSessionId ?? session.claudeSessionId
         if (nativeSessionId) args.push('-r', nativeSessionId)
-        cmd = [runtimeStore.executable('claude'), ...args]
+        if (project.wsl) {
+          // bash -lic picks up the user's shell init (nvm, aliases) so claude
+          // resolves the same way as an interactive WSL terminal; exec keeps
+          // the PTY lifetime tied to claude itself. Windows profile env vars
+          // don't cross into WSL — 「应用到 WSL」persists them in the distro.
+          const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+          cmd = ['wsl.exe', '--cd', wslDistroPath(project.path), '-e', 'bash', '-lic', `exec claude ${args.map(quote).join(' ')}`]
+        } else {
+          const profileVars = claudeStore.editingConfig.vars
+          for (const [key, value] of Object.entries(profileVars)) {
+            if (value) envVars[key] = value
+          }
+          cmd = [runtimeStore.executable('claude'), ...args]
+        }
       } else if (session.cliKind === 'codex') {
         const codexStore = useCodexConfigStore()
         const { isWindows } = usePlatform()
@@ -1938,12 +2050,18 @@ export const useProjectStore = defineStore('project', () => {
         cmd = [runtimeStore.executable('opencode'), ...args]
       }
 
-      const tabId = await terminalStore.createTab(cmd, envVars, session.cwd || project.path, session.name, {
+      // WSL cwd lives inside the distro (wsl.exe --cd); passing the Linux/UNC
+      // path as the Windows-side PTY cwd would break the spawn.
+      const ptyCwd = project.wsl ? null : session.cwd || project.path
+      const tabId = await terminalStore.createTab(cmd, envVars, ptyCwd, session.name, {
         scope: 'project',
         projectSessionId: session.id,
         activate: false,
         cliKind: session.cliKind,
         observeClaude,
+        // The WSL command line hides '-r <id>' inside the bash script string,
+        // so pass the known Claude session id explicitly.
+        sessionId: session.cliKind === 'claude' ? session.nativeSessionId ?? session.claudeSessionId : undefined,
       })
       sessionTerminalIds.value[session.id] = tabId
       return tabId
@@ -2315,6 +2433,9 @@ export const useProjectStore = defineStore('project', () => {
     activeProjectId,
     activeSessionId,
     projectSortMode,
+    claudeWslMode,
+    wslUncRoot,
+    wslHomeUnc,
     sidebarOpen,
     sidebarPlacement,
     leftSidebarCollapsed,
@@ -2340,6 +2461,8 @@ export const useProjectStore = defineStore('project', () => {
     refreshCodexProfileSessions,
     refreshClaudeHistory,
     handleClaudeSessionLifecycleEvent,
+    toggleClaudeWslMode,
+    loadWslClaudeProjects,
     pickAndAddProject,
     addProject,
     removeProject,

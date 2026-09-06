@@ -12,14 +12,20 @@
 //! `cp` backup (`.cl-launcher.bak`) inside the distro.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::session_manager::{ClaudeHistorySnapshot, SessionEntry};
+
 const WSL_TIMEOUT: Duration = Duration::from_secs(60);
+// The WSL history snapshot crosses process boundaries (wsl.exe spawn per read),
+// so per-project session syncs share one cached snapshot for a short window.
+const WSL_HISTORY_CACHE_TTL: Duration = Duration::from_secs(10);
 
 const BLOCK_START: &str = "# >>> Agents Launcher: Claude Code env >>>";
 const BLOCK_END: &str = "# <<< Agents Launcher: Claude Code env <<<";
@@ -33,6 +39,11 @@ const READ_SETTINGS_SCRIPT: &str =
 const WRITE_SETTINGS_SCRIPT: &str =
     r#"mkdir -p "$HOME/.claude" && cat > "$HOME/.claude/settings.json""#;
 const CHECK_SCRIPT: &str = r#"if command -v claude >/dev/null 2>&1 || grep -qs "alias claude=" "$HOME/.bashrc"; then echo WSL_CLAUDE_OK; else echo WSL_CLAUDE_MISSING; fi"#;
+// Prints the distro name and $HOME as header lines, then the raw history file
+// (absent history is fine — the launcher treats it as an empty project list).
+const LIST_PROJECTS_SCRIPT: &str = r#"printf '%s\n' "$WSL_DISTRO_NAME"; printf '%s\n' "$HOME"; if [ -f "$HOME/.claude/history.jsonl" ]; then cat "$HOME/.claude/history.jsonl"; fi"#;
+const READ_HISTORY_SCRIPT: &str =
+    r#"if [ -f "$HOME/.claude/history.jsonl" ]; then cat "$HOME/.claude/history.jsonl"; fi"#;
 
 // ---------------------------------------------------------------------------
 // wsl.exe helper
@@ -165,6 +176,134 @@ pub fn splice_block(existing: &str, block: &str) -> String {
             out.push('\n');
             out
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WSL Claude Code project discovery
+// ---------------------------------------------------------------------------
+
+/// Result of scanning the default WSL distro for Claude Code projects.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WslClaudeProjectList {
+    pub distro: String,
+    pub home: String,
+    /// `\\wsl.localhost\<distro>` — prefix for opening distro paths from Windows.
+    pub unc_root: String,
+    /// `\\wsl.localhost\<distro><home>` — starting directory for project pickers.
+    pub home_unc: String,
+    /// Recent project directories (distro-local paths like `/home/paul/foo`).
+    pub projects: Vec<String>,
+}
+
+/// Splits the listing script output into (distro, home, recent projects).
+/// Header values come from trusted shell variables; everything after the
+/// second line is history JSONL and goes through the shared history parser.
+pub fn parse_wsl_project_listing(stdout: &str) -> (String, String, Vec<String>) {
+    let mut lines = stdout.lines();
+    let distro = lines.next().unwrap_or("").trim().to_string();
+    let home = lines.next().unwrap_or("").trim().to_string();
+    let history = lines.collect::<Vec<_>>().join("\n");
+    let snapshot = crate::session_manager::parse_history(std::io::Cursor::new(history));
+    (distro, home, snapshot.recent_projects)
+}
+
+/// Lists Claude Code projects known to the default WSL distro, along with the
+/// UNC path of the distro's home directory for the "add project" picker.
+#[tauri::command]
+pub async fn list_wsl_claude_projects() -> Result<WslClaudeProjectList, String> {
+    #[cfg(windows)]
+    {
+        let (ok, stdout, stderr) = run_wsl_bash(LIST_PROJECTS_SCRIPT, None)
+            .await
+            .map_err(|e| wsl_error("读取 WSL 项目列表", e))?;
+        if !ok {
+            return Err(wsl_error_text("读取 WSL 项目列表", &stderr));
+        }
+        let (distro, home, projects) = parse_wsl_project_listing(&stdout);
+        if distro.is_empty() || home.is_empty() {
+            return Err("无法识别 WSL 默认发行版或用户主目录".to_string());
+        }
+        let unc_root = format!(r"\\wsl.localhost\{distro}");
+        let home_unc = format!("{unc_root}{}", home.replace('/', "\\"));
+        Ok(WslClaudeProjectList {
+            distro,
+            home,
+            unc_root,
+            home_unc,
+            projects,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅 Windows 支持 WSL 项目".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WSL Claude Code session history
+// ---------------------------------------------------------------------------
+
+static WSL_HISTORY_CACHE: OnceLock<Mutex<Option<(Instant, Arc<ClaudeHistorySnapshot>)>>> =
+    OnceLock::new();
+
+fn wsl_history_cache() -> &'static Mutex<Option<(Instant, Arc<ClaudeHistorySnapshot>)>> {
+    WSL_HISTORY_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Drops the cached WSL history snapshot (manual refresh).
+#[tauri::command]
+pub fn invalidate_wsl_history_cache() {
+    let mut cache = wsl_history_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cache = None;
+}
+
+#[cfg(windows)]
+async fn load_wsl_history_snapshot() -> Result<Arc<ClaudeHistorySnapshot>, String> {
+    {
+        let cache = wsl_history_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((fetched_at, snapshot)) = cache.as_ref() {
+            if fetched_at.elapsed() <= WSL_HISTORY_CACHE_TTL {
+                return Ok(snapshot.clone());
+            }
+        }
+    }
+    let (ok, stdout, stderr) = run_wsl_bash(READ_HISTORY_SCRIPT, None)
+        .await
+        .map_err(|e| wsl_error("读取 WSL 会话历史", e))?;
+    if !ok {
+        return Err(wsl_error_text("读取 WSL 会话历史", &stderr));
+    }
+    let snapshot = Arc::new(crate::session_manager::parse_history(std::io::Cursor::new(stdout)));
+    let mut cache = wsl_history_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cache = Some((Instant::now(), snapshot.clone()));
+    Ok(snapshot)
+}
+
+/// Claude Code sessions for one project directory inside the default WSL
+/// distro. `target_dir` is the distro-local path (e.g. `/home/paul/foo`).
+#[tauri::command]
+pub async fn load_wsl_claude_sessions(target_dir: String) -> Result<Vec<SessionEntry>, String> {
+    #[cfg(windows)]
+    {
+        let snapshot = load_wsl_history_snapshot().await?;
+        Ok(snapshot
+            .sessions_by_project
+            .get(&target_dir)
+            .cloned()
+            .unwrap_or_default())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target_dir;
+        Err("仅 Windows 支持 WSL 会话".to_string())
     }
 }
 
@@ -306,6 +445,29 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn parse_listing_reads_headers_and_projects() {
+        let stdout = concat!(
+            "Ubuntu-22.04\r\n",
+            "/home/paul\r\n",
+            "{\"project\":\"/home/paul/foo\",\"sessionId\":\"s1\",\"timestamp\":2,\"display\":\"x\"}\n",
+            "{\"project\":\"/home/paul/bar\",\"sessionId\":\"s2\",\"timestamp\":5}\n",
+        );
+        let (distro, home, projects) = parse_wsl_project_listing(stdout);
+        assert_eq!(distro, "Ubuntu-22.04");
+        assert_eq!(home, "/home/paul");
+        // Newer timestamp sorts first.
+        assert_eq!(projects, vec!["/home/paul/bar", "/home/paul/foo"]);
+    }
+
+    #[test]
+    fn parse_listing_without_history_file_yields_no_projects() {
+        let (distro, home, projects) = parse_wsl_project_listing("Ubuntu\n/home/paul\n");
+        assert_eq!(distro, "Ubuntu");
+        assert_eq!(home, "/home/paul");
+        assert!(projects.is_empty());
     }
 
     #[test]

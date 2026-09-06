@@ -37,9 +37,9 @@ enum HistoryRevision {
 }
 
 #[derive(Debug, Default)]
-struct ClaudeHistorySnapshot {
-    recent_projects: Vec<String>,
-    sessions_by_project: HashMap<String, Vec<SessionEntry>>,
+pub(crate) struct ClaudeHistorySnapshot {
+    pub recent_projects: Vec<String>,
+    pub sessions_by_project: HashMap<String, Vec<SessionEntry>>,
 }
 
 #[derive(Debug)]
@@ -158,7 +158,7 @@ fn parse_ts(value: &serde_json::Value) -> i64 {
     0
 }
 
-fn parse_history(reader: impl BufRead) -> ClaudeHistorySnapshot {
+pub(crate) fn parse_history(reader: impl BufRead) -> ClaudeHistorySnapshot {
     let mut recent_projects: HashMap<String, i64> = HashMap::new();
     let mut sessions_by_project: HashMap<String, HashMap<String, (i64, String)>> = HashMap::new();
 

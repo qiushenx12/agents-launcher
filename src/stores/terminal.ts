@@ -13,6 +13,9 @@ export interface CreateTerminalTabOptions {
   activate?: boolean
   cliKind?: CliKind
   observeClaude?: boolean
+  // Explicit Claude session id, for command lines where '-r <id>' is not a
+  // standalone argv element (e.g. wrapped in a WSL bash script).
+  sessionId?: string
 }
 
 export const useTerminalStore = defineStore('terminal', () => {
@@ -156,7 +159,7 @@ export const useTerminalStore = defineStore('terminal', () => {
     await ensureListeners()
 
     const sessionIdIdx = cmd.indexOf('-r')
-    const sessionId = sessionIdIdx !== -1 ? cmd[sessionIdIdx + 1] : undefined
+    const sessionId = options.sessionId ?? (sessionIdIdx !== -1 ? cmd[sessionIdIdx + 1] : undefined)
 
     const id = await invoke<number>('pty_create', {
       cmd,

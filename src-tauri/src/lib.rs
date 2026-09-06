@@ -230,6 +230,9 @@ pub fn run() {
             // wsl_env commands (Windows-only: apply profile into default WSL distro)
             wsl_env::apply_wsl_env_vars,
             wsl_env::check_wsl_claude,
+            wsl_env::list_wsl_claude_projects,
+            wsl_env::load_wsl_claude_sessions,
+            wsl_env::invalidate_wsl_history_cache,
             // settings_manager commands
             settings_manager::load_claude_settings,
             settings_manager::save_claude_settings,
