@@ -165,6 +165,44 @@ fn load_claude_settings_from(paths: &SettingsPaths) -> Result<ClaudeSettings, St
     })
 }
 
+/// Insert the launcher-managed fields into a settings.json object.
+///   - `skipDangerousModePermissionPrompt` ← skip_permissions
+///   - `permissions.defaultMode` ← "bypassPermissions" | "default"
+///   - `awaySummaryEnabled` ← !away_summary_disabled
+///
+/// Shared with `wsl_env` (apply-to-WSL writes the same fields into the
+/// distro's settings.json).
+pub fn apply_managed_fields(
+    obj: &mut Map<String, Value>,
+    skip_permissions: bool,
+    away_summary_disabled: bool,
+) -> Result<(), String> {
+    obj.insert(
+        "skipDangerousModePermissionPrompt".to_string(),
+        Value::Bool(skip_permissions),
+    );
+
+    let mode = if skip_permissions {
+        "bypassPermissions"
+    } else {
+        "default"
+    };
+    let permissions = obj
+        .entry("permissions")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "permissions field is not an object".to_string())?;
+    permissions.insert("defaultMode".to_string(), Value::String(mode.to_string()));
+
+    // Checkbox checked  → away_summary_disabled = true  → awaySummaryEnabled = false
+    // Checkbox unchecked → away_summary_disabled = false → awaySummaryEnabled = true
+    obj.insert(
+        "awaySummaryEnabled".to_string(),
+        Value::Bool(!away_summary_disabled),
+    );
+    Ok(())
+}
+
 /// Write the managed fields back to settings.json, preserving all other fields.
 #[tauri::command]
 pub fn save_claude_settings(settings: ClaudeSettings) -> Result<(), String> {
@@ -180,32 +218,11 @@ fn save_claude_settings_to(paths: &SettingsPaths, settings: &ClaudeSettings) -> 
         None => Map::new(),
     };
 
-    // --- skipDangerousModePermissionPrompt ---
-    obj.insert(
-        "skipDangerousModePermissionPrompt".to_string(),
-        Value::Bool(settings.skip_permissions),
-    );
-
-    // --- permissions.defaultMode ---
-    let mode = if settings.skip_permissions {
-        "bypassPermissions"
-    } else {
-        "default"
-    };
-    let permissions = obj
-        .entry("permissions")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| "permissions field is not an object".to_string())?;
-    permissions.insert("defaultMode".to_string(), Value::String(mode.to_string()));
-
-    // --- awaySummaryEnabled ---
-    // Checkbox checked  → away_summary_disabled = true  → awaySummaryEnabled = false
-    // Checkbox unchecked → away_summary_disabled = false → awaySummaryEnabled = true
-    obj.insert(
-        "awaySummaryEnabled".to_string(),
-        Value::Bool(!settings.away_summary_disabled),
-    );
+    apply_managed_fields(
+        &mut obj,
+        settings.skip_permissions,
+        settings.away_summary_disabled,
+    )?;
 
     // Ensure parent directory exists.
     if let Some(parent) = paths.canonical.parent() {

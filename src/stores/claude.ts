@@ -55,6 +55,8 @@ export const useClaudeStore = defineStore('claude', () => {
   const switchToTerminal = ref(false)
   const switchToProject = ref(false)
   const scope = ref<'user' | 'system'>('user')
+  const wslStatus = ref<'checking' | 'ready' | 'unavailable'>('checking')
+  const wslDisabledReason = ref('正在检测 WSL…')
   const statusMessage = ref('')
   const settingsSourcePath = ref('')
   const settingsSourceKind = ref<'settings' | 'legacy' | 'missing' | string>('missing')
@@ -468,14 +470,18 @@ export const useClaudeStore = defineStore('claude', () => {
     }
   })
 
-  async function applyToRegistry() {
-    const vars = editingConfig.value.vars
-    // Build a full map: for every known env key, use the config value or empty string.
-    // Empty strings tell the backend to delete the registry entry.
+  // Full map over every known env key; missing keys become '' ("not set":
+  // registry apply deletes the entry, WSL apply emits an `unset` line).
+  function buildFullVars(vars: Record<string, string>): Record<string, string> {
     const fullVars: Record<string, string> = {}
     for (const k of KNOWN_ENV_KEYS) {
       fullVars[k] = vars[k] ?? ''
     }
+    return fullVars
+  }
+
+  async function applyToRegistry() {
+    const fullVars = buildFullVars(editingConfig.value.vars)
     const nonEmpty = Object.entries(fullVars).filter(([, v]) => v)
     if (nonEmpty.length === 0) {
       statusMessage.value = '没有需要应用的环境变量'
@@ -502,6 +508,61 @@ export const useClaudeStore = defineStore('claude', () => {
           invoke('set_titlebar_theme', { dark: currentTheme === 'dark' }).catch(() => {})
         }, 300)
       }
+    } catch (e) {
+      statusMessage.value = `应用失败: ${e}`
+    }
+  }
+
+  // ── WSL (Windows only) ─────────────────────────────────────────────────────
+
+  async function checkWsl() {
+    wslStatus.value = 'checking'
+    wslDisabledReason.value = '正在检测 WSL…'
+    try {
+      const result = await invoke<{ wslAvailable: boolean; claudeFound: boolean }>(
+        'check_wsl_claude'
+      )
+      if (!result.wslAvailable) {
+        wslStatus.value = 'unavailable'
+        wslDisabledReason.value = '未检测到 WSL'
+      } else if (!result.claudeFound) {
+        wslStatus.value = 'unavailable'
+        wslDisabledReason.value = 'WSL 内未检测到 Claude Code'
+      } else {
+        wslStatus.value = 'ready'
+        wslDisabledReason.value = ''
+      }
+    } catch {
+      wslStatus.value = 'unavailable'
+      wslDisabledReason.value = 'WSL 检测失败'
+    }
+  }
+
+  async function applyToWsl() {
+    if (wslStatus.value !== 'ready') {
+      statusMessage.value = wslDisabledReason.value || 'WSL 未就绪'
+      return
+    }
+    const fullVars = buildFullVars(editingConfig.value.vars)
+    const nonEmpty = Object.entries(fullVars).filter(([, v]) => v)
+    if (nonEmpty.length === 0) {
+      statusMessage.value = '没有需要应用的环境变量'
+      return
+    }
+    const confirmed = await confirm(
+      `将以下内容写入 WSL（默认发行版）:\n\n~/.bashrc 环境变量（${nonEmpty.length} 个）:\n` +
+        formatRedactedEntries(Object.fromEntries(nonEmpty)).map(line => `  ${line}`).join('\n') +
+        `\n\n~/.claude/settings.json:\n  会话权限: ${skipPermissions.value ? '跳过权限检查' : '默认'}\n  会话摘要: ${awaySummaryDisabled.value ? '已关闭' : '已开启'}`,
+      { title: '确认应用到 WSL', kind: 'warning' }
+    )
+    if (!confirmed) return
+    try {
+      await invoke('apply_wsl_env_vars', {
+        vars: fullVars,
+        skipPermissions: skipPermissions.value,
+        awaySummaryDisabled: awaySummaryDisabled.value,
+      })
+      statusMessage.value = '已应用到 WSL（默认发行版的 ~/.bashrc 和 ~/.claude/settings.json）'
     } catch (e) {
       statusMessage.value = `应用失败: ${e}`
     }
@@ -722,6 +783,8 @@ export const useClaudeStore = defineStore('claude', () => {
     switchToTerminal,
     switchToProject,
     scope,
+    wslStatus,
+    wslDisabledReason,
     statusMessage,
     settingsSourcePath,
     settingsSourceKind,
@@ -739,6 +802,8 @@ export const useClaudeStore = defineStore('claude', () => {
     deleteConfig,
     reorderConfigs,
     applyToRegistry,
+    checkWsl,
+    applyToWsl,
     fetchModels,
     loadSessions,
     loadMoreSessions,

@@ -180,6 +180,15 @@
         {{ store.isConfigDirty ? '保存配置' : '已保存' }}
       </button>
       <button class="btn btn-primary" @click="store.applyToRegistry()">应用到环境变量</button>
+      <button
+        v-if="isWindows"
+        class="btn btn-primary"
+        :disabled="store.wslStatus !== 'ready'"
+        :title="store.wslDisabledReason || undefined"
+        @click="store.applyToWsl()"
+      >
+        应用到 WSL
+      </button>
     </div>
     <div class="action-row action-row--tools">
       <button class="btn btn-secondary" @click="openJsonDir()">打开JSON目录</button>
@@ -203,7 +212,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useClaudeStore } from '@/stores/claude'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
@@ -215,6 +224,17 @@ import ModelField from '@/components/config/ModelField.vue'
 const store = useClaudeStore()
 const workspaceStore = useConfigWorkspaceStore()
 const { isWindows } = usePlatform()
+
+// Re-check WSL availability (default distro + claude inside it) whenever the
+// Claude Code config page is shown; the panel stays mounted after first visit
+// (v-show), so onMounted alone would miss later switches.
+watch(
+  () => workspaceStore.activeKind,
+  (kind) => {
+    if (kind === 'claude' && isWindows.value) store.checkWsl()
+  },
+  { immediate: true }
+)
 
 // Convenience proxy so templates can use vars.ANTHROPIC_MODEL etc.
 const vars = computed(() => store.editingConfig.vars)

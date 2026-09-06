@@ -23,6 +23,7 @@ pub mod session_manager;
 pub mod settings_manager;
 pub mod tab_cli;
 pub mod utils;
+pub mod wsl_env;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -226,6 +227,9 @@ pub fn run() {
             config_store::save_claude_configs,
             // env_applier commands (cross-platform env vars)
             env_applier::apply_env_vars,
+            // wsl_env commands (Windows-only: apply profile into default WSL distro)
+            wsl_env::apply_wsl_env_vars,
+            wsl_env::check_wsl_claude,
             // settings_manager commands
             settings_manager::load_claude_settings,
             settings_manager::save_claude_settings,
