@@ -251,7 +251,10 @@ function normalizeFsPath(path: string) {
 }
 
 function sessionDisplayName(entry: SessionEntry) {
-  return entry.display.replace(/\n/g, ' ').replace(/\r/g, '').trim() || entry.id
+  // Prefer Claude Code's official AI session title (ai-title line); fall back
+  // to the last user prompt from history.jsonl when the session has none yet.
+  const raw = entry.title?.trim() || entry.display
+  return raw.replace(/\n/g, ' ').replace(/\r/g, '').trim() || entry.id
 }
 
 function normalizeSessionName(name: string) {

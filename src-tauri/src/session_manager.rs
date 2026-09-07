@@ -7,11 +7,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use tauri::{AppHandle, Emitter};
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct SessionEntry {
     pub id: String,
     pub display: String,
     pub ts: i64,
+    /// Official AI-generated session title from the session file
+    /// (`{"type":"ai-title",...}` lines in `~/.claude/projects/<dir>/<id>.jsonl`).
+    /// Falls back to `display` (last user prompt) when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 fn history_path() -> std::path::PathBuf {
@@ -40,6 +45,10 @@ enum HistoryRevision {
 pub(crate) struct ClaudeHistorySnapshot {
     pub recent_projects: Vec<String>,
     pub sessions_by_project: HashMap<String, Vec<SessionEntry>>,
+    /// Session id → official AI title. Only populated for WSL snapshots (the
+    /// distro reports all titles in one batch); local titles are read from
+    /// session files on demand.
+    pub titles: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -158,6 +167,95 @@ fn parse_ts(value: &serde_json::Value) -> i64 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// Official session titles (`{"type":"ai-title",...}` lines in session files)
+// ---------------------------------------------------------------------------
+
+/// Bytes of a session file scanned from the end before falling back to a full
+/// scan. Claude Code appends an `ai-title` line throughout the session, so the
+/// latest title is normally within this window.
+const TITLE_SCAN_WINDOW: u64 = 2 * 1024 * 1024;
+
+/// Encodes a project path into Claude Code's `~/.claude/projects/<dir>` name:
+/// every non-ASCII-alphanumeric character (including `/`, `\`, `:` and any
+/// non-ASCII character) becomes `-`.
+fn encode_project_dir(project: &str) -> String {
+    project
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Scans `path` starting at `offset` and returns the last `aiTitle` found in
+/// `{"type":"ai-title",...}` lines (the file is append-only, so the last
+/// occurrence is the current title).
+fn scan_title_from(path: &std::path::Path, offset: u64) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+
+    let file = File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    if offset > 0 {
+        reader.seek(SeekFrom::Start(offset)).ok()?;
+    }
+
+    let mut last: Option<String> = None;
+    for line in reader.lines() {
+        let Ok(raw) = line else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() || !raw.contains("ai-title") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("ai-title") {
+            continue;
+        }
+        if let Some(title) = value.get("aiTitle").and_then(serde_json::Value::as_str) {
+            let title = title.trim();
+            if !title.is_empty() {
+                last = Some(title.to_string());
+            }
+        }
+    }
+    last
+}
+
+/// Latest official AI title of one Claude Code session file, if any.
+fn read_session_title(path: &std::path::Path) -> Option<String> {
+    let size = std::fs::metadata(path).ok()?.len();
+    let offset = size.saturating_sub(TITLE_SCAN_WINDOW);
+    if let Some(title) = scan_title_from(path, offset) {
+        return Some(title);
+    }
+    if offset == 0 {
+        return None;
+    }
+    // Title predates the tail window (e.g. one prompt, long output): rescan
+    // the whole file.
+    scan_title_from(path, 0)
+}
+
+/// Fills `SessionEntry::title` for local Claude sessions by reading
+/// `<projects_root>/<encoded project>/<session id>.jsonl`.
+pub(crate) fn enrich_claude_session_titles(
+    sessions: &[SessionEntry],
+    project: &str,
+    projects_root: &std::path::Path,
+) -> Vec<SessionEntry> {
+    let project_dir = projects_root.join(encode_project_dir(project));
+    sessions
+        .iter()
+        .map(|entry| {
+            let mut entry = entry.clone();
+            entry.title = read_session_title(&project_dir.join(format!("{}.jsonl", entry.id)));
+            entry
+        })
+        .collect()
+}
+
 pub(crate) fn parse_history(reader: impl BufRead) -> ClaudeHistorySnapshot {
     let mut recent_projects: HashMap<String, i64> = HashMap::new();
     let mut sessions_by_project: HashMap<String, HashMap<String, (i64, String)>> = HashMap::new();
@@ -225,7 +323,12 @@ pub(crate) fn parse_history(reader: impl BufRead) -> ClaudeHistorySnapshot {
         .map(|(project, sessions)| {
             let mut sessions = sessions
                 .into_iter()
-                .map(|(id, (ts, display))| SessionEntry { id, display, ts })
+                .map(|(id, (ts, display))| SessionEntry {
+                    id,
+                    display,
+                    ts,
+                    title: None,
+                })
                 .collect::<Vec<_>>();
             sessions.sort_by(|left, right| right.ts.cmp(&left.ts));
             (project, sessions)
@@ -239,6 +342,7 @@ pub(crate) fn parse_history(reader: impl BufRead) -> ClaudeHistorySnapshot {
             .map(|(project, _)| project)
             .collect(),
         sessions_by_project,
+        titles: HashMap::new(),
     }
 }
 
@@ -285,11 +389,15 @@ fn load_history_snapshot_from_path(
 
 #[tauri::command]
 pub fn load_claude_sessions(target_dir: String) -> Result<Vec<SessionEntry>, String> {
-    Ok(load_history_snapshot()?
+    let sessions = load_history_snapshot()?
         .sessions_by_project
         .get(&target_dir)
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default();
+    let Some(projects_root) = dirs::home_dir().map(|home| home.join(".claude").join("projects")) else {
+        return Ok(sessions);
+    };
+    Ok(enrich_claude_session_titles(&sessions, &target_dir, &projects_root))
 }
 
 #[tauri::command]
@@ -332,11 +440,13 @@ mod tests {
                     id: "s1".to_string(),
                     display: "new".to_string(),
                     ts: 200,
+                    title: None,
                 },
                 SessionEntry {
                     id: "s3".to_string(),
                     display: "other".to_string(),
                     ts: 150,
+                    title: None,
                 },
             ])
         );
@@ -346,6 +456,7 @@ mod tests {
                 id: "empty-project".to_string(),
                 display: String::new(),
                 ts: 400,
+                title: None,
             }])
         );
     }
@@ -383,5 +494,90 @@ mod tests {
 
         assert_eq!(first.recent_projects, vec!["first"]);
         assert_eq!(second.recent_projects, vec!["second-longer"]);
+    }
+
+    #[test]
+    fn encode_project_dir_replaces_non_alphanumerics() {
+        assert_eq!(encode_project_dir("D:\\project\\cc-launcher"), "D--project-cc-launcher");
+        assert_eq!(encode_project_dir("C:\\Users\\30919"), "C--Users-30919");
+        assert_eq!(encode_project_dir("/home/paul/foo"), "-home-paul-foo");
+        // Non-ASCII characters map one-to-one to dashes (verified against the
+        // directories Claude Code actually creates).
+        assert_eq!(encode_project_dir("D:\\work\\体感游戏调研"), "D--work-------");
+    }
+
+    #[test]
+    fn read_session_title_picks_last_ai_title_line() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("s1.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"s1\"}\n",
+                "{\"type\":\"ai-title\",\"aiTitle\":\"old title\",\"sessionId\":\"s1\"}\n",
+                "not-json\n",
+                "{\"type\":\"ai-title\",\"aiTitle\":\"new title\",\"sessionId\":\"s1\"}\n",
+                "{\"type\":\"ai-title\",\"aiTitle\":\"  \",\"sessionId\":\"s1\"}\n",
+                "{\"type\":\"summary\",\"summary\":\"nope\",\"sessionId\":\"s1\"}\n",
+            ),
+        )
+        .expect("write session file");
+
+        assert_eq!(read_session_title(&path).as_deref(), Some("new title"));
+    }
+
+    #[test]
+    fn read_session_title_missing_or_titleless_file_is_none() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        assert_eq!(read_session_title(&directory.path().join("absent.jsonl")), None);
+
+        let path = directory.path().join("plain.jsonl");
+        std::fs::write(&path, "{\"type\":\"user\",\"sessionId\":\"s2\"}\n").expect("write file");
+        assert_eq!(read_session_title(&path), None);
+    }
+
+    #[test]
+    fn read_session_title_falls_back_to_full_scan() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("big.jsonl");
+        // Title in the first half, padding beyond the tail window afterwards.
+        let mut content = String::from("{\"type\":\"ai-title\",\"aiTitle\":\"early\",\"sessionId\":\"s3\"}\n");
+        content.push_str(&"x".repeat(TITLE_SCAN_WINDOW as usize + 64));
+        content.push('\n');
+        std::fs::write(&path, content).expect("write padded file");
+
+        assert_eq!(read_session_title(&path).as_deref(), Some("early"));
+    }
+
+    #[test]
+    fn enrich_titles_reads_per_session_files() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let project_dir = directory.path().join("D--project-foo");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::write(
+            project_dir.join("s1.jsonl"),
+            "{\"type\":\"ai-title\",\"aiTitle\":\"官方标题\",\"sessionId\":\"s1\"}\n",
+        )
+        .expect("write s1");
+
+        let sessions = vec![
+            SessionEntry {
+                id: "s1".to_string(),
+                display: "prompt one".to_string(),
+                ts: 1,
+                title: None,
+            },
+            SessionEntry {
+                id: "missing".to_string(),
+                display: "prompt two".to_string(),
+                ts: 2,
+                title: None,
+            },
+        ];
+
+        let enriched = enrich_claude_session_titles(&sessions, "D:\\project\\foo", directory.path());
+        assert_eq!(enriched[0].title.as_deref(), Some("官方标题"));
+        assert_eq!(enriched[0].display, "prompt one");
+        assert_eq!(enriched[1].title, None);
     }
 }

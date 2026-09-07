@@ -222,6 +222,8 @@ export interface SessionEntry {
   id: string
   display: string
   ts: number
+  /** Claude Code 官方 AI 会话标题（来自会话文件的 ai-title 行），可能不存在 */
+  title?: string
 }
 
 export interface WindowState {

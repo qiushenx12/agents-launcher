@@ -42,8 +42,12 @@ const CHECK_SCRIPT: &str = r#"if command -v claude >/dev/null 2>&1 || grep -qs "
 // Prints the distro name and $HOME as header lines, then the raw history file
 // (absent history is fine — the launcher treats it as an empty project list).
 const LIST_PROJECTS_SCRIPT: &str = r#"printf '%s\n' "$WSL_DISTRO_NAME"; printf '%s\n' "$HOME"; if [ -f "$HOME/.claude/history.jsonl" ]; then cat "$HOME/.claude/history.jsonl"; fi"#;
-const READ_HISTORY_SCRIPT: &str =
-    r#"if [ -f "$HOME/.claude/history.jsonl" ]; then cat "$HOME/.claude/history.jsonl"; fi"#;
+// Prints the raw history file, then a marker line, then the last
+// `{"type":"ai-title",...}` line of every session file
+// (`~/.claude/projects/<dir>/<id>.jsonl`) — one line per session that has a
+// title. Missing history or projects directory is fine.
+const TITLES_MARKER: &str = "__CL_LAUNCHER_TITLES__";
+const READ_HISTORY_SCRIPT: &str = r#"if [ -f "$HOME/.claude/history.jsonl" ]; then cat "$HOME/.claude/history.jsonl"; fi; printf '\n%s\n' "__CL_LAUNCHER_TITLES__"; find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' -print0 2>/dev/null | xargs -0 -r awk 'FNR == 1 { if (last != "") print last; last = "" } /"type":"ai-title"/ { last = $0 } END { if (last != "") print last }'"#;
 
 // ---------------------------------------------------------------------------
 // wsl.exe helper
@@ -209,6 +213,35 @@ pub fn parse_wsl_project_listing(stdout: &str) -> (String, String, Vec<String>) 
     (distro, home, snapshot.recent_projects)
 }
 
+/// Parses the combined `READ_HISTORY_SCRIPT` output: history JSONL up to the
+/// `TITLES_MARKER`, then one last-`ai-title` JSON line per session after it.
+/// The marker may be absent (e.g. older callers); titles then stay empty.
+pub(crate) fn parse_wsl_history_output(stdout: &str) -> ClaudeHistorySnapshot {
+    let (history_part, titles_part) = match stdout.find(TITLES_MARKER) {
+        Some(index) => (&stdout[..index], &stdout[index + TITLES_MARKER.len()..]),
+        None => (stdout, ""),
+    };
+    let mut snapshot = crate::session_manager::parse_history(std::io::Cursor::new(history_part));
+    for line in titles_part.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.contains("ai-title") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("ai-title") {
+            continue;
+        }
+        let session_id = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
+        let title = value.get("aiTitle").and_then(Value::as_str).unwrap_or("").trim();
+        if !session_id.is_empty() && !title.is_empty() {
+            snapshot.titles.insert(session_id.to_string(), title.to_string());
+        }
+    }
+    snapshot
+}
+
 /// Lists Claude Code projects known to the default WSL distro, along with the
 /// UNC path of the distro's home directory for the "add project" picker.
 #[tauri::command]
@@ -279,7 +312,7 @@ async fn load_wsl_history_snapshot() -> Result<Arc<ClaudeHistorySnapshot>, Strin
     if !ok {
         return Err(wsl_error_text("读取 WSL 会话历史", &stderr));
     }
-    let snapshot = Arc::new(crate::session_manager::parse_history(std::io::Cursor::new(stdout)));
+    let snapshot = Arc::new(parse_wsl_history_output(&stdout));
     let mut cache = wsl_history_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -294,11 +327,18 @@ pub async fn load_wsl_claude_sessions(target_dir: String) -> Result<Vec<SessionE
     #[cfg(windows)]
     {
         let snapshot = load_wsl_history_snapshot().await?;
-        Ok(snapshot
+        let mut sessions = snapshot
             .sessions_by_project
             .get(&target_dir)
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        // Titles arrive in one batch per distro read; attach by session id.
+        for entry in &mut sessions {
+            if entry.title.is_none() {
+                entry.title = snapshot.titles.get(&entry.id).cloned();
+            }
+        }
+        Ok(sessions)
     }
     #[cfg(not(windows))]
     {
@@ -468,6 +508,45 @@ mod tests {
         assert_eq!(distro, "Ubuntu");
         assert_eq!(home, "/home/paul");
         assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn parse_history_output_splits_marker_and_collects_titles() {
+        let stdout = concat!(
+            "{\"project\":\"/home/paul/foo\",\"sessionId\":\"s1\",\"timestamp\":10,\"display\":\"x\"}\n",
+            "{\"project\":\"/home/paul/foo\",\"sessionId\":\"s2\",\"timestamp\":20,\"display\":\"y\"}\n",
+            "\n",
+            "__CL_LAUNCHER_TITLES__\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"正式标题\",\"sessionId\":\"s1\"}\n",
+            "not-json\n",
+            "{\"type\":\"summary\",\"summary\":\"other\",\"sessionId\":\"s1\"}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"\",\"sessionId\":\"s2\"}\n",
+        );
+
+        let snapshot = parse_wsl_history_output(stdout);
+        assert_eq!(
+            snapshot.sessions_by_project.get("/home/paul/foo").map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            snapshot.titles.get("s1"),
+            Some(&"正式标题".to_string())
+        );
+        // Blank titles and non-title lines are not collected.
+        assert!(!snapshot.titles.contains_key("s2"));
+        assert_eq!(snapshot.titles.len(), 1);
+    }
+
+    #[test]
+    fn parse_history_output_without_marker_keeps_history_and_no_titles() {
+        let stdout =
+            "{\"project\":\"/home/paul/foo\",\"sessionId\":\"s1\",\"timestamp\":10,\"display\":\"x\"}\n";
+        let snapshot = parse_wsl_history_output(stdout);
+        assert_eq!(
+            snapshot.sessions_by_project.get("/home/paul/foo").map(Vec::len),
+            Some(1)
+        );
+        assert!(snapshot.titles.is_empty());
     }
 
     #[test]

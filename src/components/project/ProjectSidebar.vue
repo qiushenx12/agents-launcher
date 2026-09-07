@@ -10,7 +10,7 @@
         :title="projectListExpanded ? '收起项目列表' : '展开项目列表'"
         @click="projectListExpanded = !projectListExpanded"
       >
-        {{ CLI_DESCRIPTORS[store.activeCliKind].label }} 项目{{ store.activeCliKind === 'claude' && store.claudeWslMode ? '（WSL）' : '' }}
+        项目{{ store.activeCliKind === 'claude' && store.claudeWslMode ? '（WSL）' : '' }}
         <span>{{ projectListExpanded ? '▾' : '▸' }}</span>
       </button>
       <div class="project-sidebar__actions">
@@ -215,7 +215,6 @@ import { useProjectStore } from '@/stores/project'
 import type { Project, ProjectSession, ProjectSortMode } from '@/stores/project'
 import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import { useDragReorder } from '@/composables/useDragReorder'
-import { CLI_DESCRIPTORS } from '@/types/cli'
 import { usePlatform } from '@/composables/usePlatform'
 
 const store = useProjectStore()
