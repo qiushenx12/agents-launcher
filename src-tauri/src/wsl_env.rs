@@ -13,40 +13,59 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
+
+#[cfg(windows)]
+use std::time::Duration;
+#[cfg(windows)]
+use serde_json::Map;
+#[cfg(windows)]
 use tokio::io::AsyncWriteExt;
+#[cfg(windows)]
 use tokio::process::Command;
 
 use crate::session_manager::{ClaudeHistorySnapshot, SessionEntry};
 
+#[cfg(windows)]
 const WSL_TIMEOUT: Duration = Duration::from_secs(60);
 // The WSL history snapshot crosses process boundaries (wsl.exe spawn per read),
 // so per-project session syncs share one cached snapshot for a short window.
+#[cfg(windows)]
 const WSL_HISTORY_CACHE_TTL: Duration = Duration::from_secs(10);
 
 const BLOCK_START: &str = "# >>> Agents Launcher: Claude Code env >>>";
 const BLOCK_END: &str = "# <<< Agents Launcher: Claude Code env <<<";
 
 // Scripts run as a single argv element via `wsl.exe -e bash -c <script>`.
+#[cfg(windows)]
 const READ_BASHRC_SCRIPT: &str =
     r#"if [ -f "$HOME/.bashrc" ]; then cp "$HOME/.bashrc" "$HOME/.bashrc.cl-launcher.bak"; cat "$HOME/.bashrc"; fi"#;
+#[cfg(windows)]
 const WRITE_BASHRC_SCRIPT: &str = r#"cat > "$HOME/.bashrc""#;
+#[cfg(windows)]
 const READ_SETTINGS_SCRIPT: &str =
     r#"if [ -f "$HOME/.claude/settings.json" ]; then cp "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.cl-launcher.bak"; cat "$HOME/.claude/settings.json"; fi"#;
+#[cfg(windows)]
 const WRITE_SETTINGS_SCRIPT: &str =
     r#"mkdir -p "$HOME/.claude" && cat > "$HOME/.claude/settings.json""#;
+#[cfg(windows)]
 const CHECK_SCRIPT: &str = r#"if command -v claude >/dev/null 2>&1 || grep -qs "alias claude=" "$HOME/.bashrc"; then echo WSL_CLAUDE_OK; else echo WSL_CLAUDE_MISSING; fi"#;
 // Prints the distro name and $HOME as header lines, then the raw history file
 // (absent history is fine — the launcher treats it as an empty project list).
+#[cfg(windows)]
 const LIST_PROJECTS_SCRIPT: &str = r#"printf '%s\n' "$WSL_DISTRO_NAME"; printf '%s\n' "$HOME"; if [ -f "$HOME/.claude/history.jsonl" ]; then cat "$HOME/.claude/history.jsonl"; fi"#;
 // Prints the raw history file, then a marker line, then the last
 // `{"type":"ai-title",...}` line of every session file
 // (`~/.claude/projects/<dir>/<id>.jsonl`) — one line per session that has a
 // title. Missing history or projects directory is fine.
+// Referenced by parse_wsl_history_output (unit tested on all platforms) and
+// by READ_HISTORY_SCRIPT (Windows only), so it is dead on other platforms.
+#[cfg_attr(not(windows), allow(dead_code))]
 const TITLES_MARKER: &str = "__CL_LAUNCHER_TITLES__";
+#[cfg(windows)]
 const READ_HISTORY_SCRIPT: &str = r#"if [ -f "$HOME/.claude/history.jsonl" ]; then cat "$HOME/.claude/history.jsonl"; fi; printf '\n%s\n' "__CL_LAUNCHER_TITLES__"; find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' -print0 2>/dev/null | xargs -0 -r awk 'FNR == 1 { if (last != "") print last; last = "" } /"type":"ai-title"/ { last = $0 } END { if (last != "") print last }'"#;
 
 // ---------------------------------------------------------------------------
@@ -55,53 +74,44 @@ const READ_HISTORY_SCRIPT: &str = r#"if [ -f "$HOME/.claude/history.jsonl" ]; th
 
 /// Runs `wsl.exe -e bash -c <script>` (optionally feeding stdin) and returns
 /// (exit_success, stdout, stderr). Spawning a missing wsl.exe is an error.
+#[cfg(windows)]
 async fn run_wsl_bash(script: &str, stdin: Option<&str>) -> std::io::Result<(bool, String, String)> {
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let mut command = Command::new("wsl.exe");
-        command.args(["-e", "bash", "-c", script]);
-        command.creation_flags(CREATE_NO_WINDOW);
-        command.stdin(std::process::Stdio::piped());
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-        command.kill_on_drop(true);
+    let mut command = Command::new("wsl.exe");
+    command.args(["-e", "bash", "-c", script]);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
 
-        let mut child = command
-            .spawn()
-            .map_err(|e| std::io::Error::new(e.kind(), format!("无法启动 wsl.exe: {e}")))?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("无法启动 wsl.exe: {e}")))?;
 
-        if let Some(content) = stdin {
-            if let Some(mut handle) = child.stdin.take() {
-                handle.write_all(content.as_bytes()).await?;
-            }
+    if let Some(content) = stdin {
+        if let Some(mut handle) = child.stdin.take() {
+            handle.write_all(content.as_bytes()).await?;
         }
-        // Drop the pipe so the child sees EOF.
-        drop(child.stdin.take());
+    }
+    // Drop the pipe so the child sees EOF.
+    drop(child.stdin.take());
 
-        let output = tokio::time::timeout(WSL_TIMEOUT, child.wait_with_output())
-            .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "wsl.exe timed out")
-            })?
-            .map_err(|e| std::io::Error::new(e.kind(), format!("wsl.exe 执行失败: {e}")))?;
-        Ok((
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ))
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (script, stdin);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "WSL 仅支持 Windows",
-        ))
-    }
+    let output = tokio::time::timeout(WSL_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "wsl.exe timed out")
+        })?
+        .map_err(|e| std::io::Error::new(e.kind(), format!("wsl.exe 执行失败: {e}")))?;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
 }
 
+#[cfg(windows)]
 fn wsl_error(step: &str, e: std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::TimedOut => {
@@ -113,6 +123,7 @@ fn wsl_error(step: &str, e: std::io::Error) -> String {
     }
 }
 
+#[cfg(windows)]
 fn wsl_error_text(step: &str, stderr: &str) -> String {
     let message = stderr.trim().replace(['\r', '\n'], " ");
     if message.is_empty() {
@@ -216,6 +227,9 @@ pub fn parse_wsl_project_listing(stdout: &str) -> (String, String, Vec<String>) 
 /// Parses the combined `READ_HISTORY_SCRIPT` output: history JSONL up to the
 /// `TITLES_MARKER`, then one last-`ai-title` JSON line per session after it.
 /// The marker may be absent (e.g. older callers); titles then stay empty.
+// Kept on all platforms so its unit tests run everywhere; only the Windows
+// history loader calls it in production.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn parse_wsl_history_output(stdout: &str) -> ClaudeHistorySnapshot {
     let (history_part, titles_part) = match stdout.find(TITLES_MARKER) {
         Some(index) => (&stdout[..index], &stdout[index + TITLES_MARKER.len()..]),

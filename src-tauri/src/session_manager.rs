@@ -47,7 +47,9 @@ pub(crate) struct ClaudeHistorySnapshot {
     pub sessions_by_project: HashMap<String, Vec<SessionEntry>>,
     /// Session id → official AI title. Only populated for WSL snapshots (the
     /// distro reports all titles in one batch); local titles are read from
-    /// session files on demand.
+    /// session files on demand. Written on all platforms, but only the
+    /// Windows WSL session loader reads it.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub titles: HashMap<String, String>,
 }
 
