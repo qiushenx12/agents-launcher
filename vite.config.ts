@@ -28,12 +28,28 @@ export default defineConfig({
     target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari16",
     minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
+    // The CodeMirror runtime (editor chunk) is one lazy-loaded bundle that
+    // cannot be split further per package; assets load from local disk in the
+    // desktop app, so the web-oriented 500 kB heuristic doesn't apply.
+    chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {
         manualChunks: {
           vue: ["vue", "pinia"],
           xterm: ["@xterm/xterm", "@xterm/addon-fit", "@xterm/addon-web-links"],
           tauri: ["@tauri-apps/api", "@tauri-apps/plugin-dialog", "@tauri-apps/plugin-shell"],
+          // FilePanel's editor/markdown vendors, split out so the lazy
+          // FilePanel chunk stays small and the vendor chunks are cacheable.
+          editor: [
+            "@codemirror/view",
+            "@codemirror/state",
+            "@codemirror/commands",
+            "@codemirror/language",
+            "@codemirror/lang-markdown",
+            "@codemirror/language-data",
+            "@lezer/highlight",
+          ],
+          markdown: ["markdown-it", "highlight.js"],
         },
       },
     },
