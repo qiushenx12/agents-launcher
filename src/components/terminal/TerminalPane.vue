@@ -304,7 +304,8 @@ watch(() => store.refitSignal, () => {
   position: absolute;
   inset: 0;
   background: #1E1E1E;
-  overflow: hidden;
+  /* Unlike hidden, clip prevents the IME caret from scrolling the whole pane. */
+  overflow: clip;
 }
 
 .terminal-pane__inner {
@@ -340,6 +341,12 @@ watch(() => store.refitSignal, () => {
 .terminal-pane :deep(.xterm-screen) {
   padding-right: 18px !important;
   box-sizing: border-box;
+  /* xterm's unwrapped composition view and matching textarea can extend past
+     the last column. Contain that overflow before it reaches scrollable
+     ancestors, without changing the textarea geometry used by native IMEs.
+     Keep vertical overflow visible; xterm manages scrollback independently. */
+  overflow-x: clip;
+  overflow-y: visible;
 }
 
 /* Thin overlay scrollbar — 5px line that floats over content */
