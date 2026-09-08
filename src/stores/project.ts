@@ -158,9 +158,12 @@ interface WslClaudeProjectList {
 }
 
 // A project path lives inside WSL when it is a distro-local absolute path or
-// already a \\wsl… UNC path picked from the distro share.
+// already a \\wsl… UNC path picked from the distro share. Windows-only
+// heuristic: on macOS every absolute path starts with `/`, so a leading
+// slash must not mark a project as WSL there.
 function isWslProjectPath(path: string) {
-  return path.startsWith('/') || /^\\\\wsl/i.test(path)
+  const { isWindows } = usePlatform()
+  return isWindows.value && (path.startsWith('/') || /^\\\\wsl/i.test(path))
 }
 
 // The distro-local form of a stored WSL project path: Linux paths pass

@@ -15,7 +15,7 @@
       </button>
       <div class="project-sidebar__actions">
         <button
-          v-if="store.activeCliKind === 'claude'"
+          v-if="store.activeCliKind === 'claude' && isWindows"
           class="icon-btn"
           :class="{ 'icon-btn--primary': store.claudeWslMode }"
           :title="store.claudeWslMode ? '切换回 Windows 项目' : '切换到 WSL 项目'"
@@ -218,7 +218,7 @@ import { useDragReorder } from '@/composables/useDragReorder'
 import { usePlatform } from '@/composables/usePlatform'
 
 const store = useProjectStore()
-const { isMacOS } = usePlatform()
+const { isWindows, isMacOS } = usePlatform()
 const emit = defineEmits<{
   (event: 'open-settings', mouseEvent: MouseEvent): void
 }>()
@@ -758,6 +758,7 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   border: 0;
   background: transparent;
   color: var(--text-primary);
+  font-size: var(--font-size-title);
   font-weight: 700;
   cursor: pointer;
 }
