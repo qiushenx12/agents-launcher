@@ -131,7 +131,7 @@ Claude Code, Codex, and OpenCode share UI and project abstractions, but their ru
 - Preserve unknown fields when rewriting supported external configuration files.
 - Use `file_transaction` helpers for atomic writes, verified backups, and rollback.
 - Never log, serialize into diagnostics, or expose API keys and tokens to the frontend unnecessarily.
-- The dsh access token is the one exception and is delivered to the frontend on purpose (copy link and QR code). Keep it in `DshRuntimePanel` component state only: never in a Pinia store, never on disk, never in `safeDiagnostic`, and always redact `token=` from backend diagnostics.
+- The dsh access token is the one exception and is delivered to the frontend on purpose (the per-address access list: its copy buttons and QR codes). Keep it in component state only — the `useDshLink` composable behind `DshConfigPanel.vue`: never in a Pinia store, never on disk, never in `safeDiagnostic`, and always redact `token=` from backend diagnostics. The panel shows each address without its token (`urlHostPort`) and hands out the token-bearing URL only when a row action asks for it.
 - Codex and OpenCode managed secrets use Windows DPAPI where supported.
 - Keep migration logic idempotent and cover legacy or interrupted-write cases with fixtures.
 

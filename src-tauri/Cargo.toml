@@ -70,4 +70,9 @@ windows = { version = "0.58", features = [
   "Win32_System_Environment",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Graphics_Dwm",
+  # Interface address enumeration for the dsh access list: one URL per way into
+  # the running service (本机 / 局域网 / Tailscale) instead of one guessed one.
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
 ] }

@@ -14,7 +14,7 @@
 //! three things an unpinned dsh release can move out from under us.
 
 use std::collections::VecDeque;
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,7 +107,8 @@ pub struct DshRuntimeStatus {
     /// User-facing Chinese description, rendered verbatim.
     pub message: String,
     /// Short machine-readable code for the failed phase:
-    /// `port_in_use` / `npx_missing` / `spawn_failed` / `ready_timeout` / `exited`.
+    /// `port_in_use` / `npx_missing` / `spawn_failed` / `ready_timeout` /
+    /// `exited` / `stop_failed`.
     pub issue: Option<String>,
     /// Sanitized tail of stderr, populated for failed starts only.
     pub detail: Option<String>,
@@ -132,6 +133,58 @@ pub struct DshPortStatus {
 pub struct DshRuntimeUrls {
     pub local_url: String,
     pub remote_url: Option<String>,
+    /// Every interface address the running service answers on, each with its own
+    /// token-bearing URL, ordered 本地 → 局域网 → Tailscale → 其它.
+    ///
+    /// One `remote_url` is not enough: `dsh web` picks a single non-loopback
+    /// address for its `(LAN: …)` segment and that pick can be the Tailscale
+    /// one, which is useless to a phone on the same Wi-Fi. The panel lists what
+    /// the machine actually has instead of guessing.
+    pub addresses: Vec<DshAccessAddress>,
+}
+
+/// Which network an entry point belongs to. The panel groups and labels the
+/// access list by this; it is a stable identifier, not display copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DshAddressKind {
+    /// `127.0.0.1`: reachable from this machine only.
+    Loopback,
+    /// A private-range address (`10/8`, `172.16/12`, `192.168/16`) of a local
+    /// interface: the address another device on the same network can open.
+    Lan,
+    /// A Tailscale address. Tailscale hands out `100.64.0.0/10` (CGNAT), which
+    /// is a different audience from the LAN: only devices in the same tailnet.
+    Tailscale,
+    /// Anything else the host answers on (a public or corporate address).
+    Other,
+}
+
+impl DshAddressKind {
+    /// Display order rank. Stable so the list does not reshuffle between reads.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Loopback => 0,
+            Self::Lan => 1,
+            Self::Tailscale => 2,
+            Self::Other => 3,
+        }
+    }
+}
+
+/// One way into the running service: the address plus the URL that carries this
+/// process's access token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshAccessAddress {
+    pub kind: DshAddressKind,
+    /// Bare IPv4 address, e.g. `192.168.1.5` or `100.101.102.103`.
+    pub address: String,
+    /// Interface name when the OS reports one (`WLAN`, `Tailscale`, `en0`); it
+    /// is what makes a list of four look-alike numbers readable.
+    pub interface: Option<String>,
+    /// Token-bearing URL. Never logged, never persisted, never in diagnostics.
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,6 +228,18 @@ struct DshRegistry {
 fn registry() -> &'static Mutex<DshRegistry> {
     static REGISTRY: OnceLock<Mutex<DshRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(DshRegistry::default()))
+}
+
+static DSH_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+fn shutdown_requested() -> bool {
+    DSH_SHUTTING_DOWN.load(Ordering::Acquire)
+}
+
+fn request_shutdown() {
+    // This flag is process-lifetime state: once application exit begins, no
+    // later dsh start may publish a child after the exit hook looked for one.
+    DSH_SHUTTING_DOWN.store(true, Ordering::Release);
 }
 
 fn lock_registry() -> Result<MutexGuard<'static, DshRegistry>, String> {
@@ -319,6 +384,311 @@ pub fn sanitize_diagnostic(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Access addresses (本机 / 局域网 / Tailscale)
+// ---------------------------------------------------------------------------
+
+/// One IPv4 address an interface of this machine currently carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalAddress {
+    ip: Ipv4Addr,
+    /// Interface name as the OS reports it (`WLAN`, `Tailscale`, `en0`).
+    interface: Option<String>,
+    /// True when the owning adapter has a default gateway. Such an adapter is a
+    /// real network rather than a virtual switch a hypervisor created, so its
+    /// address is the better default for «复制链接».
+    has_gateway: bool,
+}
+
+/// `100.64.0.0/10` — the CGNAT range Tailscale assigns.
+fn is_tailscale_range(ip: Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    first == 100 && (64..128).contains(&second)
+}
+
+/// RFC 1918 private space, i.e. the addresses a LAN peer normally sees.
+fn is_private_range(ip: Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    first == 10
+        || (first == 172 && (16..32).contains(&second))
+        || (first == 192 && second == 168)
+}
+
+/// Classify one address, or reject it when it cannot be opened by anyone.
+///
+/// The interface name is only a second signal: Tailscale's address range is the
+/// reliable marker, because a renamed adapter would otherwise fall into the LAN
+/// group and be handed out as if a Wi-Fi peer could reach it.
+fn classify_address(ip: Ipv4Addr, interface: Option<&str>) -> Option<DshAddressKind> {
+    if ip.is_loopback() {
+        return Some(DshAddressKind::Loopback);
+    }
+    // 169.254/16 is what an interface reports while it is still asking for a
+    // lease: listing it would offer an address nothing can reach.
+    if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() || ip.is_link_local() {
+        return None;
+    }
+    let named_tailscale = interface
+        .is_some_and(|name| name.to_ascii_lowercase().contains("tailscale"));
+    if named_tailscale || is_tailscale_range(ip) {
+        return Some(DshAddressKind::Tailscale);
+    }
+    if is_private_range(ip) {
+        return Some(DshAddressKind::Lan);
+    }
+    Some(DshAddressKind::Other)
+}
+
+/// IPv4 addresses of every interface that is up, straight from the OS.
+///
+/// Deliberately not derived from the ready line: `dsh web` reports one address
+/// and on a machine that also runs Tailscale that one can be the tailnet
+/// address, which is exactly the case this list exists to fix.
+#[cfg(windows)]
+fn local_ipv4_addresses() -> Vec<LocalAddress> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
+
+    /// `ERROR_BUFFER_OVERFLOW`: the table grew, `size` now holds what it needs.
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    const MAX_ATTEMPTS: usize = 4;
+
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    // One call to learn the size, one to fill the buffer. The first is still
+    // made through the same loop: passing a buffer that happens to be large
+    // enough turns this into a single call.
+    //
+    // The buffer is a `Vec<u64>`, not a `Vec<u8>`: the API writes
+    // `IP_ADAPTER_ADDRESSES_LH` (and its linked lists) into it, and reading those
+    // out of a byte buffer would be a misaligned reference.
+    let mut size: u32 = 15 * 1024;
+    let mut buffer: Vec<u64> = Vec::new();
+    let mut filled = false;
+    for _ in 0..MAX_ATTEMPTS {
+        buffer.resize((size as usize).div_ceil(std::mem::size_of::<u64>()), 0);
+        let result = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_UNSPEC.0),
+                flags,
+                None,
+                Some(buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()),
+                &mut size,
+            )
+        };
+        if result == 0 {
+            filled = true;
+            break;
+        }
+        if result != ERROR_BUFFER_OVERFLOW {
+            return Vec::new();
+        }
+    }
+    if !filled {
+        // A table that will not fit after four attempts is not worth reporting
+        // half of: the caller falls back to the address dsh itself printed.
+        return Vec::new();
+    }
+
+    let mut found = Vec::new();
+    let mut adapter = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    while let Some(current) = unsafe { adapter.as_ref() } {
+        // A down adapter only carries stale addresses, and the software loopback
+        // adapter only carries `127.0.0.1`, which is added explicitly later.
+        if current.OperStatus == IfOperStatusUp && current.IfType != IF_TYPE_SOFTWARE_LOOPBACK {
+            let interface = unsafe { current.FriendlyName.to_string() }
+                .ok()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty());
+            let has_gateway = !current.FirstGatewayAddress.is_null();
+            let mut unicast = current.FirstUnicastAddress;
+            while let Some(entry) = unsafe { unicast.as_ref() } {
+                let socket = entry.Address;
+                if !socket.lpSockaddr.is_null()
+                    && socket.iSockaddrLength as usize >= std::mem::size_of::<SOCKADDR_IN>()
+                {
+                    let raw = unsafe { &*socket.lpSockaddr.cast::<SOCKADDR_IN>() };
+                    if raw.sin_family == AF_INET {
+                        // `sin_addr` is in network byte order.
+                        let ip =
+                            Ipv4Addr::from(u32::from_be(unsafe { raw.sin_addr.S_un.S_addr }));
+                        found.push(LocalAddress {
+                            ip,
+                            interface: interface.clone(),
+                            has_gateway,
+                        });
+                    }
+                }
+                unicast = entry.Next;
+            }
+        }
+        adapter = current.Next;
+    }
+    found
+}
+
+/// POSIX branch: `ifconfig -a`, whose output is not localized and which groups
+/// addresses under a `name: flags=…` header line.
+#[cfg(not(windows))]
+fn local_ipv4_addresses() -> Vec<LocalAddress> {
+    let Ok(output) = hidden_command("ifconfig").arg("-a").output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut found = Vec::new();
+    let mut interface: Option<String> = None;
+    for line in text.lines() {
+        // A header line starts in column zero; every address line is indented.
+        if !line.starts_with([' ', '\t']) {
+            interface = line
+                .split(':')
+                .next()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty());
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // `inet 192.168.1.5 netmask 0xffffff00 broadcast 192.168.1.255`
+        if fields.len() >= 2 && fields[0] == "inet" {
+            if let Ok(ip) = fields[1].parse::<Ipv4Addr>() {
+                found.push(LocalAddress {
+                    ip,
+                    interface: interface.clone(),
+                    // `ifconfig` reports no gateway, and inventing one would make
+                    // the ordering claim something it cannot know.
+                    has_gateway: false,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// `http://127.0.0.1:3080/?token=abc` → `http`.
+fn url_scheme(url: &str) -> Option<&str> {
+    url.split_once("://").map(|(scheme, _)| scheme)
+}
+
+/// `http://192.168.1.5:3080/?token=abc` → `192.168.1.5`.
+fn url_authority_host(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, _) = bracketed.split_once(']')?;
+        return Some(host.to_string());
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// The raw `token` query value of a ready-line URL. Never decoded and never
+/// re-encoded: the value is copied verbatim into the URLs we hand out, so a
+/// token that contains `%` keeps working.
+fn url_token(url: &str) -> Option<String> {
+    let (_, query) = url.split_once('?')?;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("token="))
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+/// Build the access list from the addresses the OS reports.
+///
+/// Split out from {@link access_addresses} so the ordering, the de-duplication
+/// and the URL construction are testable without a running child process.
+fn build_access_addresses(
+    access: DshAccess,
+    port: u16,
+    local_url: &str,
+    lan_url: Option<&str>,
+    enumerated: Vec<LocalAddress>,
+) -> Vec<DshAccessAddress> {
+    // 本地 mode binds loopback only: every other address would be a dead link,
+    // and offering it as "the way in" is worse than not listing it.
+    if access == DshAccess::Local {
+        return vec![DshAccessAddress {
+            kind: DshAddressKind::Loopback,
+            address: url_authority_host(local_url).unwrap_or_else(|| "127.0.0.1".to_string()),
+            interface: None,
+            url: local_url.to_string(),
+        }];
+    }
+
+    let scheme = url_scheme(local_url).unwrap_or("http");
+    let Some(token) = url_token(local_url) else {
+        // Without the token every URL would land on dsh's 401 page, so there is
+        // nothing worth listing.
+        return Vec::new();
+    };
+
+    let mut candidates: Vec<(DshAddressKind, Ipv4Addr, Option<String>, bool)> = Vec::new();
+    {
+        let mut push = |ip: Ipv4Addr, interface: Option<String>, has_gateway: bool| {
+            if candidates.iter().any(|(_, existing, _, _)| *existing == ip) {
+                return;
+            }
+            if let Some(kind) = classify_address(ip, interface.as_deref()) {
+                candidates.push((kind, ip, interface, has_gateway));
+            }
+        };
+
+        for entry in enumerated {
+            push(entry.ip, entry.interface, entry.has_gateway);
+        }
+        // The ready line is ground truth for "dsh considers this address its
+        // LAN one", so it is kept even when the enumeration missed it. It is
+        // added last and without a gateway claim, so a real interface address
+        // still wins the «默认» slot.
+        if let Some(host) = lan_url.and_then(url_authority_host) {
+            if let Ok(ip) = host.parse::<Ipv4Addr>() {
+                push(ip, None, false);
+            }
+        }
+        push(Ipv4Addr::LOCALHOST, None, false);
+    }
+
+    // Stable sort: within one group the OS enumeration order is kept, and
+    // gateway-bearing adapters come first because they lead somewhere.
+    candidates.sort_by_key(|(kind, _, _, has_gateway)| {
+        (kind.rank(), if *has_gateway { 0 } else { 1 })
+    });
+
+    candidates
+        .into_iter()
+        .map(|(kind, ip, interface, _)| DshAccessAddress {
+            kind,
+            address: ip.to_string(),
+            interface,
+            url: format!("{scheme}://{ip}:{port}/?token={token}"),
+        })
+        .collect()
+}
+
+/// The access list of a running server.
+fn access_addresses(server: &DshServer) -> Vec<DshAccessAddress> {
+    build_access_addresses(
+        server.access,
+        server.port,
+        &server.local_url,
+        server.lan_url.as_deref(),
+        local_ipv4_addresses(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // npx resolution and command construction
 // ---------------------------------------------------------------------------
 
@@ -336,6 +706,18 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+/// Put the launched command at the root of an independently terminable process
+/// tree. Windows uses `taskkill /T` and therefore needs no spawn flag; on Unix
+/// the negative-PID signal used by `terminate_pid` only works when the child is
+/// actually a process-group leader.
+fn configure_process_tree(_command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        _command.process_group(0);
+    }
 }
 
 /// Arguments for `npx`. Launcher flags must precede app arguments: dsh's
@@ -624,8 +1006,13 @@ fn terminate_pid(pid: u32) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let group = pid as i32;
-        unsafe {
-            libc::kill(-group, libc::SIGTERM);
+        let term_result = unsafe { libc::kill(-group, libc::SIGTERM) };
+        if term_result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("无法结束进程组 {group}: {error}"));
+            }
+            return Ok(());
         }
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(25));
@@ -633,8 +1020,12 @@ fn terminate_pid(pid: u32) -> Result<(), String> {
                 return Ok(());
             }
         }
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
+        let kill_result = unsafe { libc::kill(-group, libc::SIGKILL) };
+        if kill_result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("无法强制结束进程组 {group}: {error}"));
+            }
         }
         Ok(())
     }
@@ -908,6 +1299,7 @@ fn spawn_and_wait(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_process_tree(&mut command);
 
     let mut child = command.spawn().map_err(|error| {
         (
@@ -957,11 +1349,26 @@ fn spawn_and_wait(
 
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
+        if shutdown_requested() {
+            progress_active.store(false, Ordering::Relaxed);
+            let detail = with_shutdown_error(
+                stderr_summary(&stderr_tail),
+                terminate_managed_process(&mut child, DshAccess::Local, port),
+            );
+            return Err((
+                "exited".to_string(),
+                "应用正在退出，已取消 dsh 启动。".to_string(),
+                detail,
+            ));
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             progress_active.store(false, Ordering::Relaxed);
             let detail = stderr_summary(&stderr_tail);
-            terminate_child(&mut child);
+            let detail = with_shutdown_error(
+                detail,
+                terminate_managed_process(&mut child, DshAccess::Local, port),
+            );
             return Err((
                 "ready_timeout".to_string(),
                 format!(
@@ -988,6 +1395,10 @@ fn spawn_and_wait(
                 progress_active.store(false, Ordering::Relaxed);
                 let detail = stderr_summary(&stderr_tail);
                 let reason = exit_reason(&mut child);
+                let detail = with_shutdown_error(
+                    detail,
+                    terminate_managed_process(&mut child, DshAccess::Local, port),
+                );
                 return Err((
                     "exited".to_string(),
                     format!("dsh 进程在就绪前退出（{reason}）。"),
@@ -999,6 +1410,10 @@ fn spawn_and_wait(
         if let Ok(Some(status)) = child.try_wait() {
             progress_active.store(false, Ordering::Relaxed);
             let detail = stderr_summary(&stderr_tail);
+            let detail = with_shutdown_error(
+                detail,
+                terminate_managed_process(&mut child, DshAccess::Local, port),
+            );
             return Err((
                 "exited".to_string(),
                 format!("dsh 进程在就绪前退出（{}）。", describe_exit_status(&status)),
@@ -1037,40 +1452,115 @@ fn stderr_summary(tail: &Arc<Mutex<VecDeque<String>>>) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// Terminate the whole process tree. npx spawns `cmd.exe` → `node` → dsh's own
-/// children, so killing only the direct child leaves a live listener behind.
-fn terminate_child(child: &mut Child) {
+/// Terminate the whole process tree and retain every failure for the caller.
+/// npx spawns `cmd.exe` → `node` → dsh's own children, so killing only the
+/// direct child can leave the actual listener alive.
+fn terminate_child(child: &mut Child) -> Vec<String> {
     let pid = child.id();
-    #[cfg(windows)]
-    {
-        let mut command = hidden_command("taskkill");
-        command
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _ = command.output();
-    }
-    #[cfg(unix)]
-    {
-        let group = pid as i32;
-        // `npx` is the direct child and the process-group leader here, so the
-        // whole tree can be signalled at once.
-        unsafe {
-            libc::kill(-group, libc::SIGTERM);
+    let mut errors = Vec::new();
+    let child_was_running = match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(error) => {
+            errors.push(format!("无法查询 dsh 启动进程 PID {pid}: {error}"));
+            true
         }
-        for _ in 0..40 {
-            std::thread::sleep(Duration::from_millis(25));
-            if unsafe { libc::kill(-group, 0) } != 0 {
-                break;
+    };
+    // Never signal an already-reaped PID: Windows may have reused the numeric
+    // identifier. Descendants that outlived their wrapper are handled through
+    // the listener-PID snapshot in `terminate_managed_process`.
+    if child_was_running {
+        if let Err(error) = terminate_pid(pid) {
+            errors.push(error);
+        }
+        if child.try_wait().ok().flatten().is_none() {
+            if let Err(error) = child.kill() {
+                errors.push(format!("无法结束 dsh 启动进程 PID {pid}: {error}"));
             }
         }
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
+    }
+    if let Err(error) = child.wait() {
+        errors.push(format!("无法回收 dsh 启动进程 PID {pid}: {error}"));
+    }
+    errors
+}
+
+fn wait_for_port_release(access: DshAccess, port: u16, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        if !port_is_occupied(access.probe_host(), port) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Stop one supervised server and prove that its listening socket disappeared.
+///
+/// `taskkill /T` normally removes the entire npx tree. The listener PID is also
+/// snapshotted before that operation, because wrappers can exit or re-parent a
+/// descendant while Windows is walking the tree. Only that known PID is used as
+/// a fallback, so a new unrelated process that races onto the port is never
+/// killed.
+fn terminate_managed_process(
+    child: &mut Child,
+    access: DshAccess,
+    port: u16,
+) -> Result<(), String> {
+    let listener_pids = listening_pids(port);
+    let protected = self_process_chain();
+    let mut errors = terminate_child(child);
+
+    // `taskkill` is synchronous, but allow socket teardown to become visible
+    // before reaching for the listener fallback.
+    if wait_for_port_release(access, port, Duration::from_millis(500)) {
+        return Ok(());
+    }
+
+    let still_listening = listening_pids(port);
+    for pid in listener_pids {
+        if !still_listening.contains(&pid) {
+            continue;
+        }
+        if protected.contains(&pid) {
+            errors.push(format!("监听端口 {port} 的 PID {pid} 属于启动器进程链，已拒绝结束。"));
+            continue;
+        }
+        if let Err(error) = terminate_pid(pid) {
+            errors.push(error);
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+
+    if wait_for_port_release(access, port, STOP_GRACE) {
+        return Ok(());
+    }
+
+    let occupant = occupant_label(&listening_processes(port));
+    if errors.is_empty() {
+        errors.push("进程终止命令已返回，但监听端口没有释放。".to_string());
+    }
+    Err(format!(
+        "端口 {port} 仍被 {occupant} 占用。{}",
+        errors.join("；")
+    ))
+}
+
+fn terminate_server(server: &mut DshServer) -> Result<(), String> {
+    terminate_managed_process(&mut server.child, server.access, server.port)
+}
+
+fn with_shutdown_error(detail: Option<String>, outcome: Result<(), String>) -> Option<String> {
+    let Err(error) = outcome else {
+        return detail;
+    };
+    let shutdown = format!("停止残留 dsh 进程失败：{}", sanitize_diagnostic(&error));
+    Some(match detail {
+        Some(detail) if !detail.is_empty() => format!("{detail}\n{shutdown}"),
+        _ => shutdown,
+    })
 }
 
 fn read_version(npx: &Path) -> Option<String> {
@@ -1136,6 +1626,25 @@ fn stopped_status(access: DshAccess, port: u16) -> DshRuntimeStatus {
     }
 }
 
+fn stop_outcome_status(
+    access: DshAccess,
+    port: u16,
+    outcome: Result<(), String>,
+) -> DshRuntimeStatus {
+    match outcome {
+        Ok(()) => stopped_status(access, port),
+        Err(detail) => failure_status(
+            access,
+            port,
+            "stop_failed",
+            &format!(
+                "关闭 DeepSeek Harness 失败，端口 {port} 尚未释放。请重试关闭，或确认后使用「一键清理占用」。"
+            ),
+            Some(sanitize_diagnostic(&detail)),
+        ),
+    }
+}
+
 /// Start (or reuse) the managed server. Runs while holding no registry lock, so
 /// it must be called with `busy` already set.
 fn start_server(app: &AppHandle, access: DshAccess, port: u16) -> DshRuntimeStatus {
@@ -1171,16 +1680,48 @@ fn start_server(app: &AppHandle, access: DshAccess, port: u16) -> DshRuntimeStat
         }
     };
 
-    let version = read_version(&npx);
     let SpawnOutcome {
-        child,
+        mut child,
         local_url,
         lan_url,
     } = outcome;
+    if shutdown_requested() {
+        let detail = with_shutdown_error(
+            None,
+            terminate_managed_process(&mut child, access, port),
+        );
+        return failure_status(
+            access,
+            port,
+            "exited",
+            "应用正在退出，已关闭刚启动的 dsh 服务。",
+            detail,
+        );
+    }
+    let version = read_version(&npx);
+    if shutdown_requested() {
+        let detail = with_shutdown_error(
+            None,
+            terminate_managed_process(&mut child, access, port),
+        );
+        return failure_status(
+            access,
+            port,
+            "exited",
+            "应用正在退出，已关闭刚启动的 dsh 服务。",
+            detail,
+        );
+    }
 
     let mut guard = match lock_registry() {
         Ok(guard) => guard,
-        Err(error) => return failure_status(access, port, "spawn_failed", &error, None),
+        Err(error) => {
+            let detail = with_shutdown_error(
+                None,
+                terminate_managed_process(&mut child, access, port),
+            );
+            return failure_status(access, port, "spawn_failed", &error, detail);
+        }
     };
     guard.failure = None;
     guard.server = Some(DshServer {
@@ -1223,17 +1764,17 @@ fn stop_server() -> DshRuntimeStatus {
     };
     let access = server.access;
     let port = server.port;
-    terminate_child(&mut server.child);
+    // Do not hold the registry while taskkill/process-group shutdown waits. UI
+    // status probes should remain responsive and the `busy` flag already keeps
+    // another start/stop operation out.
+    drop(guard);
 
-    let deadline = Instant::now() + STOP_GRACE;
-    while Instant::now() < deadline {
-        if !port_is_occupied(access.probe_host(), port) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    let status = stop_outcome_status(access, port, terminate_server(&mut server));
+
+    if let Ok(mut guard) = lock_registry() {
+        guard.failure = (status.phase == DshPhase::Failed).then(|| status.clone());
     }
-    guard.failure = None;
-    stopped_status(access, port)
+    status
 }
 
 fn live_status(guard: &mut DshRegistry) -> Option<DshRuntimeStatus> {
@@ -1302,12 +1843,17 @@ pub fn dsh_runtime_status() -> Result<DshRuntimeStatus, String> {
 
 /// URLs are served separately from the polled status so the token-bearing URLs
 /// are only fetched when the UI actually needs them.
+///
+/// The address list is computed per call rather than stored: an interface can
+/// come up (Wi-Fi, a VPN) while the service keeps running, and the panel must
+/// not keep showing yesterday's addresses.
 #[tauri::command]
 pub fn dsh_runtime_urls() -> Result<Option<DshRuntimeUrls>, String> {
     let guard = lock_registry()?;
     Ok(guard.server.as_ref().map(|server| DshRuntimeUrls {
         local_url: server.local_url.clone(),
         remote_url: server.lan_url.clone(),
+        addresses: access_addresses(server),
     }))
 }
 
@@ -1317,6 +1863,9 @@ pub async fn dsh_runtime_start(
     access: String,
     port: u16,
 ) -> Result<DshRuntimeStatus, String> {
+    if shutdown_requested() {
+        return Err("应用正在退出，无法再启动 dsh。".to_string());
+    }
     if port == 0 {
         return Err("端口必须在 1–65535 之间。".to_string());
     }
@@ -1424,11 +1973,33 @@ pub async fn dsh_release_port(port: u16) -> Result<DshPortReleaseReport, String>
 
 /// Stop the managed server during application shutdown.
 pub fn stop() {
-    let Ok(mut guard) = registry().lock() else {
-        return;
-    };
-    if let Some(mut server) = guard.server.take() {
-        terminate_child(&mut server.child);
+    request_shutdown();
+    // A start may still be downloading or waiting for its ready line. Give that
+    // worker time to observe the shutdown flag and run the same verified cleanup
+    // before the application process disappears underneath it.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let Ok(mut guard) = registry().lock() else {
+            return;
+        };
+        let server = guard.server.take();
+        let busy = guard.busy;
+        drop(guard);
+
+        if let Some(mut server) = server {
+            if let Err(error) = terminate_server(&mut server) {
+                eprintln!("退出应用时未能完全关闭 dsh：{}", sanitize_diagnostic(&error));
+            }
+            return;
+        }
+        if !busy {
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("退出应用时等待 dsh 启动任务结束超时。");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -1503,6 +2074,232 @@ mod tests {
         let line = "dsh web: http://127.0.0.1:3080?token=abc";
         let (local, _) = parse_ready_line(line, 3080).expect("ready line should parse");
         assert_eq!(local, "http://127.0.0.1:3080/?token=abc");
+    }
+
+    fn address(ip: &str, interface: Option<&str>, has_gateway: bool) -> LocalAddress {
+        LocalAddress {
+            ip: ip.parse().expect("test address should parse"),
+            interface: interface.map(str::to_string),
+            has_gateway,
+        }
+    }
+
+    #[test]
+    fn addresses_are_classified_by_range_before_anything_else() {
+        assert_eq!(
+            classify_address("127.0.0.1".parse().unwrap(), None),
+            Some(DshAddressKind::Loopback)
+        );
+        // 100.64.0.0/10 is Tailscale's CGNAT range: a LAN peer cannot open it,
+        // which is why it is never filed under 局域网.
+        assert_eq!(
+            classify_address("100.101.102.103".parse().unwrap(), None),
+            Some(DshAddressKind::Tailscale)
+        );
+        assert_eq!(
+            classify_address("100.63.255.255".parse().unwrap(), None),
+            Some(DshAddressKind::Other)
+        );
+        assert_eq!(
+            classify_address("100.128.0.1".parse().unwrap(), None),
+            Some(DshAddressKind::Other)
+        );
+        for lan in ["10.1.2.3", "172.16.0.9", "172.31.255.254", "192.168.1.5"] {
+            assert_eq!(
+                classify_address(lan.parse().unwrap(), None),
+                Some(DshAddressKind::Lan),
+                "{lan} is RFC 1918 space"
+            );
+        }
+        for other in ["172.15.0.1", "172.32.0.1", "192.169.1.1", "8.8.8.8"] {
+            assert_eq!(
+                classify_address(other.parse().unwrap(), None),
+                Some(DshAddressKind::Other),
+                "{other} is not private space"
+            );
+        }
+        // A renamed Tailscale adapter is still Tailscale, and an address nothing
+        // can reach is not offered at all.
+        assert_eq!(
+            classify_address("192.168.1.5".parse().unwrap(), Some("Tailscale")),
+            Some(DshAddressKind::Tailscale)
+        );
+        assert_eq!(classify_address("169.254.10.20".parse().unwrap(), None), None);
+        assert_eq!(classify_address("0.0.0.0".parse().unwrap(), None), None);
+        assert_eq!(classify_address("224.0.0.1".parse().unwrap(), None), None);
+    }
+
+    /// The enumeration is OS-dependent and may legitimately come back empty on a
+    /// locked-down host, but calling it must be harmless and must never produce
+    /// an address that is not a host address at all. Run with `--nocapture` to
+    /// see what this machine reports and how the list comes out.
+    #[test]
+    fn the_host_address_enumeration_is_safe_to_call() {
+        let found = local_ipv4_addresses();
+        let summary: Vec<String> = found
+            .iter()
+            .map(|entry| {
+                let interface = entry.interface.clone().unwrap_or_else(|| "?".to_string());
+                let kind = classify_address(entry.ip, entry.interface.as_deref());
+                format!("{} [{interface}] {kind:?}", entry.ip)
+            })
+            .collect();
+        eprintln!(
+            "[dsh] enumerated {} local IPv4 address(es): {}",
+            found.len(),
+            summary.join(", ")
+        );
+        for entry in &found {
+            assert!(!entry.ip.is_multicast());
+            assert!(!entry.ip.is_unspecified());
+            assert!(!entry.ip.is_broadcast());
+        }
+
+        let listed = build_access_addresses(
+            DshAccess::Remote,
+            3080,
+            "http://127.0.0.1:3080/?token=smoke",
+            None,
+            found,
+        );
+        let order: Vec<String> = listed
+            .iter()
+            .map(|entry| format!("{:?} {}", entry.kind, entry.address))
+            .collect();
+        eprintln!("[dsh] access list: {}", order.join(" | "));
+        // 本机 is what 「打开网页」 falls back to, so it is always listed first.
+        assert_eq!(listed.first().map(|entry| entry.kind), Some(DshAddressKind::Loopback));
+        assert!(listed.iter().all(|entry| entry.url.ends_with("/?token=smoke")));
+    }
+
+    #[test]
+    fn ready_line_urls_are_taken_apart_without_touching_the_token() {
+        let url = "http://192.168.1.5:3080/?token=a.b%2Fc-d";
+        assert_eq!(url_scheme(url), Some("http"));
+        assert_eq!(url_authority_host(url).as_deref(), Some("192.168.1.5"));
+        assert_eq!(url_token(url).as_deref(), Some("a.b%2Fc-d"));
+        assert_eq!(url_authority_host("http://[::1]:3080/?token=x").as_deref(), Some("::1"));
+        assert_eq!(url_authority_host("http://host/?token=x").as_deref(), Some("host"));
+        assert_eq!(url_token("http://127.0.0.1:3080/"), None);
+        assert_eq!(url_authority_host("not a url"), None);
+    }
+
+    /// The whole point of the list: a machine running Tailscale must still offer
+    /// its LAN address first, and it must be the address another device can
+    /// actually open.
+    #[test]
+    fn the_lan_address_wins_the_default_slot_over_tailscale() {
+        let listed = build_access_addresses(
+            DshAccess::Remote,
+            3080,
+            "http://127.0.0.1:3080/?token=t1",
+            Some("http://100.101.102.103:3080/?token=t1"),
+            vec![
+                address("100.101.102.103", Some("Tailscale"), false),
+                address("192.168.1.5", Some("WLAN"), true),
+            ],
+        );
+
+        let order: Vec<DshAddressKind> = listed.iter().map(|entry| entry.kind).collect();
+        assert_eq!(
+            order,
+            vec![
+                DshAddressKind::Loopback,
+                DshAddressKind::Lan,
+                DshAddressKind::Tailscale,
+            ]
+        );
+        assert_eq!(listed[1].address, "192.168.1.5");
+        assert_eq!(listed[1].interface.as_deref(), Some("WLAN"));
+        assert_eq!(listed[2].address, "100.101.102.103");
+        for entry in &listed {
+            assert!(
+                entry.url.ends_with("/?token=t1"),
+                "{} must keep the access token",
+                entry.url
+            );
+        }
+        assert_eq!(listed[1].url, "http://192.168.1.5:3080/?token=t1");
+    }
+
+    /// A real interface (one with a gateway) outranks a hypervisor's virtual
+    /// switch even when the enumeration lists the virtual one first.
+    #[test]
+    fn gateway_bearing_adapters_are_listed_before_virtual_ones() {
+        let listed = build_access_addresses(
+            DshAccess::Remote,
+            3080,
+            "http://127.0.0.1:3080/?token=t",
+            None,
+            vec![
+                address("192.168.56.1", Some("VirtualBox Host-Only"), false),
+                address("192.168.1.5", Some("WLAN"), true),
+            ],
+        );
+        let lan: Vec<&str> = listed
+            .iter()
+            .filter(|entry| entry.kind == DshAddressKind::Lan)
+            .map(|entry| entry.address.as_str())
+            .collect();
+        assert_eq!(lan, vec!["192.168.1.5", "192.168.56.1"]);
+    }
+
+    /// dsh's own LAN URL is kept even when the enumeration missed it, and the
+    /// loopback address is always present exactly once.
+    #[test]
+    fn the_reported_lan_address_is_kept_and_duplicates_are_dropped() {
+        let listed = build_access_addresses(
+            DshAccess::Remote,
+            3199,
+            "http://127.0.0.1:3199/?token=t",
+            Some("http://10.0.0.7:3199/?token=t"),
+            vec![address("127.0.0.1", None, false), address("10.0.0.7", Some("以太网"), true)],
+        );
+        assert_eq!(listed.len(), 2, "the duplicate 10.0.0.7 must appear once");
+        let lan = listed
+            .iter()
+            .find(|entry| entry.kind == DshAddressKind::Lan)
+            .expect("10.0.0.7 should be listed as LAN");
+        // The enumerated entry wins, so its interface name survives.
+        assert_eq!(lan.interface.as_deref(), Some("以太网"));
+        assert_eq!(lan.url, "http://10.0.0.7:3199/?token=t");
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|entry| entry.kind == DshAddressKind::Loopback)
+                .count(),
+            1
+        );
+    }
+
+    /// 本地 mode binds `127.0.0.1`, so listing LAN or Tailscale addresses would
+    /// hand out links that cannot connect.
+    #[test]
+    fn a_local_only_service_lists_nothing_but_loopback() {
+        let listed = build_access_addresses(
+            DshAccess::Local,
+            3080,
+            "http://127.0.0.1:3080/?token=t",
+            None,
+            vec![address("192.168.1.5", Some("WLAN"), true)],
+        );
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, DshAddressKind::Loopback);
+        assert_eq!(listed[0].url, "http://127.0.0.1:3080/?token=t");
+    }
+
+    /// A URL without the token lands on dsh's 401 page, so a detail URL with no
+    /// token yields no list at all rather than unusable entries.
+    #[test]
+    fn the_access_list_is_empty_without_a_token() {
+        let listed = build_access_addresses(
+            DshAccess::Remote,
+            3080,
+            "http://127.0.0.1:3080/",
+            None,
+            vec![address("192.168.1.5", Some("WLAN"), true)],
+        );
+        assert!(listed.is_empty());
     }
 
     #[test]
@@ -1671,5 +2468,108 @@ mod tests {
         assert!(report.failed.is_empty());
         assert!(!report.self_protected);
         assert!(report.message.contains(&port.to_string()));
+    }
+
+    #[test]
+    fn a_failed_stop_is_never_reported_as_stopped() {
+        let status = stop_outcome_status(
+            DshAccess::Remote,
+            3080,
+            Err("node.exe（PID 21436）仍在监听".to_string()),
+        );
+        assert_eq!(status.phase, DshPhase::Failed);
+        assert_eq!(status.issue.as_deref(), Some("stop_failed"));
+        assert!(status.message.contains("端口 3080 尚未释放"));
+        assert!(status
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("PID 21436")));
+
+        let stopped = stop_outcome_status(DshAccess::Remote, 3080, Ok(()));
+        assert_eq!(stopped.phase, DshPhase::Stopped);
+        assert!(stopped.issue.is_none());
+    }
+
+    const PROCESS_TREE_ROLE: &str = "AGENTS_LAUNCHER_DSH_TREE_TEST_ROLE";
+    const PROCESS_TREE_PORT: &str = "AGENTS_LAUNCHER_DSH_TREE_TEST_PORT";
+
+    /// Subprocess entry point for `a_supervised_process_tree_releases_its_port`.
+    /// The first helper waits on a second helper that owns a wildcard listener,
+    /// reproducing the important launcher → wrapper → server shape without
+    /// starting dsh or depending on npm.
+    #[test]
+    fn process_tree_test_helper() {
+        let Ok(role) = std::env::var(PROCESS_TREE_ROLE) else {
+            return;
+        };
+        let port: u16 = std::env::var(PROCESS_TREE_PORT)
+            .expect("tree helper port")
+            .parse()
+            .expect("numeric tree helper port");
+
+        if role == "listener" {
+            let _listener = TcpListener::bind(("0.0.0.0", port)).expect("tree helper listener");
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+
+        assert_eq!(role, "parent");
+        let mut child = Command::new(std::env::current_exe().expect("test executable"));
+        child
+            .args(["--exact", "dsh_runtime::tests::process_tree_test_helper"])
+            .env(PROCESS_TREE_ROLE, "listener")
+            .env(PROCESS_TREE_PORT, port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = child.spawn().expect("listener helper");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_supervised_process_tree_releases_its_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--exact", "dsh_runtime::tests::process_tree_test_helper"])
+            .env(PROCESS_TREE_ROLE, "parent")
+            .env(PROCESS_TREE_PORT, port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_tree(&mut command);
+        let child = command.spawn().expect("parent helper");
+
+        let start_deadline = Instant::now() + Duration::from_secs(5);
+        while !port_is_occupied(DshAccess::Remote.probe_host(), port)
+            && Instant::now() < start_deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut server = DshServer {
+            child,
+            access: DshAccess::Remote,
+            port,
+            local_url: format!("http://127.0.0.1:{port}/?token=test"),
+            lan_url: None,
+            version: None,
+            executable: "test-helper".to_string(),
+            started_at: Instant::now(),
+        };
+        assert!(
+            port_is_occupied(DshAccess::Remote.probe_host(), port),
+            "listener helper did not become ready"
+        );
+        let outcome = terminate_server(&mut server);
+        assert!(outcome.is_ok(), "tree termination failed: {outcome:?}");
+        assert!(
+            !port_is_occupied(DshAccess::Remote.probe_host(), port),
+            "tree listener survived a successful stop"
+        );
     }
 }

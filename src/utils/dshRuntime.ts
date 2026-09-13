@@ -99,36 +99,127 @@ export function hasAccessToken(url: string | null | undefined): boolean {
 export interface DshRuntimeUrls {
   localUrl: string
   remoteUrl: string | null
+  /** Every interface address the running service answers on. */
+  addresses: DshAccessAddress[]
 }
 
 /**
- * Which URL "复制链接" should hand out.
- *
- * The choice follows the configured access scope, because that is the URL the
- * user intends to share:
- *
- * * 本地 → the loopback URL (only this machine can open it),
- * * 远程 → the LAN URL, so a phone or another machine receives something usable.
- *
- * In 远程 mode the LAN URL only exists while the service runs and only when dsh
- * reported one, so the loopback URL is a fallback rather than an error. Every
- * returned URL carries its `token` query parameter — without it the recipient
- * lands on dsh's 401 page, which is exactly the failure this button prevents.
+ * Which network an entry point belongs to. Mirrors `DshAddressKind` in
+ * `src-tauri/src/dsh_runtime.rs`.
  */
-export function pickCopyUrl(
-  urls: DshRuntimeUrls | null | undefined,
-  access: DshAccess,
-): string | null {
-  if (!urls) return null
-  if (access === 'remote' && hasAccessToken(urls.remoteUrl)) return urls.remoteUrl
-  if (hasAccessToken(urls.localUrl)) return urls.localUrl
-  return null
+export type DshAddressKind = 'loopback' | 'lan' | 'tailscale' | 'other'
+
+/** One address the running service answers on, with its token-bearing URL. */
+export interface DshAccessAddress {
+  kind: DshAddressKind
+  /** Bare address, e.g. `192.168.1.5`. */
+  address: string
+  /** Interface name when the OS reports one (`WLAN`, `Tailscale`, `en0`). */
+  interface: string | null
+  /** Token-bearing URL for this address. */
+  url: string
 }
 
-/** Hint text for the copy button, describing which URL it will hand out. */
-export function describeCopyTarget(access: DshAccess, url: string | null): string {
-  if (!url) return '服务运行后才能复制链接'
-  return access === 'remote' ? '将复制局域网链接（含访问令牌）' : '将复制本地链接（含访问令牌）'
+/** Label per kind. `Tailscale` stays untranslated: it is a product name. */
+const ADDRESS_LABELS: Record<DshAddressKind, string> = {
+  loopback: '本机',
+  lan: '局域网',
+  tailscale: 'Tailscale',
+  other: '其它网络',
+}
+
+export function dshAddressLabel(kind: DshAddressKind): string {
+  return ADDRESS_LABELS[kind] ?? ADDRESS_LABELS.other
+}
+
+/**
+ * `http://192.168.1.5:3080/?token=abc` → `192.168.1.5:3080`.
+ *
+ * The panel shows this instead of the whole URL: the token is a full-access
+ * credential and does not belong on screen when the copy button already hands
+ * it out.
+ */
+export function urlHostPort(url: string | null | undefined): string {
+  if (!url) return ''
+  const match = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(url)
+  return match ? match[1] : url
+}
+
+/** One row of the panel's access list. */
+export interface DshAddressRow {
+  kind: DshAddressKind
+  label: string
+  /** Address as shown, e.g. `192.168.1.5:3080`. */
+  display: string
+  interface: string | null
+  /** Token-bearing URL this row's 复制 button hands out. */
+  url: string
+  /** True for the row the plain 「复制链接」 button copies. */
+  preferred: boolean
+}
+
+/**
+ * URLs another device can open, best first: 局域网 → Tailscale → 其它.
+ *
+ * Loopback is excluded on purpose — it is the one address a phone scanning the
+ * QR code can never reach.
+ */
+export function pickShareUrl(urls: DshRuntimeUrls | null | undefined): string | null {
+  const shareable = (urls?.addresses ?? []).filter(
+    (entry) => entry.kind !== 'loopback' && hasAccessToken(entry.url),
+  )
+  const ordered = [
+    ...shareable.filter((entry) => entry.kind === 'lan'),
+    ...shareable.filter((entry) => entry.kind === 'tailscale'),
+    ...shareable.filter((entry) => entry.kind === 'other'),
+  ]
+  if (ordered.length > 0) return ordered[0].url
+  // A run whose enumeration found nothing still reports the LAN URL dsh printed
+  // at startup, which is better than offering nothing to share.
+  return hasAccessToken(urls?.remoteUrl) ? urls!.remoteUrl : null
+}
+
+/**
+ * What 「复制链接」 hands out.
+ *
+ * The choice follows the *running* service rather than the draft access
+ * setting: the backend lists exactly the addresses the service answers on, so
+ * the first shareable one is right in both modes — 局域网 when there is one (a
+ * phone on the same Wi-Fi), otherwise the tailnet, otherwise loopback.
+ */
+export function pickCopyUrl(urls: DshRuntimeUrls | null | undefined): string | null {
+  if (!urls) return null
+  const shared = pickShareUrl(urls)
+  if (shared) return shared
+  if (hasAccessToken(urls.localUrl)) return urls.localUrl
+  const loopback = (urls.addresses ?? []).find(
+    (entry) => entry.kind === 'loopback' && hasAccessToken(entry.url),
+  )
+  return loopback?.url ?? null
+}
+
+/**
+ * Access-list rows for the panel, in the backend's order (本机 → 局域网 →
+ * Tailscale → 其它). Entries without a token are dropped: they would only open
+ * dsh's 401 page.
+ */
+export function dshAddressRows(urls: DshRuntimeUrls | null | undefined): DshAddressRow[] {
+  const entries = (urls?.addresses ?? []).filter((entry) => hasAccessToken(entry.url))
+  const preferred = pickCopyUrl(urls)
+  return entries.map((entry) => ({
+    kind: entry.kind,
+    label: dshAddressLabel(entry.kind),
+    display: urlHostPort(entry.url),
+    interface: entry.interface?.trim() || null,
+    url: entry.url,
+    preferred: entry.url === preferred,
+  }))
+}
+
+/** Hint text for a copy button, naming the address it will hand out. */
+export function describeCopyTarget(row: DshAddressRow | null | undefined): string {
+  if (!row) return '服务运行后才能复制链接'
+  return `将复制「${row.label}」链接：${row.display}（含访问令牌）`
 }
 
 /**

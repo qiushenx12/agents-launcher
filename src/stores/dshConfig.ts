@@ -89,16 +89,24 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
   const portStatus = ref<DshPortStatus | null>(null)
   const portChecking = ref(false)
   const releasing = ref(false)
+  const stopping = ref(false)
   const actionError = ref('')
   /** Non-error feedback, e.g. the result of a port cleanup. */
   const actionNotice = ref('')
   const progress = ref<DshInstallProgress | null>(null)
   /** Set when a saved change needs a service restart to take effect. */
   const pendingRestart = ref(false)
-  /** The LAN QR dialog lives in the configuration panel. */
+  /** The address QR dialog lives in the configuration panel. */
   const qrVisible = ref(false)
   let loadPromise: Promise<void> | null = null
   let progressUnlisten: UnlistenFn | null = null
+  let statusRequestId = 0
+  let portCheckRequestId = 0
+
+  function invalidateStatusRequests() {
+    statusRequestId += 1
+    statusChecking.value = false
+  }
 
   const isDirty = computed(() => (
     access.value !== saved.access || port.value !== saved.port
@@ -106,6 +114,7 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
   const isRunning = computed(() => status.value?.phase === 'running')
   const isBusy = computed(() => (
     status.value?.phase === 'preparing' || status.value?.phase === 'starting'
+    || stopping.value
   ))
   const isRemote = computed(() => access.value === 'remote')
 
@@ -194,32 +203,43 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
   }
 
   async function refreshStatus() {
+    const requestId = ++statusRequestId
     statusChecking.value = true
     try {
       const next = await invoke<DshRuntimeStatus>('dsh_runtime_status')
-      status.value = { ...next, access: normalizeStatusAccess(next.access) }
+      if (requestId === statusRequestId) {
+        status.value = { ...next, access: normalizeStatusAccess(next.access) }
+      }
     } catch (error) {
-      actionError.value = `读取 dsh 运行状态失败：${String(error)}`
+      if (requestId === statusRequestId) {
+        actionError.value = `读取 dsh 运行状态失败：${String(error)}`
+      }
     } finally {
-      statusChecking.value = false
+      if (requestId === statusRequestId) statusChecking.value = false
     }
   }
 
   async function checkPort() {
     if (!isValidDshPort(port.value)) {
+      portCheckRequestId += 1
       portStatus.value = null
+      portChecking.value = false
       return
     }
+    const requestId = ++portCheckRequestId
+    const requestedAccess = access.value
+    const requestedPort = port.value
     portChecking.value = true
     try {
-      portStatus.value = await invoke<DshPortStatus>('dsh_check_port', {
-        access: access.value,
-        port: port.value,
+      const next = await invoke<DshPortStatus>('dsh_check_port', {
+        access: requestedAccess,
+        port: requestedPort,
       })
+      if (requestId === portCheckRequestId) portStatus.value = next
     } catch {
-      portStatus.value = null
+      if (requestId === portCheckRequestId) portStatus.value = null
     } finally {
-      portChecking.value = false
+      if (requestId === portCheckRequestId) portChecking.value = false
     }
   }
 
@@ -297,6 +317,8 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     }
     actionError.value = ''
     actionNotice.value = ''
+    // Invalidate a status poll that began before this explicit transition.
+    invalidateStatusRequests()
     await ensureProgressListener()
     status.value = {
       ...(status.value ?? defaultStatus()),
@@ -308,6 +330,7 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
         access: access.value,
         port: port.value,
       })
+      invalidateStatusRequests()
       status.value = { ...started, access: normalizeStatusAccess(started.access) }
       if (started.phase === 'failed') {
         actionError.value = started.message
@@ -324,22 +347,37 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     }
   }
 
-  async function stop() {
+  async function stop(): Promise<boolean> {
     actionError.value = ''
     actionNotice.value = ''
+    stopping.value = true
+    // A running-state poll may already be in flight. Its answer is older than
+    // the explicit stop result and must never overwrite that result later.
+    invalidateStatusRequests()
     try {
       const stopped = await invoke<DshRuntimeStatus>('dsh_runtime_stop')
+      invalidateStatusRequests()
       status.value = { ...stopped, access: normalizeStatusAccess(stopped.access) }
+      if (stopped.phase !== 'stopped') {
+        actionError.value = stopped.message
+        return false
+      }
       pendingRestart.value = false
+      return true
     } catch (error) {
       actionError.value = String(error)
       await refreshStatus()
+      return false
+    } finally {
+      stopping.value = false
+      // The status card and the port hint must describe the same verified
+      // reality after a stop attempt, successful or otherwise.
+      await checkPort()
     }
   }
 
   async function restart() {
-    await stop()
-    await start()
+    if (await stop()) await start()
   }
 
   return {
@@ -354,6 +392,7 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     portStatus,
     portChecking,
     releasing,
+    stopping,
     actionError,
     actionNotice,
     progress,

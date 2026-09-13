@@ -11,7 +11,7 @@
             class="btn btn-secondary"
             type="button"
             :disabled="store.loading"
-            @click="store.refreshStatus()"
+            @click="refreshStatus()"
           >
             {{ store.statusChecking ? '刷新中…' : '刷新状态' }}
           </button>
@@ -131,31 +131,74 @@
               重启
             </button>
             <button class="btn btn-secondary" type="button" :disabled="store.isBusy" @click="store.stop()">
-              关闭
+              {{ store.stopping ? '关闭中…' : '关闭' }}
             </button>
           </template>
-          <button
-            class="btn btn-secondary"
-            type="button"
-            :disabled="!canCopy || store.isBusy"
-            :title="copyHint"
-            @click="copyCurrentLink"
-          >
-            {{ copied ? '已复制' : '复制链接' }}
-          </button>
-          <button
-            v-if="store.isRemote"
-            class="btn btn-secondary"
-            type="button"
-            :disabled="!canShowQr || store.isBusy"
-            @click="store.openQr()"
-          >
-            二维码
-          </button>
         </div>
-        <p class="field-help field-help--action">
-          {{ copyHint }}
-        </p>
+
+        <!--
+          访问地址清单：同一台机器可能同时有局域网地址和 Tailscale 地址，而 dsh 只
+          上报其中一个（装了 Tailscale 的机器上常常正是 100.x，别的设备反而打不开）。
+          所以这里把本机 / 局域网 / Tailscale 全部列出来，每行自带
+          「二维码 / 复制 / 打开网页」，三个动作都作用于这一行的地址。
+          「默认」标出最可能想用的那一个（局域网优先，其次 Tailscale）。
+        -->
+        <div class="address-list">
+          <div class="address-list__head">
+            <span class="address-list__title">访问地址</span>
+            <span v-if="rows.length" class="address-list__note">
+              复制的内容包含访问令牌，拿到它的人可以操作这台机器上的 agent 与 shell。
+            </span>
+          </div>
+          <ul v-if="rows.length" class="address-list__items">
+            <li v-for="row in rows" :key="row.url" class="address-list__item">
+              <span class="address-list__kind" :class="`address-list__kind--${row.kind}`">
+                {{ row.label }}
+              </span>
+              <code class="address-list__address">{{ row.display }}</code>
+              <span v-if="row.interface" class="address-list__interface">{{ row.interface }}</span>
+              <span v-if="row.preferred" class="address-list__badge">默认</span>
+              <!--
+                二维码只给别的设备能打开的地址：回环地址手机扫了也进不去，所以那里
+                不出现这个按钮。
+              -->
+              <button
+                v-if="needsQr(row)"
+                class="btn btn-secondary address-list__action"
+                type="button"
+                title="用二维码分享这个地址（含访问令牌）"
+                @click="openQr(row)"
+              >
+                二维码
+              </button>
+              <button
+                class="btn btn-secondary address-list__action"
+                type="button"
+                :title="describeCopyTarget(row)"
+                @click="copyRowLink(row)"
+              >
+                {{ copiedKey === row.url ? '已复制' : '复制' }}
+              </button>
+              <button
+                class="btn btn-secondary address-list__action"
+                type="button"
+                :title="`在默认浏览器中打开 ${row.display}（链接中已包含访问令牌）`"
+                @click="openRowLink(row)"
+              >
+                打开网页
+              </button>
+            </li>
+          </ul>
+          <p v-else class="address-list__empty">{{ addressHint }}</p>
+          <!--
+            本地模式只绑 127.0.0.1，所以清单里只有「本机」一行。这里说明另外两类
+            地址为什么不在——否则看起来像是没探测到。
+          -->
+          <p v-if="localOnlyHint" class="address-list__foot">
+            当前服务是「本地」模式，只有这台电脑能访问；把访问范围改为「远程」并重启后，
+            这里会列出局域网与 Tailscale 地址。
+          </p>
+        </div>
 
         <div class="preflight-entry">
           <button class="btn btn-secondary" type="button" @click="workspaceStore.openPreflight()">
@@ -175,7 +218,7 @@
         >
           <section class="dsh-qr-card" role="dialog" aria-modal="true" aria-labelledby="dsh-qr-title">
             <header class="dsh-qr-card__header">
-              <h2 id="dsh-qr-title">扫码打开局域网界面</h2>
+              <h2 id="dsh-qr-title">扫码打开{{ qrKindSuffix }}</h2>
               <button
                 class="dsh-qr-card__close"
                 type="button"
@@ -186,9 +229,9 @@
                 ×
               </button>
             </header>
-            <img v-if="qrDataUrl" :src="qrDataUrl" alt="局域网访问二维码" width="220" height="220">
+            <img v-if="qrDataUrl" :src="qrDataUrl" alt="访问地址二维码" width="220" height="220">
             <p v-else class="dsh-qr-card__pending">正在生成二维码…</p>
-            <code class="dsh-qr-card__url">{{ remoteUrl }}</code>
+            <code class="dsh-qr-card__url">{{ qrTarget?.display }}</code>
             <p class="dsh-qr-card__warning">
               二维码与链接都包含访问令牌，任何拿到它的人都能以你的身份操作这台机器上的 agent 与 shell。
               请仅在可信网络中分享。
@@ -218,6 +261,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { confirm } from '@tauri-apps/plugin-dialog'
+import { open } from '@tauri-apps/plugin-shell'
 import {
   DSH_DEFAULT_PORT,
   DSH_PORT_MAX,
@@ -225,7 +269,7 @@ import {
   useDshConfigStore,
   type DshAccess,
 } from '@/stores/dshConfig'
-import { describeCopyTarget, describeInstallProgress, describePortOccupant, hasAccessToken } from '@/utils/dshRuntime'
+import { describeCopyTarget, describeInstallProgress, describePortOccupant, type DshAddressRow } from '@/utils/dshRuntime'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
 import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
 import { useDshLink } from './useDshLink'
@@ -235,42 +279,89 @@ const store = useDshConfigStore()
 const workspaceStore = useConfigWorkspaceStore()
 
 /**
- * 「复制链接」按访问范围选择要复制的 URL：本地 → 回环地址；远程 → 局域网地址。
- * 两者都带 `?token=`，否则打开的人只会看到 dsh 的 401 页面。
+ * 访问地址清单：后端列出服务实际监听的每个地址（本机 / 局域网 / Tailscale），
+ * 每行自带「二维码 / 复制 / 打开网页」，三个动作都作用于这一行的地址。
+ *
+ * 不再有全局的复制/打开按钮：同一台机器上「想复制哪一个」本来就取决于接收方
+ * 在哪张网里，让用户对着地址选比让按钮猜更可靠。
  */
-const { canCopy, copied, copyUrl, copyLink, urls } = useDshLink({
-  access: computed(() => store.access),
+const { copiedKey, copyAddress, loadUrls, resolveAddress, rows } = useDshLink({
   running: computed(() => store.isRunning),
   onError: (message) => { store.setActionError(message) },
 })
 
-const copyHint = computed(() => (canCopy.value
-  ? describeCopyTarget(store.access, copyUrl.value)
-  : '服务运行后才能复制链接，链接中已包含访问令牌'))
+/** 地址清单为空时的说明：服务没起来时它只是还没内容，不是出错了。 */
+const addressHint = computed(() => (store.isRunning
+  ? '正在读取访问地址…'
+  : '服务运行后，这里会列出本机、局域网与 Tailscale 地址，每个地址都能单独复制。'))
 
-function copyCurrentLink() {
-  void copyLink()
+/**
+ * 运行中的服务如果是「本地」模式，就只会有一行回环地址。判定用运行状态里的
+ * access（服务实际绑定的范围），不是草稿：切到「远程」但还没重启时提示不该出现。
+ */
+const localOnlyHint = computed(() => store.isRunning
+  && store.status?.access === 'local'
+  && rows.value.every((row) => row.kind === 'loopback'))
+
+function copyRowLink(row: DshAddressRow) {
+  void copyAddress(row)
+}
+
+/** 行内的「打开网页」：打开这一行的地址，本机地址就是用本机浏览器打开。 */
+async function openRowLink(row: DshAddressRow) {
+  store.clearActionError()
+  // 服务重启会换令牌，所以先把地址重新解析一次再打开，避免打开一个 401 页面。
+  const value = await resolveAddress(row)
+  if (!value) return
+  try {
+    await open(value)
+  } catch {
+    // Some platform errors echo the full target. Keep the token-bearing URL out
+    // of UI errors and diagnostics even when the system browser cannot open it.
+    store.setActionError('打开网页失败，请检查系统默认浏览器设置。')
+  }
 }
 
 /**
- * 二维码只在「远程」模式下有意义——本地回环地址手机扫了也打不开，所以必须同时
- * 拿到带令牌的局域网 URL 才允许打开。
+ * 二维码按行打开：只有别的设备能打开的地址（局域网 / Tailscale）才需要它——回环
+ * 地址手机扫了也进不去，所以那里不显示按钮。
  */
-const remoteUrl = computed(() => urls.value?.remoteUrl ?? null)
-const canShowQr = computed(() => hasAccessToken(remoteUrl.value))
+const qrTarget = ref<DshAddressRow | null>(null)
 const qrDataUrl = ref('')
 
+function needsQr(row: DshAddressRow): boolean {
+  return row.kind === 'lan' || row.kind === 'tailscale'
+}
+
+/** 「局域网」用引号包住，Tailscale 是拉丁产品名、需要前后空格。 */
+const qrKindSuffix = computed(() => {
+  const row = qrTarget.value
+  if (!row) return '地址'
+  return row.kind === 'tailscale' ? ` ${row.label} 地址` : `「${row.label}」地址`
+})
+
+function openQr(row: DshAddressRow) {
+  qrTarget.value = row
+  store.openQr()
+}
+
 async function renderQr() {
-  if (!store.qrVisible || !canShowQr.value || !remoteUrl.value) {
+  const url = qrTarget.value?.url
+  if (!store.qrVisible || !url) {
     qrDataUrl.value = ''
     return
   }
   const { toDataURL } = await import('qrcode')
-  qrDataUrl.value = await toDataURL(remoteUrl.value, { margin: 1, width: 220 })
+  qrDataUrl.value = await toDataURL(url, { margin: 1, width: 220 })
 }
 
-watch([() => store.qrVisible, remoteUrl], () => {
+watch([() => store.qrVisible, qrTarget], () => {
   void renderQr().catch(() => { qrDataUrl.value = '' })
+})
+
+// 浮层关掉后立刻丢掉二维码指向的地址：它是带令牌的，没有理由留在组件状态里。
+watch(() => store.qrVisible, (visible) => {
+  if (!visible) qrTarget.value = null
 })
 
 // 切回「本地」模式后二维码没有意义，别把它留在屏幕上。
@@ -363,7 +454,7 @@ const statusTone = computed(() => {
 const statusLabel = computed(() => {
   switch (store.status?.phase) {
     case 'running': return '运行中'
-    case 'failed': return '启动失败'
+    case 'failed': return store.status?.issue === 'stop_failed' ? '关闭失败' : '启动失败'
     case 'preparing': return '准备中'
     case 'starting': return '启动中'
     default: return '未启动'
@@ -409,6 +500,10 @@ watch(
   () => {
     if (workspaceStore.activeKind !== 'dsh') return
     void store.checkPort()
+    // 地址清单同样要跟着这两个时机刷新：接口随时可能增减（插网线、连 Wi-Fi、
+    // Tailscale 上线/下线），停在旧地址上会让用户复制到一个已经不可达的链接。
+    // 服务没在跑时 loadUrls 自己会清空，不需要在这里判断。
+    void loadUrls()
   },
   { immediate: true },
 )
@@ -416,6 +511,12 @@ watch(
 // 手动重新检测：探测失败或端口刚被别的程序释放时不必切页重进。
 function recheckPort() {
   void store.checkPort()
+}
+
+/** 「刷新状态」：状态与地址清单一起重取，两者都是"当前现实"。 */
+function refreshStatus() {
+  void store.refreshStatus()
+  void loadUrls()
 }
 </script>
 
@@ -470,7 +571,7 @@ function recheckPort() {
   width: 110px;
   flex: 0 0 auto;
   color: var(--text-secondary);
-  text-align: right;
+  text-align: left;
 }
 
 .field-row > .input {
@@ -482,11 +583,6 @@ function recheckPort() {
   margin: 2px 0 8px 120px;
   color: var(--text-secondary);
   font-size: var(--font-size-small);
-}
-
-/* 操作行下方的说明：与字段行左对齐（120px + 10px 间距），不缩进到标签列。 */
-.field-help--action {
-  margin: 6px 0 0;
 }
 
 /* 端口说明 + 重新检测：占用状态可能随时变化，给一个显式入口。 */
@@ -639,6 +735,114 @@ function recheckPort() {
   color: var(--text-secondary);
   font-size: var(--font-size-small);
   line-height: 1.45;
+}
+
+/*
+  访问地址清单：一个地址一行，复制按钮固定在这一行末尾，所以「复制哪一个」永远
+  是行内唯一按钮，不需要先选中再复制。
+*/
+.address-list {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--separator);
+  border-radius: var(--radius-md);
+  background: var(--tab-bg);
+}
+
+.address-list__head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-bottom: 4px;
+}
+
+.address-list__title {
+  color: var(--text-primary);
+  font-size: var(--font-size-small);
+}
+
+.address-list__note,
+.address-list__empty,
+.address-list__foot {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-small);
+  line-height: 1.5;
+}
+
+/* 清单下方的补充说明：与列表之间留一点距离，读起来是"清单的注脚"。 */
+.address-list__foot {
+  margin-top: 6px;
+}
+
+.address-list__items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.address-list__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+}
+
+.address-list__item + .address-list__item {
+  border-top: 1px solid var(--separator);
+}
+
+/* 分组标签：本机 / 局域网 / Tailscale / 其它网络。 */
+.address-list__kind {
+  flex: 0 0 auto;
+  width: 68px;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-secondary) 18%, transparent);
+  font-size: var(--font-size-small);
+  text-align: center;
+}
+
+.address-list__kind--lan {
+  color: var(--success, #22c55e);
+  background: color-mix(in srgb, var(--success, #22c55e) 16%, transparent);
+}
+
+.address-list__kind--tailscale {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 16%, transparent);
+}
+
+.address-list__address {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-size: var(--font-size-small);
+}
+
+.address-list__interface {
+  flex: 0 1 auto;
+  max-width: 140px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--font-size-small);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.address-list__badge {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: var(--font-size-small);
+}
+
+.address-list__action {
+  flex: 0 0 auto;
+  padding: 2px 10px;
+  font-size: var(--font-size-small);
 }
 
 /* 二维码浮层：与启动前检测同层，Teleport 到 body 覆盖全屏（含标题栏）。 */

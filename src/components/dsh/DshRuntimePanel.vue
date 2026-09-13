@@ -10,7 +10,7 @@
     <Transition name="dsh-fade">
       <div v-if="hasError" class="dsh-runtime-panel__error">
         <div class="card dsh-card">
-          <div class="card-title">DeepSeek Harness 启动失败</div>
+          <div class="card-title">DeepSeek Harness {{ errorAction }}失败</div>
           <ConfigStatusBanner :message="store.status?.message || embedError" tone="error" />
           <pre v-if="store.status?.detail" class="dsh-detail">{{ store.status.detail }}</pre>
           <div class="action-row">
@@ -95,6 +95,7 @@ const { error: embedError, apply, hide, close, reload, refresh, reassert, suspen
   })
 
 const hasError = computed(() => store.status?.phase === 'failed')
+const errorAction = computed(() => store.status?.issue === 'stop_failed' ? '关闭' : '启动')
 
 const progressText = computed(() => describeInstallProgress(store.progress))
 

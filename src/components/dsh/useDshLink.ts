@@ -1,33 +1,31 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { pickCopyUrl, type DshAccess } from '@/utils/dshRuntime'
-import type { DshRuntimeUrls } from '@/stores/dshConfig'
+import { dshAddressRows, type DshAddressRow, type DshRuntimeUrls } from '@/utils/dshRuntime'
 
 /**
- * "复制链接" for the dsh panels.
+ * The dsh access list: every address the running service answers on, each with
+ * the token-bearing URL its own row actions (复制 / 打开网页 / 二维码) use.
  *
- * The token-bearing URLs are fetched on demand and held in component-local
- * state only. They are never written to a store, disk, a diagnostic payload or
- * a log, and are dropped when the owning component unmounts.
+ * The panel has no global copy button on purpose — which address is the right
+ * one depends on where the receiving device is (same Wi-Fi, same tailnet), and
+ * only the user knows that.
  *
- * Both the configuration panel and the runtime panel use this composable so
- * there is exactly one place that decides which URL is copied — see
- * `pickCopyUrl`, which follows the access scope and always keeps the token.
+ * The URLs are fetched on demand and held in component-local state only. They
+ * are never written to a store, disk, a diagnostic payload or a log, and are
+ * dropped when the owning component unmounts.
  */
 export function useDshLink(options: {
-  /** Reactive access scope; decides between the loopback and LAN URL. */
-  access: Ref<DshAccess>
   /** Reactive flag: only fetch while the service is running. */
   running: Ref<boolean>
   /** Optional side channel for surfacing failures in the panel. */
   onError?: (message: string) => void
 }) {
   const urls = ref<DshRuntimeUrls | null>(null)
-  const copied = ref(false)
+  /** URL most recently copied, so the row that did it can say 「已复制」. */
+  const copiedKey = ref<string | null>(null)
   let copiedTimer: ReturnType<typeof setTimeout> | null = null
 
-  const copyUrl = computed(() => pickCopyUrl(urls.value, options.access.value))
-  const canCopy = computed(() => copyUrl.value !== null)
+  const rows = computed<DshAddressRow[]>(() => dshAddressRows(urls.value))
 
   async function loadUrls() {
     if (!options.running.value) {
@@ -41,31 +39,49 @@ export function useDshLink(options: {
     }
   }
 
-  function flagCopied() {
-    copied.value = true
+  /**
+   * The current token-bearing URL of a listed address, or null when it is gone.
+   *
+   * Every row action goes through here: a restart issues a new process token, so
+   * the URL captured when the row was rendered is stale the moment the service
+   * comes back, and both copying and opening it would land on dsh's 401 page.
+   */
+  async function resolveAddress(row: DshAddressRow): Promise<string | null> {
+    await loadUrls()
+    const fresh = rows.value.find((entry) => entry.display === row.display)
+    if (!fresh) {
+      options.onError?.('该地址当前不可用，请刷新状态后重试。')
+      return null
+    }
+    return fresh.url
+  }
+
+  function flagCopied(key: string) {
+    copiedKey.value = key
     if (copiedTimer !== null) clearTimeout(copiedTimer)
     copiedTimer = setTimeout(() => {
-      copied.value = false
+      copiedKey.value = null
       copiedTimer = null
     }, 2200)
   }
 
   /** Returns true when the clipboard write succeeded. */
-  async function copyLink(): Promise<boolean> {
-    await loadUrls()
-    const value = copyUrl.value
-    if (!value) {
-      options.onError?.('服务运行后才能复制链接。')
-      return false
-    }
+  async function copyValue(value: string): Promise<boolean> {
     try {
       await navigator.clipboard.writeText(value)
-      flagCopied()
+      flagCopied(value)
       return true
     } catch (error) {
       options.onError?.(`复制失败：${String(error)}`)
       return false
     }
+  }
+
+  /** The 复制 button of one address row. */
+  async function copyAddress(row: DshAddressRow): Promise<boolean> {
+    const value = await resolveAddress(row)
+    if (!value) return false
+    return copyValue(value)
   }
 
   // The URL set changes on every service restart (a new process token), so
@@ -79,7 +95,15 @@ export function useDshLink(options: {
     if (copiedTimer !== null) clearTimeout(copiedTimer)
     // Drop the tokens with the component instead of caching them.
     urls.value = null
+    copiedKey.value = null
   })
 
-  return { urls, copyUrl, canCopy, copied, copyLink, loadUrls }
+  return {
+    urls,
+    rows,
+    copiedKey,
+    copyAddress,
+    resolveAddress,
+    loadUrls,
+  }
 }
