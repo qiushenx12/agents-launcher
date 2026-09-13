@@ -126,6 +126,26 @@ pub struct DshPortStatus {
     pub occupant_is_dsh: bool,
     /// True when the occupant is the dsh service this launcher supervises.
     pub occupant_is_supervised: bool,
+    /// Which networks the occupant serves, so the runtime panel can compare a
+    /// resident dsh instance with the saved 访问范围. `None` when the port is
+    /// free (there is no occupant to describe).
+    pub occupant_listen_scope: Option<DshListenScope>,
+}
+
+/// Whether the listener holding a port answers beyond the loopback interface.
+///
+/// The answer comes from connect probes against the machine's own addresses,
+/// not from parsing socket tables: a wildcard bind (`0.0.0.0`) and a bind to
+/// one concrete interface are indistinguishable from the client side, and for
+/// the panel's «运行配置与保存配置是否一致» check both mean the same thing —
+/// the network can reach this service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DshListenScope {
+    /// Only loopback answers: reachable from this machine only.
+    Local,
+    /// At least one non-loopback address answers: the network can reach it.
+    Remote,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -802,6 +822,23 @@ fn port_occupant_is_dsh(port: u16) -> bool {
             Err(_) => false,
         }
     })
+}
+
+/// Which networks the port's listener answers on, probed from the client side.
+///
+/// Connecting to each of the machine's own non-loopback addresses works for a
+/// wildcard bind and for a concrete-interface bind alike, and it needs no
+/// platform-specific socket-table parsing.
+fn occupant_listen_scope(port: u16) -> DshListenScope {
+    let serves_network = local_ipv4_addresses()
+        .into_iter()
+        .filter(|entry| !entry.ip.is_loopback())
+        .any(|entry| is_listening(SocketAddr::new(std::net::IpAddr::V4(entry.ip), port)));
+    if serves_network {
+        DshListenScope::Remote
+    } else {
+        DshListenScope::Local
+    }
 }
 
 /// What is known about the process holding a port.
@@ -1944,6 +1981,7 @@ pub async fn dsh_check_port(access: Option<String>, port: u16) -> Result<DshPort
                 occupant: None,
                 occupant_is_dsh: false,
                 occupant_is_supervised: false,
+                occupant_listen_scope: None,
             };
         }
         let occupant = describe_occupant(port);
@@ -1952,6 +1990,7 @@ pub async fn dsh_check_port(access: Option<String>, port: u16) -> Result<DshPort
             occupant: Some(occupant.label),
             occupant_is_dsh: occupant.is_dsh,
             occupant_is_supervised: occupant.is_supervised,
+            occupant_listen_scope: Some(occupant_listen_scope(port)),
         }
     })
     .await
@@ -2434,6 +2473,33 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         drop(listener);
         assert!(listening_processes(port).is_empty());
+    }
+
+    /// A loopback-only listener must not be mistaken for a network service:
+    /// the runtime panel compares this scope with the saved 访问范围.
+    #[test]
+    fn a_loopback_listener_reports_local_scope() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        assert_eq!(occupant_listen_scope(port), DshListenScope::Local);
+    }
+
+    /// A wildcard listener answers on the machine's LAN address, not just on
+    /// loopback — the client-side probe is what tells the two bindings apart.
+    #[test]
+    fn a_wildcard_listener_reports_remote_scope() {
+        // A fully offline host has no non-loopback address to probe, so the
+        // assertion would be meaningless there.
+        if !local_ipv4_addresses()
+            .iter()
+            .any(|entry| !entry.ip.is_loopback())
+        {
+            eprintln!("[dsh] no non-loopback address on this host; skipping assertion");
+            return;
+        }
+        let listener = TcpListener::bind("0.0.0.0:0").expect("bind wildcard port");
+        let port = listener.local_addr().expect("local addr").port();
+        assert_eq!(occupant_listen_scope(port), DshListenScope::Remote);
     }
 
     /// The app must never terminate itself: the process chain always contains

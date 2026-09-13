@@ -4,7 +4,11 @@ import {
   shouldOfferPortCleanup,
   describePortCleanupHint,
 } from '../src/components/dsh/portCleanup.ts'
-import { describePortOccupant } from '../src/utils/dshRuntime.ts'
+import {
+  classifyPortConflict,
+  describePortOccupant,
+  describeRuntimePortConflict,
+} from '../src/utils/dshRuntime.ts'
 
 /**
  * Regression tests for the port-occupancy copy in the dsh configuration panel.
@@ -137,4 +141,100 @@ test('清理提示 names the consequence for the occupant that was detected', ()
   assert.match(unrelated, /结束该进程/)
   assert.match(unrelated, /其它端口/)
   assert.doesNotMatch(unrelated, /中断该会话/)
+})
+
+/**
+ * The runtime panel's «清理并启动» card: the conflict classification decides
+ * which explanation the user gets, and the port matches by construction (it is
+ * the saved port that was probed), so the listen scope is the only axis that
+ * can diverge from the saved configuration.
+ */
+test('冲突分类 compares the occupant listen scope with the saved access mode', () => {
+  assert.equal(
+    classifyPortConflict(
+      { occupantIsDsh: false, occupantIsSupervised: false, occupantListenScope: null },
+      'local',
+    ),
+    'other-program',
+  )
+  assert.equal(
+    classifyPortConflict(
+      { occupantIsDsh: true, occupantIsSupervised: true, occupantListenScope: 'local' },
+      'local',
+    ),
+    'supervised',
+    'the launcher-supervised service is never a cleanup target',
+  )
+  assert.equal(
+    classifyPortConflict(
+      { occupantIsDsh: true, occupantIsSupervised: false, occupantListenScope: 'local' },
+      'local',
+    ),
+    'dsh-match',
+  )
+  assert.equal(
+    classifyPortConflict(
+      { occupantIsDsh: true, occupantIsSupervised: false, occupantListenScope: 'remote' },
+      'local',
+    ),
+    'dsh-mismatch',
+    'a remote-listening dsh conflicts with a saved 本地 config',
+  )
+  assert.equal(
+    classifyPortConflict(
+      { occupantIsDsh: true, occupantIsSupervised: false, occupantListenScope: 'local' },
+      'remote',
+    ),
+    'dsh-mismatch',
+    'a loopback-only dsh conflicts with a saved 远程 config',
+  )
+  assert.equal(
+    classifyPortConflict(
+      { occupantIsDsh: true, occupantIsSupervised: false, occupantListenScope: null },
+      'remote',
+    ),
+    'dsh-unknown',
+    'an undeterminable scope must not be claimed as consistent',
+  )
+})
+
+test('冲突文案 names the occupant, the mismatch and the saved config', () => {
+  const base = {
+    port: 3080,
+    occupant: 'node.exe（PID 21436）',
+    savedAccess: 'local' as const,
+    savedPort: 3080,
+  }
+
+  const mismatch = describeRuntimePortConflict({
+    ...base,
+    kind: 'dsh-mismatch',
+    occupantListenScope: 'remote',
+  })
+  assert.match(mismatch, /当前占用进程为 node\.exe（PID 21436）。/)
+  assert.match(mismatch, /远程 · 端口 3080/, 'the running config must be named')
+  assert.match(mismatch, /保存的配置（本地 · 端口 3080）/, 'the saved config must be named')
+  assert.match(mismatch, /清理后将按保存的配置（本地 · 端口 3080）重新启动/)
+
+  // Even a consistent resident dsh cannot be adopted: the launcher does not
+  // hold its token, so the copy must say why cleanup is still the way in.
+  const match = describeRuntimePortConflict({
+    ...base,
+    kind: 'dsh-match',
+    occupantListenScope: 'local',
+  })
+  assert.match(match, /配置与保存的一致/)
+  assert.match(match, /访问凭据/)
+  assert.match(match, /重新启动/)
+
+  const unknown = describeRuntimePortConflict({ ...base, kind: 'dsh-unknown' })
+  assert.match(unknown, /无法确认其运行配置/)
+
+  const other = describeRuntimePortConflict({ ...base, kind: 'other-program' })
+  assert.doesNotMatch(other, /dsh 服务/, 'a non-dsh occupant must not be called a dsh')
+  assert.match(other, /改用其它端口/, 'the non-destructive alternative stays')
+
+  const supervised = describeRuntimePortConflict({ ...base, kind: 'supervised' })
+  assert.match(supervised, /启动器启动/)
+  assert.match(supervised, /「关闭」/, 'the managed service points at 关闭, not cleanup')
 })

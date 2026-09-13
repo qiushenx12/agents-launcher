@@ -59,6 +59,84 @@ export function describePortOccupant(occupant: string | null | undefined, port: 
   return label ? `当前占用进程为 ${label}。` : `端口 ${port} 的当前占用进程未知。`
 }
 
+/**
+ * How a port occupant relates to the saved dsh configuration, for the runtime
+ * panel's «清理并启动» card.
+ *
+ * Only the listen scope can be verified against the saved config: the port
+ * matches by construction (it is the port that was probed), and the access
+ * token cannot be checked without knowing it — a dsh index page answers 401 to
+ * exactly the request that would identify it.
+ */
+export type PortConflictKind =
+  /** The launcher-supervised service holds it: 「关闭」 is the right action. */
+  | 'supervised'
+  /** A non-dsh program holds it. */
+  | 'other-program'
+  /** A dsh service holds it and its listen scope matches the saved 访问范围. */
+  | 'dsh-match'
+  /** A dsh service holds it, but listens on a different scope than saved. */
+  | 'dsh-mismatch'
+  /** A dsh service holds it, but its scope could not be determined. */
+  | 'dsh-unknown'
+
+export function classifyPortConflict(
+  occupancy: {
+    occupantIsDsh: boolean
+    occupantIsSupervised: boolean
+    occupantListenScope?: DshAccess | null
+  },
+  savedAccess: DshAccess,
+): PortConflictKind {
+  if (occupancy.occupantIsSupervised) return 'supervised'
+  if (!occupancy.occupantIsDsh) return 'other-program'
+  if (occupancy.occupantListenScope == null) return 'dsh-unknown'
+  return occupancy.occupantListenScope === savedAccess ? 'dsh-match' : 'dsh-mismatch'
+}
+
+/**
+ * The explanatory paragraph of the runtime panel's port-conflict card. The
+ * button row is separate; this text says *who* holds the port (the same
+ * «当前占用进程为 …» sentence every surface uses), *why* the resident instance
+ * cannot simply be reused, and what happens after the cleanup.
+ *
+ * A resident dsh can never be adopted — even a config-consistent one — because
+ * the launcher does not hold its access token, and without the token every
+ * page load lands on dsh's 401. Cleanup + a fresh supervised start is the only
+ * path into the embedded UI.
+ */
+export function describeRuntimePortConflict(conflict: {
+  port: number
+  occupant: string | null
+  kind: PortConflictKind
+  occupantListenScope?: DshAccess | null
+  savedAccess: DshAccess
+  savedPort: number
+}): string {
+  const who = describePortOccupant(conflict.occupant, conflict.port)
+  const saved = `保存的配置（${dshAccessLabel(conflict.savedAccess)} · 端口 ${conflict.savedPort}）`
+  switch (conflict.kind) {
+    case 'supervised':
+      return `端口 ${conflict.port} 已被占用。${who}`
+        + '它由启动器启动，当前状态只是没跟踪到它。请到配置页点击「关闭」停止它，或改用其它端口。'
+    case 'dsh-match':
+      return `端口 ${conflict.port} 已被占用。${who}`
+        + '它是一个已在运行的 dsh 服务，配置与保存的一致，但启动器未持有它的访问凭据，无法直接内嵌。'
+        + `清理后将按${saved}重新启动。`
+    case 'dsh-mismatch':
+      return `端口 ${conflict.port} 已被占用。${who}`
+        + `它是一个已在运行的 dsh 服务，但运行配置（${dshAccessLabel(conflict.occupantListenScope ?? 'local')} · 端口 ${conflict.port}）与${saved}不一致。`
+        + `清理后将按${saved}重新启动。`
+    case 'dsh-unknown':
+      return `端口 ${conflict.port} 已被占用。${who}`
+        + '它是一个已在运行的 dsh 服务，但无法确认其运行配置是否与保存的一致。'
+        + `清理后将按${saved}重新启动。`
+    default:
+      return `端口 ${conflict.port} 已被占用。${who}`
+        + `清理后将按${saved}启动 dsh；也可以在配置页改用其它端口。`
+  }
+}
+
 export interface DshEmbedBounds {
   x: number
   y: number

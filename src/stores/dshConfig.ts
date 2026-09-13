@@ -44,6 +44,8 @@ export interface DshPortStatus {
   occupantIsDsh: boolean
   /** True when the occupant is the dsh this launcher started. */
   occupantIsSupervised: boolean
+  /** Which networks the occupant serves; null when the port is free. */
+  occupantListenScope: DshAccess | null
 }
 
 export interface DshPortProcess {
@@ -243,6 +245,25 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     }
   }
 
+  /**
+   * Probe an arbitrary port without touching `portStatus` (that state belongs
+   * to the config panel's draft). The runtime panel's auto-start flow uses
+   * this to probe the *saved* port even while the draft differs.
+   */
+  async function probePort(
+    probeAccess: DshAccess,
+    probePortValue: number,
+  ): Promise<DshPortStatus | null> {
+    try {
+      return await invoke<DshPortStatus>('dsh_check_port', {
+        access: probeAccess,
+        port: probePortValue,
+      })
+    } catch {
+      return null
+    }
+  }
+
   /** Surface a panel-level failure (used by the copy-link action). */
   function setActionError(message: string) {
     actionError.value = message
@@ -259,12 +280,12 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
    * refuses to touch this process (or its ancestors) and reports that through
    * `selfProtected` instead of guessing.
    */
-  async function releasePort(): Promise<DshPortReleaseReport> {
+  async function releasePort(targetPort?: number): Promise<DshPortReleaseReport> {
     releasing.value = true
     actionError.value = ''
     try {
       const report = await invoke<DshPortReleaseReport>('dsh_release_port', {
-        port: port.value,
+        port: targetPort ?? port.value,
       })
       if (!report.released) {
         actionError.value = report.message
@@ -310,11 +331,14 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     progress.value = null
   }
 
-  async function start() {
-    if (portError.value) {
-      actionError.value = portError.value
-      return
-    }
+  /**
+   * Start the service with an explicit configuration, leaving the draft and
+   * the saved values alone. The runtime panel's auto-start uses this: it must
+   * run on the *saved* config even while the config panel holds unsaved edits.
+   *
+   * Returns true only when the service ended up running.
+   */
+  async function startWith(startAccess: DshAccess, startPort: number): Promise<boolean> {
     actionError.value = ''
     actionNotice.value = ''
     // Invalidate a status poll that began before this explicit transition.
@@ -323,27 +347,42 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     status.value = {
       ...(status.value ?? defaultStatus()),
       phase: 'preparing',
+      access: startAccess,
+      port: startPort,
       message: '正在准备 dsh，首次运行需要下载依赖。',
     }
     try {
       const started = await invoke<DshRuntimeStatus>('dsh_runtime_start', {
-        access: access.value,
-        port: port.value,
+        access: startAccess,
+        port: startPort,
       })
       invalidateStatusRequests()
       status.value = { ...started, access: normalizeStatusAccess(started.access) }
       if (started.phase === 'failed') {
         actionError.value = started.message
-      } else {
-        saved.access = access.value
-        saved.port = port.value
-        pendingRestart.value = false
+        return false
       }
+      pendingRestart.value = false
+      return true
     } catch (error) {
       actionError.value = String(error)
       await refreshStatus()
+      return false
     } finally {
       disposeProgressListener()
+    }
+  }
+
+  async function start() {
+    if (portError.value) {
+      actionError.value = portError.value
+      return
+    }
+    const ok = await startWith(access.value, port.value)
+    if (ok) {
+      // 从配置页手动启动视为采纳草稿配置：保存值跟随草稿（既有行为）。
+      saved.access = access.value
+      saved.port = port.value
     }
   }
 
@@ -408,12 +447,14 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     discardChanges,
     refreshStatus,
     checkPort,
+    probePort,
     setActionError,
     clearActionError,
     releasePort,
     openQr,
     closeQr,
     start,
+    startWith,
     stop,
     restart,
     disposeProgressListener,
