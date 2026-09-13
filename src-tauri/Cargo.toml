@@ -13,7 +13,11 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# `unstable` is required for `Window::add_child`, which hosts the dsh browser UI
+# in a child WebView. An iframe cannot be used instead: dsh's auth cookie is
+# `HttpOnly; SameSite=Strict` and is never stored in a cross-site frame. The
+# unstable API usage is confined to `src/dsh_embed.rs`.
+tauri = { version = "2", features = ["tray-icon", "unstable"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }

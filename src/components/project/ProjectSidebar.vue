@@ -728,8 +728,7 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  background: var(--app-bg-gradient);
-  background-attachment: fixed;
+  background: transparent;
   position: relative;
 }
 
@@ -740,8 +739,7 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   justify-content: space-between;
   gap: 6px;
   padding: 8px;
-  background: var(--app-bg-gradient);
-  background-attachment: fixed;
+  background: transparent;
   position: relative;
 }
 

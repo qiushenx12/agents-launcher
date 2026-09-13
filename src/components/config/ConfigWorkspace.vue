@@ -19,6 +19,12 @@
         :sidebar-collapsed="sidebarCollapsed"
         @left-width-change="emit('left-width-change', $event)"
       />
+      <CliDshPanel
+        v-if="mountedKinds.dsh"
+        v-show="workspaceStore.activeKind === 'dsh'"
+        :sidebar-collapsed="sidebarCollapsed"
+        @left-width-change="emit('left-width-change', $event)"
+      />
     </div>
 
     <Teleport to="body">
@@ -37,7 +43,10 @@
           <header class="preflight-dialog__header">
             <div>
               <h2 id="preflight-dialog-title">{{ activeDescriptor.label }} 启动前检测</h2>
-              <span>{{ activeDescriptor.configFormat.toUpperCase() }} 配置</span>
+              <span v-if="activeDescriptor.configFormat !== 'none'">
+                {{ activeDescriptor.configFormat.toUpperCase() }} 配置
+              </span>
+              <span v-else>启动器托管运行时</span>
             </div>
             <button
               type="button"
@@ -90,6 +99,7 @@ import { CLI_DESCRIPTORS, type CliKind } from '@/types/cli'
 import { useClaudeStore } from '@/stores/claude'
 import { useCodexConfigStore } from '@/stores/codexConfig'
 import { useOpencodeConfigStore } from '@/stores/opencodeConfig'
+import { useDshConfigStore } from '@/stores/dshConfig'
 import { useCliRuntimeStore } from '@/stores/cliRuntime'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
 import { redactConfigRecord } from '@/utils/configSecurity'
@@ -101,6 +111,7 @@ import ConfigStatusBanner from './ConfigStatusBanner.vue'
 const loadClaudePanel = () => import('@/components/cli/CliClaudePanel.vue')
 const loadCodexPanel = () => import('@/components/cli/CliCodexPanel.vue')
 const loadOpencodePanel = () => import('@/components/cli/CliOpencodePanel.vue')
+const loadDshPanel = () => import('@/components/cli/CliDshPanel.vue')
 const asyncPanelOptions = {
   loadingComponent: AsyncPanelLoading,
   delay: 80,
@@ -108,6 +119,7 @@ const asyncPanelOptions = {
 const CliClaudePanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadClaudePanel })
 const CliCodexPanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadCodexPanel })
 const CliOpencodePanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadOpencodePanel })
+const CliDshPanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadDshPanel })
 
 defineProps<{
   sidebarCollapsed?: boolean
@@ -121,11 +133,13 @@ const mountedKinds = reactive<Record<CliKind, boolean>>({
   claude: false,
   codex: false,
   opencode: false,
+  dsh: false,
 })
 const runtimeStore = useCliRuntimeStore()
 const claudeStore = useClaudeStore()
 const codexStore = useCodexConfigStore()
 const opencodeStore = useOpencodeConfigStore()
+const dshStore = useDshConfigStore()
 const { isMacOS } = usePlatform()
 let cancelIdlePreload: (() => void) | undefined
 const unregisterClaudeGuard = workspaceStore.registerDraftGuard('claude', {
@@ -139,6 +153,10 @@ const unregisterCodexGuard = workspaceStore.registerDraftGuard('codex', {
 const unregisterOpencodeGuard = workspaceStore.registerDraftGuard('opencode', {
   isDirty: () => opencodeStore.isDirty,
   discard: () => opencodeStore.discardChanges(),
+})
+const unregisterDshGuard = workspaceStore.registerDraftGuard('dsh', {
+  isDirty: () => dshStore.isDirty,
+  discard: () => dshStore.discardChanges(),
 })
 const activeDescriptor = computed(() => CLI_DESCRIPTORS[workspaceStore.activeKind])
 const activeStatus = computed(() => runtimeStore.statuses[workspaceStore.activeKind])
@@ -163,6 +181,15 @@ const sourceDescription = computed(() => {
       ? '~/Library/Application Support/ClaudeEnvManager/codex/profiles.json'
       : '%APPDATA%\\ClaudeEnvManager\\codex\\profiles.json'
     return `全局配置：${codexStore.globalConfigPath || '~/.codex/config.toml'}（仅显式勾选时同步）；启动器方案：${codexStore.profilesPath || launcherPath}；auth.json 只读。`
+  }
+  if (workspaceStore.activeKind === 'dsh') {
+    const overlayPath = isMacOS.value
+      ? '~/Library/Application Support/ClaudeEnvManager/dsh/runtime.overlay.yml'
+      : '%APPDATA%\\ClaudeEnvManager\\dsh\\runtime.overlay.yml'
+    const statePath = isMacOS.value
+      ? '~/Library/Application Support/ClaudeEnvManager/app_state.json'
+      : '%APPDATA%\\ClaudeEnvManager\\app_state.json'
+    return `运行方式：npx --yes @deepseek-ai/dsh web；访问范围与端口保存在 ${statePath} 的 dsh_runtime 字段；每次启动生成 ${overlayPath} 覆盖 webserver 行的 host/port。模型与凭据由 dsh 自行管理。`
   }
   return `唯一配置来源：${opencodeStore.globalConfigPath || '~/.config/opencode/opencode.jsonc'}；界面直接读取和保存该文件，只管理其中带 npm 的自定义 Provider，内置 Provider 保持不变。`
 })
@@ -232,6 +259,19 @@ const safeDiagnostic = computed(() => JSON.stringify(redactConfigRecord({
     previewError: opencodeStore.previewError || null,
     lastLaunchContext: opencodeStore.lastLaunchContext,
   } : null,
+  // 只放配置与状态，不放 URL 与 token（token 等于本机 shell 权限）。
+  dsh: workspaceStore.activeKind === 'dsh' ? {
+    access: dshStore.access,
+    port: dshStore.port,
+    savedAccess: dshStore.saved.access,
+    savedPort: dshStore.saved.port,
+    dirty: dshStore.isDirty,
+    phase: dshStore.status?.phase ?? 'unknown',
+    issue: dshStore.status?.issue ?? null,
+    version: dshStore.status?.version ?? null,
+    portAvailable: dshStore.portStatus?.available ?? null,
+    invocation: 'npx --yes @deepseek-ai/dsh web --patch <overlay> --port <port> --no-open',
+  } : null,
 }), null, 2))
 
 async function checkActive(force = false) {
@@ -239,6 +279,11 @@ async function checkActive(force = false) {
   if (workspaceStore.activeKind === 'opencode') {
     await opencodeStore.ensureLoaded().catch(() => {})
     await opencodeStore.previewCurrent().catch(() => {})
+  }
+  if (workspaceStore.activeKind === 'dsh') {
+    await dshStore.load().catch(() => {})
+    await dshStore.refreshStatus().catch(() => {})
+    await dshStore.checkPort().catch(() => {})
   }
 }
 
@@ -256,6 +301,7 @@ onMounted(() => {
       loadClaudePanel(),
       loadCodexPanel(),
       loadOpencodePanel(),
+      loadDshPanel(),
     ])
   })
 })
@@ -265,6 +311,7 @@ onBeforeUnmount(() => {
   unregisterClaudeGuard()
   unregisterCodexGuard()
   unregisterOpencodeGuard()
+  unregisterDshGuard()
   workspaceStore.closePreflight()
 })
 </script>
@@ -275,7 +322,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  background: var(--app-bg-gradient);
+  background: transparent;
 }
 
 .config-workspace__body {

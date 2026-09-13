@@ -6,6 +6,12 @@
   --app-bg-gradient: linear-gradient(90deg, var(--bg), var(--bg));
   --card-bg-gradient: linear-gradient(90deg, var(--card), var(--card));
   --chrome-bridge-bg: var(--card);
+  /* Surface behind a configuration editor. Equal to the surrounding chrome in the
+     light theme, where the whole window is light. */
+  --editor-surface: #F5F5F7;
+  /* Terminal block in a project workspace. The light theme keeps the PTY surface
+     it has always had (see the dark theme for the recessed value). */
+  --project-surface: #1E1E1E;
   --text-primary: #1D1D1F;
   --text-secondary: #6E6E73;
   --primary: #007AFF;
@@ -32,6 +38,7 @@
   --font-size-small: 12px;
   --radius: 8px;
   --radius-sm: 6px;
+  --radius-lg: 12px;
 }
 
 /* Dark theme */
@@ -39,9 +46,19 @@
   color-scheme: dark;
   --bg: #1B1F24;
   --card: #252A31;
-  --app-bg-gradient: linear-gradient(100deg, #252A31 0%, #20242A 45%, #171A1F 100%);
+  --app-bg-gradient: linear-gradient(100deg, #272C34 0%, #23272E 45%, #1B1F25 100%);
   --card-bg-gradient: linear-gradient(100deg, #2B3038 0%, #252A31 52%, #20242A 100%);
   --chrome-bridge-bg: #2B3038;
+  /* Well below `--bg` (#1B1F24) and below the gradient's darker end: the
+     configuration editor pane is its own recessed region, so the light chrome
+     above and beside it reads as a separate surface rather than an adjacent
+     shade of the same grey. Cards on this pane carry no fill of their own; the
+     form fields inside them are what sits above the recess. */
+  --editor-surface: #0F1216;
+  /* The project workspace's terminal block. Deeper than the PTY surface
+     (`--terminal-bg`, #171A1F) so that it stands apart from the chrome, but not
+     as deep as the configuration editor, which is a full-height pane. */
+  --project-surface: #14181D;
   --text-primary: #F2F4F7;
   --text-secondary: #A4ADB8;
   --primary: #0A84FF;

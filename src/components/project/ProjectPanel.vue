@@ -478,7 +478,11 @@ defineExpose({
   flex-direction: column;
   height: 100%;
   overflow: hidden;
-  background: var(--bg);
+  /* Transparent so the sidebar column shows the same chrome as the title bar
+     above it; an opaque `--bg` here is what made the project view read as a
+     flat dark slab instead of the light chrome the configuration workspaces
+     use. The terminal area paints its own recess over this. */
+  background: transparent;
 }
 
 .project-panel__row {
@@ -576,8 +580,9 @@ defineExpose({
 }
 
 /* The left resize hit area sits between the sidebar and the module toolbar.
-   Keep its right half filled with the toolbar surface so that the two bars
-   meet cleanly instead of exposing a dark gap at their junction. */
+   Both bars are transparent over the shared app background, so the bridge stays
+   transparent too — an opaque patch here would punch a rectangle out of the
+   continuous top bar. */
 .project-panel__divider--left::before {
   content: '';
   position: absolute;
@@ -586,14 +591,17 @@ defineExpose({
   width: 50%;
   height: 38px;
   pointer-events: none;
-  background: var(--chrome-bridge-bg);
+  background: transparent;
 }
 
+/* Grab strip only, like the configuration workspaces: the sidebar and the
+   recessed terminal area are different surfaces, so the colour step marks the
+   boundary and hovering still highlights the handle. */
 .project-panel__divider::after {
   content: '';
   width: 1px;
   height: 100%;
-  background-color: var(--separator);
+  background-color: transparent;
   transition: background-color 0.2s ease, width 0.2s ease, box-shadow 0.2s ease;
 }
 

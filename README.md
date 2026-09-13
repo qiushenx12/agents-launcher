@@ -2,7 +2,7 @@
 
 English | [简体中文](./README-中文版.md)
 
-Agents Launcher is a desktop workspace for running and managing **Claude Code**, **Codex**, and **OpenCode** from one application. It combines isolated CLI configuration profiles, project and native-session discovery, embedded PTY terminals, and file tools.
+Agents Launcher is a desktop workspace for running and managing **Claude Code**, **Codex**, **OpenCode**, and **DeepSeek Harness** from one application. It combines isolated CLI configuration profiles, project and native-session discovery, embedded PTY terminals, and file tools.
 
 The application is built with **Tauri 2**, **Vue 3**, **Pinia**, **TypeScript**, and **Rust**. It uses the operating system's native webview and a Rust PTY backend instead of bundling an Electron runtime.
 
@@ -22,7 +22,7 @@ Some integrations are platform-specific. Windows uses the registry, DPAPI, and `
 
 | Area | Capabilities |
 | --- | --- |
-| CLI workspaces | Separate entry points for Claude Code, Codex, and OpenCode with isolated profiles, runtime detection, and capability checks |
+| CLI workspaces | Separate entry points for Claude Code, Codex, OpenCode, and DeepSeek Harness with isolated profiles, runtime detection, and capability checks |
 | Configuration | Create, edit, select, and apply CLI-specific profiles; discover models and manage provider settings |
 | Projects and sessions | Discover recent projects and native CLI sessions, create project sessions, and resume previous work |
 | Terminal workspace | Run CLI processes in standalone and project-aware multi-tab PTY terminals powered by xterm.js and `portable-pty` |
@@ -55,7 +55,15 @@ Some integrations are platform-specific. Windows uses the registry, DPAPI, and `
 - Provider connection management and local credential handling
 - Native project and session discovery
 
-Agents Launcher does not bundle these CLIs. Install each CLI separately before testing or using its workspace.
+### DeepSeek Harness (dsh)
+
+- Runs `npx --yes @deepseek-ai/dsh web` as a supervised background service; no global install required
+- Two settings only: access scope (local / remote) and port, applied through a generated `--patch` overlay
+- The dsh browser UI is embedded in the workspace with a child WebView, so its token cookie works in a top-level browsing context
+- Model and API credentials stay with dsh; the launcher never reads or writes them
+- Starting and stopping the service is explicit, and quitting the application always stops it
+
+Agents Launcher does not bundle these CLIs. Install each CLI separately before testing or using its workspace. DeepSeek Harness is fetched on demand by `npx`.
 
 ## Architecture
 
@@ -68,7 +76,8 @@ flowchart TB
     Services --> Config["Configuration, migration, and persistence"]
     Services --> PTY["PTY and terminal session manager"]
     Services --> Platform["Windows and macOS integrations"]
-    Runtime --> CLIs["Claude Code / Codex / OpenCode"]
+    Runtime --> CLIs["Claude Code / Codex / OpenCode / DeepSeek Harness"]
+    Runtime --> Dsh["dsh web supervisor + child WebView"]
     PTY -->|"output events"| Stores
     Config --> Data["Local application data"]
 ```
@@ -80,7 +89,7 @@ The frontend owns presentation and transient UI state. Pinia stores coordinate p
 The Vue application lives under `src/`:
 
 - `components/config/` provides the shared configuration workspace.
-- `components/claude/`, `components/codex/`, and `components/opencode/` contain CLI-specific interfaces.
+- `components/claude/`, `components/codex/`, `components/opencode/`, and `components/dsh/` contain CLI-specific interfaces.
 - `components/project/` implements project sessions, file tools, and sidebars.
 - `components/terminal/` manages xterm.js tabs and PTY interaction.
 - `stores/` contains Pinia state for CLI runtimes, profiles, projects, terminals, top-bar layout, and tab communication.
@@ -96,6 +105,8 @@ The Rust application lives under `src-tauri/src/`:
 | `cli_migration`, `file_transaction` | Backward-compatible migrations, atomic writes, backups, and recovery |
 | `project_manager`, `session_manager` | Project metadata, recent items, and session persistence |
 | `pty` | Process creation, terminal input/output, resizing, titles, and lifecycle management |
+| `dsh_runtime` | Supervised `dsh web` process: overlay generation, readiness parsing, download progress, start/stop, port diagnostics |
+| `dsh_embed` | Child WebView that hosts the dsh browser UI inside the workspace |
 | `tab_cli` | Inter-tab commands, permissions, and terminal snapshots |
 | `persistent_state`, `settings_manager` | Window, pane, font, profile, layout, and launch-state persistence |
 | `platform_env`, `env_applier`, `registry` | Platform-aware executable discovery and environment integration |

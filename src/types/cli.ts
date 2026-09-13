@@ -1,9 +1,9 @@
 import rawCliContract from '../../contracts/cli-contract.json'
 
-export const CLI_KINDS = ['claude', 'codex', 'opencode'] as const
+export const CLI_KINDS = ['claude', 'codex', 'opencode', 'dsh'] as const
 export type CliKind = typeof CLI_KINDS[number]
 
-export type CliConfigFormat = 'json' | 'toml' | 'jsonc'
+export type CliConfigFormat = 'json' | 'toml' | 'jsonc' | 'none'
 export type CliIssueCode =
   | 'executable_missing'
   | 'version_command_failed'
@@ -16,8 +16,8 @@ export type MainTab = 'config' | CliKind | 'terminal' | 'orchestration'
 
 export interface CliDescriptor {
   kind: CliKind
-  label: 'Claude Code' | 'CodeX' | 'OpenCode'
-  command: 'claude' | 'codex' | 'opencode'
+  label: 'Claude Code' | 'CodeX' | 'OpenCode' | 'DeepSeek Harness'
+  command: 'claude' | 'codex' | 'opencode' | 'dsh'
   configFormat: CliConfigFormat
   supportsManagedProfile: boolean
 }
@@ -76,7 +76,7 @@ function assertCliContract(value: unknown): asserts value is CliContract {
       !isCliKind(descriptor.kind)
       || typeof descriptor.label !== 'string'
       || typeof descriptor.command !== 'string'
-      || !['json', 'toml', 'jsonc'].includes(descriptor.configFormat)
+      || !['json', 'toml', 'jsonc', 'none'].includes(descriptor.configFormat)
       || typeof descriptor.supportsManagedProfile !== 'boolean'
     ) {
       throw new Error('CLI 描述项无效')

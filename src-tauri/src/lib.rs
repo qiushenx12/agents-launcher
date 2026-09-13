@@ -8,6 +8,8 @@ pub mod codex_config;
 pub mod codex_proxy;
 pub mod config_store;
 pub mod dependency_manager;
+pub mod dsh_embed;
+pub mod dsh_runtime;
 pub mod env_applier;
 pub mod file_transaction;
 pub mod macos_window;
@@ -272,6 +274,21 @@ pub fn run() {
             persistent_state::save_last_active_main_tab,
             persistent_state::load_top_bar_layout,
             persistent_state::save_top_bar_layout,
+            // DeepSeek Harness runtime (managed external `dsh web` process)
+            persistent_state::load_dsh_runtime_config,
+            persistent_state::save_dsh_runtime_config,
+            dsh_runtime::dsh_runtime_status,
+            dsh_runtime::dsh_runtime_urls,
+            dsh_runtime::dsh_runtime_start,
+            dsh_runtime::dsh_runtime_stop,
+            dsh_runtime::dsh_check_port,
+            dsh_runtime::dsh_release_port,
+            // DeepSeek Harness embedded browser surface (child WebView)
+            dsh_embed::dsh_embed_show,
+            dsh_embed::dsh_embed_hide,
+            dsh_embed::dsh_embed_close,
+            dsh_embed::dsh_embed_reload,
+            dsh_embed::dsh_debug_log,
             // project_manager commands
             project_manager::load_projects,
             project_manager::save_projects,
@@ -340,6 +357,10 @@ pub fn run() {
             pty::cleanup_all_sessions(app_handle);
             // 应用退出：恢复全局 CodeX 配置中的真实地址并停止代理。
             let _ = codex_config::restore_global_conversion_proxy();
+            // 退出应用必须连带关闭 dsh：它是常驻 HTTP 服务，不像 PTY 那样
+            // 随标签页消失；这里同时回收内嵌 WebView。
+            dsh_embed::close_on_exit();
+            dsh_runtime::stop();
         }
     });
 }

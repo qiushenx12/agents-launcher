@@ -783,7 +783,7 @@ watch(leftWidth, (width) => {
   height: 100%;
   min-height: 0;
   display: flex;
-  background: var(--app-bg-gradient);
+  background: transparent;
 }
 
 .codex-config-panel__sidebar-shell {
@@ -814,7 +814,11 @@ watch(leftWidth, (width) => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--bg);
+  /* Transparent on purpose: the profile list sits on the same app background as
+     the title bar above it. Painting `--bg` here (a flat colour) against the
+     bar's gradient left the two visibly different shades, even though both read
+     as "the light chrome". */
+  background: transparent;
 }
 
 .codex-config-panel__divider {
@@ -829,11 +833,15 @@ watch(leftWidth, (width) => {
   justify-content: center;
 }
 
+/* No resting rule between the sidebar and the editor pane: the two surfaces are
+   different colours, so the colour step is the boundary. The grab strip and its
+   hover/drag highlight stay, because this is still the resize handle — only the
+   1px line is gone. */
 .codex-config-panel__divider::after {
   content: '';
   width: 1px;
   height: 100%;
-  background-color: var(--separator);
+  background-color: transparent;
   transition: background-color 0.2s ease, width 0.2s ease, box-shadow 0.2s ease;
 }
 

@@ -31,6 +31,7 @@ pub fn normalize_main_tab(value: &str) -> MainTab {
         "project" | "claude" => MainTab::Claude,
         "codex" => MainTab::Codex,
         "opencode" => MainTab::Opencode,
+        "dsh" => MainTab::Dsh,
         "terminal" => MainTab::Terminal,
         "orchestration" => MainTab::Orchestration,
         _ => MainTab::Config,

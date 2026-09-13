@@ -2,7 +2,7 @@
 
 [English](./README.md) | 简体中文
 
-Agents Launcher 是一款统一运行和管理 **Claude Code**、**Codex** 与 **OpenCode** 的桌面工作区。它将相互隔离的 CLI 配置方案、项目与原生会话发现、内嵌 PTY 终端和文件工具集中在一个应用中。
+Agents Launcher 是一款统一运行和管理 **Claude Code**、**Codex**、**OpenCode** 与 **DeepSeek Harness** 的桌面工作区。它将相互隔离的 CLI 配置方案、项目与原生会话发现、内嵌 PTY 终端和文件工具集中在一个应用中。
 
 应用使用 **Tauri 2**、**Vue 3**、**Pinia**、**TypeScript** 和 **Rust** 构建，基于操作系统原生 WebView 与 Rust PTY 后端运行，不需要捆绑 Electron 运行时。
 
@@ -22,7 +22,7 @@ macOS 能力已经验证并合入 `main`。后续 macOS 开发会在平台分支
 
 | 功能区域 | 能力 |
 | --- | --- |
-| CLI 工作区 | 为 Claude Code、Codex 和 OpenCode 提供独立入口、隔离配置、运行时检测与能力检查 |
+| CLI 工作区 | 为 Claude Code、Codex、OpenCode 和 DeepSeek Harness 提供独立入口、隔离配置、运行时检测与能力检查 |
 | 配置管理 | 创建、编辑、选择和应用各 CLI 的配置方案，发现模型并管理服务商设置 |
 | 项目与会话 | 发现最近项目和 CLI 原生会话，创建项目会话并恢复历史工作 |
 | 终端工作区 | 通过 xterm.js 和 `portable-pty` 在独立终端及项目终端中运行多标签 CLI 进程 |
@@ -55,7 +55,15 @@ macOS 能力已经验证并合入 `main`。后续 macOS 开发会在平台分支
 - 服务商连接管理与本地凭据处理
 - 原生项目和会话发现
 
-Agents Launcher 不会捆绑这些 CLI。测试或使用某个工作区前，需要单独安装对应 CLI。
+### DeepSeek Harness（dsh）
+
+- 以受监督的后台服务方式运行 `npx --yes @deepseek-ai/dsh web`，不要求全局安装
+- 只提供两组设置：访问范围（本地 / 远程）与端口，通过生成的 `--patch` overlay 生效
+- dsh 自带浏览器界面以子 WebView 内嵌在工作区中，使其 token Cookie 处于顶层浏览上下文而可用
+- 模型与 API 凭据完全由 dsh 自行管理，启动器不读取也不写入
+- 启停是显式动作；退出应用一定连带停止服务
+
+Agents Launcher 不会捆绑这些 CLI。测试或使用某个工作区前，需要单独安装对应 CLI；DeepSeek Harness 由 `npx` 按需拉取。
 
 ## 架构
 
@@ -68,7 +76,8 @@ flowchart TB
     Services --> Config["配置、迁移与持久化"]
     Services --> PTY["PTY 与终端会话管理器"]
     Services --> Platform["Windows 与 macOS 集成"]
-    Runtime --> CLIs["Claude Code / Codex / OpenCode"]
+    Runtime --> CLIs["Claude Code / Codex / OpenCode / DeepSeek Harness"]
+    Runtime --> Dsh["dsh web 监督器 + 子 WebView"]
     PTY -->|"输出事件"| Stores
     Config --> Data["本地应用数据"]
 ```
@@ -80,7 +89,7 @@ flowchart TB
 Vue 应用位于 `src/`：
 
 - `components/config/` 提供共用配置工作区。
-- `components/claude/`、`components/codex/` 和 `components/opencode/` 包含各 CLI 专属界面。
+- `components/claude/`、`components/codex/`、`components/opencode/` 和 `components/dsh/` 包含各 CLI 专属界面。
 - `components/project/` 实现项目会话、文件工具和侧边栏。
 - `components/terminal/` 管理 xterm.js 标签和 PTY 交互。
 - `stores/` 保存 CLI 运行时、配置方案、项目、终端、顶栏布局和标签通信状态。
@@ -96,6 +105,8 @@ Rust 应用位于 `src-tauri/src/`：
 | `cli_migration`、`file_transaction` | 向后兼容迁移、原子写入、备份与恢复 |
 | `project_manager`、`session_manager` | 项目元数据、最近项目与会话持久化 |
 | `pty` | 进程创建、终端输入输出、尺寸调整、标题与生命周期管理 |
+| `dsh_runtime` | 受监督的 `dsh web` 进程：overlay 生成、就绪行解析、下载进度、启停与端口诊断 |
+| `dsh_embed` | 在工作区内承载 dsh 浏览器界面的子 WebView |
 | `tab_cli` | 跨标签页命令、权限与终端快照 |
 | `persistent_state`、`settings_manager` | 窗口、面板、字体、配置方案、布局与启动状态持久化 |
 | `platform_env`、`env_applier`、`registry` | 平台化可执行程序发现与环境集成 |

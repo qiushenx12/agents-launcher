@@ -13,7 +13,7 @@ import { InFlightTaskCache } from '@/utils/inFlightTaskCache'
 type CliStatusMap = Record<CliKind, CliStatus | null>
 
 function initialStatuses(): CliStatusMap {
-  return { claude: null, codex: null, opencode: null }
+  return { claude: null, codex: null, opencode: null, dsh: null }
 }
 
 export const useCliRuntimeStore = defineStore('cliRuntime', () => {
@@ -22,6 +22,7 @@ export const useCliRuntimeStore = defineStore('cliRuntime', () => {
     claude: false,
     codex: false,
     opencode: false,
+    dsh: false,
   })
   const inFlight = new InFlightTaskCache<CliKind, CliStatus>()
 

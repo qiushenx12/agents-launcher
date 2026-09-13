@@ -181,6 +181,7 @@ const EMPTY_SELECTIONS: Record<CliKind, string | null> = {
   claude: null,
   codex: null,
   opencode: null,
+  dsh: null,
 }
 
 function makeId(prefix: string) {
@@ -349,6 +350,7 @@ export const useProjectStore = defineStore('project', () => {
     claude: false,
     codex: false,
     opencode: false,
+    dsh: false,
   }
   const cliWorkspaceLoads = new InFlightTaskCache<CliKind, void>()
 

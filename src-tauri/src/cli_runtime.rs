@@ -149,11 +149,38 @@ fn hidden_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// Human-facing name of a CLI. For dsh this is the package bin name, which is
+/// **not** guaranteed to be on `PATH`; use [`cli_invocation`] to actually run it.
 fn command_name(kind: CliKind) -> &'static str {
     match kind {
         CliKind::Claude => "claude",
         CliKind::Codex => "codex",
         CliKind::Opencode => "opencode",
+        CliKind::Dsh => "dsh",
+    }
+}
+
+/// Executable plus arguments used to run a CLI.
+///
+/// Three CLIs are single executables. dsh is distributed as the npm package
+/// `@deepseek-ai/dsh` whose bin name is `dsh`; unless the user globally
+/// installed it, `dsh` is not on `PATH`, so it must run through `npx`.
+fn cli_invocation(kind: CliKind) -> Vec<String> {
+    match kind {
+        CliKind::Dsh => vec![
+            "npx".to_string(),
+            "--yes".to_string(),
+            "@deepseek-ai/dsh".to_string(),
+        ],
+        other => vec![command_name(other).to_string()],
+    }
+}
+
+/// The program `PATH` must contain for a CLI to be usable.
+fn cli_launcher_name(kind: CliKind) -> &'static str {
+    match kind {
+        CliKind::Dsh => "npx",
+        other => command_name(other),
     }
 }
 
@@ -172,7 +199,7 @@ pub fn locate_cli(kind: CliKind) -> Option<PathBuf> {
             return Some(PathBuf::from(path));
         }
     }
-    crate::platform_env::locate_executable(command_name(kind))
+    crate::platform_env::locate_executable(cli_launcher_name(kind))
 }
 
 fn inspect_cli(kind: CliKind) -> CliStatus {
@@ -187,7 +214,15 @@ fn inspect_cli(kind: CliKind) -> CliStatus {
         });
     };
 
-    let output = match hidden_command(&path).arg("--version").output() {
+    let invocation = cli_invocation(kind);
+    let mut probe = hidden_command(&path);
+    // dsh must be probed through npx, which resolves the npm dist-tag over the
+    // network and is far slower than a local `--version`.
+    if invocation.len() > 1 {
+        probe.args(&invocation[1..]);
+    }
+    let version_flag = if kind == CliKind::Dsh { "-V" } else { "--version" };
+    let output = match probe.arg(version_flag).output() {
         Ok(output) => output,
         Err(error) => {
             let mut status =

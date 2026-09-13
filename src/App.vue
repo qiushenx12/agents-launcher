@@ -9,57 +9,66 @@
     <!-- Custom title bar -->
     <header
       class="title-bar"
-      :style="{
-        '--project-nav-width': `${leftSidebarOpen ? sharedSidebarHeaderWidth : 45}px`,
-      }"
       @mousedown="startTitleBarDrag"
       @dblclick="handleTitleBarDoubleClick"
     >
-      <div
-        class="title-bar__workspace-section"
-        :class="{ 'title-bar__workspace-section--collapsed': !leftSidebarOpen }"
-      >
-        <span class="title-bar__sidebar-slot">
-          <button
-            class="title-bar__icon-btn"
-            :class="{ active: leftSidebarOpen }"
-            :title="leftSidebarToggleTitle"
-            :aria-label="leftSidebarToggleTitle"
-            :aria-pressed="leftSidebarOpen"
-            :disabled="!appReady"
-            data-tauri-drag-region="false"
-            @click="toggleActiveLeftSidebar"
+      <div class="title-bar__workspace-switch">
+        <div class="title-bar__workspace-section">
+          <span class="title-bar__sidebar-slot">
+            <button
+              class="title-bar__icon-btn"
+              :class="{ active: leftSidebarOpen }"
+              :title="leftSidebarToggleTitle"
+              :aria-label="leftSidebarToggleTitle"
+              :aria-pressed="leftSidebarOpen"
+              :disabled="!appReady"
+              data-tauri-drag-region="false"
+              @click="toggleActiveLeftSidebar"
+            >
+              <span class="sidebar-toggle-icon sidebar-toggle-icon--left" aria-hidden="true"></span>
+            </button>
+          </span>
+          <!-- Always rendered: a collapsed sidebar hides the switch but must not
+               let the CLI entries slide left underneath the freed space. -->
+          <nav
+            class="title-bar__mode-tabs"
+            :class="{ 'title-bar__mode-tabs--hidden': !leftSidebarOpen }"
+            :aria-hidden="!leftSidebarOpen"
+            aria-label="工作区"
           >
-            <span class="sidebar-toggle-icon sidebar-toggle-icon--left" aria-hidden="true"></span>
-          </button>
-        </span>
-        <nav v-if="leftSidebarOpen" class="title-bar__mode-tabs" aria-label="工作区">
-          <button
-            class="title-bar__mode-tab"
-            :class="{ active: workspaceMode === 'config' }"
-            :disabled="!appReady"
-            data-tauri-drag-region="false"
-            @click="openConfigTab"
-          >
-            配置
-            <span
-              v-if="configWorkspaceStore.activeHasUnsavedChanges"
-              class="title-bar__dirty"
-              title="当前配置有未保存的修改"
-              aria-label="当前配置有未保存的修改"
-            ></span>
-          </button>
-          <button
-            class="title-bar__mode-tab"
-            :class="{ active: workspaceMode === 'project' }"
-            :disabled="!appReady"
-            data-tauri-drag-region="false"
-            @click="openProjectTab"
-          >
-            项目
-          </button>
-        </nav>
+            <button
+              class="title-bar__mode-tab"
+              :class="{ active: workspaceMode === 'config' }"
+              :disabled="!appReady || !leftSidebarOpen"
+              :tabindex="leftSidebarOpen ? 0 : -1"
+              data-tauri-drag-region="false"
+              @click="openConfigTab"
+            >
+              配置
+              <span
+                v-if="configWorkspaceStore.activeHasUnsavedChanges"
+                class="title-bar__dirty"
+                title="当前配置有未保存的修改"
+                aria-label="当前配置有未保存的修改"
+              ></span>
+            </button>
+            <button
+              class="title-bar__mode-tab"
+              :class="{ active: workspaceMode === 'project' }"
+              :disabled="!appReady || !leftSidebarOpen"
+              :tabindex="leftSidebarOpen ? 0 : -1"
+              data-tauri-drag-region="false"
+              @click="openProjectTab"
+            >
+              项目
+            </button>
+          </nav>
+        </div>
       </div>
+
+      <!-- Separates the workspace switch from the CLI entries without running
+           the full height of the bar. -->
+      <span class="title-bar__divider" aria-hidden="true"></span>
 
       <nav class="title-bar__tabs" aria-label="前端">
         <button
@@ -129,13 +138,24 @@
       </div>
 
       <!-- Shared CLI workspace — keep mounted while on the config tab so
-           xterm instances (scrollback, mouse modes) survive tab switches. -->
+           xterm instances (scrollback, mouse modes) survive tab switches.
+           dsh has no project workspace: it serves its own browser UI, which is
+           hosted in a child WebView instead of a PTY + ProjectPanel. -->
       <div
         v-if="mountedMainPanels.project && workspaceCliKind && workspaceCliStatus?.state === 'ready'"
         v-show="workspaceMode === 'project'"
         class="app-panel"
       >
+        <DshRuntimePanel
+          v-if="workspaceCliKind === 'dsh'"
+          ref="dshPanelRef"
+          :active="dshPanelActive"
+          :overlay-open="dshOverlayOpen"
+          @open-config="openConfigTab"
+          @left-width-change="sharedSidebarHeaderWidth = $event + 5"
+        />
         <ProjectPanel
+          v-else
           ref="projectPanelRef"
           :cli-kind="workspaceCliKind"
           @open-settings="toggleSettings($event)"
@@ -448,6 +468,7 @@ import type { ClaudeAgentEvent } from './types/claudeObserver'
 
 const loadTerminalManager = () => import('./components/terminal/TerminalManager.vue')
 const loadProjectPanel = () => import('./components/project/ProjectPanel.vue')
+const loadDshRuntimePanel = () => import('./components/dsh/DshRuntimePanel.vue')
 const loadOrchestrationManager = () => import('./components/orchestration/OrchestrationManager.vue')
 const loadTopBarOrderModal = () => import('./components/common/TopBarOrderModal.vue')
 const asyncPanelOptions = {
@@ -456,6 +477,7 @@ const asyncPanelOptions = {
 }
 const TerminalManager = defineAsyncComponent({ ...asyncPanelOptions, loader: loadTerminalManager })
 const ProjectPanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadProjectPanel })
+const DshRuntimePanel = defineAsyncComponent({ ...asyncPanelOptions, loader: loadDshRuntimePanel })
 const OrchestrationManager = defineAsyncComponent({
   ...asyncPanelOptions,
   loader: loadOrchestrationManager,
@@ -503,8 +525,15 @@ interface ProjectPanelExpose {
   showClaudeViewControls: boolean
   selectClaudeView: (view: ClaudeView) => Promise<void>
 }
+interface DshRuntimePanelExpose {
+  hide: () => Promise<void>
+  refresh: () => void
+  reassert: () => void
+  apply: (force?: boolean) => Promise<void>
+}
 
 const projectPanelRef = ref<ProjectPanelExpose | null>(null)
+const dshPanelRef = ref<DshRuntimePanelExpose | null>(null)
 const topBarOrderModalOpen = ref(false)
 const topBarOrderModalMounted = ref(false)
 const mountedMainPanels = reactive({
@@ -552,6 +581,11 @@ const activeCliStatus = computed(() => cliRuntimeStore.statuses[activeCliKind.va
 // workspace. This lets both modes show the same CLI without a second switcher.
 const workspaceCliKind = computed<CliKind>(() => activeCliKind.value)
 const workspaceCliStatus = computed(() => cliRuntimeStore.statuses[workspaceCliKind.value] ?? null)
+// A child WebView is a native control: it does not follow `v-show`, so the dsh
+// panel must be told explicitly when it stops being the visible surface.
+const dshPanelActive = computed(() => workspaceCliKind.value === 'dsh'
+  && workspaceMode.value === 'project'
+  && mainTab.value === 'dsh')
 const activeCliLabel = computed(() => CLI_DESCRIPTORS[activeCliKind.value].label)
 const settingsCliKind = computed<CliKind | null>(() => {
   if (workspaceMode.value === 'config') return activeCliKind.value
@@ -605,6 +639,10 @@ const cliInstallHint = computed(() => {
     return isMacOS.value
       ? `Homebrew：brew install --cask codex；或 npm install -g @openai/codex${restart}`
       : 'npm 安装命令：npm install -g @openai/codex'
+  }
+  // dsh 不需要全局安装：它通过 npx 运行，缺的是 Node.js/npx 而不是 dsh 本身。
+  if (activeCliKind.value === 'dsh') {
+    return `运行方式：npx @deepseek-ai/dsh web（无需全局安装 dsh）。若提示找不到 npx，请先安装 Node.js${restart}`
   }
   return isMacOS.value
     ? `Homebrew：brew install anomalyco/tap/opencode；或 npm install -g opencode-ai${restart}`
@@ -929,6 +967,17 @@ watch(showSettings, (visible) => {
   if (!visible) activeSettingsSubmenu.value = null
 })
 
+// ── dsh 内嵌界面的可见性挂钩（§4.9 A 组） ───────────────────────────────────
+// 子 WebView 是窗口级原生控件：DOM 被卸载或 display:none 都不会让它消失，
+// 而它又会把任何 fixed / Teleport 浮层整块盖住（表现为"弹窗不见了"）。
+//
+// 只有一个开关：把"面板是否为当前表面"与"是否有浮层必须盖住它"一起交给
+// DshRuntimePanel，由它统一 suspend/resume。在这里逐个 hide 是不够的——
+// 只要漏掉一条恢复路径，ResizeObserver 就会把控件重新 show 回来，然后它会
+// 一直盖在新的界面上（这正是"切到配置页后 dsh 界面仍在最上层"的原因）。
+// 新增浮层时把它加进 dshOverlayOpen。
+const dshOverlayOpen = computed(() => showSettings.value || topBarOrderModalOpen.value)
+
 watch(showClaudeSettings, (visible) => {
   if (
     !visible
@@ -1051,6 +1100,9 @@ function onDocumentClick(e: MouseEvent) {
 
 function onWindowResize() {
   updateSettingsAnchor()
+  // 窗口 resize / 最大化 / macOS 全屏切换后必须重算 bounds，并且要反复确认到稳定：
+  // 布局在这些事件之后往往还会变化几帧。面板自身会在不该显示时忽略这个请求。
+  dshPanelRef.value?.reassert()
 }
 
 async function openCliTab(kind: CliKind, forceCheck = false) {
@@ -1067,6 +1119,32 @@ async function openCliTab(kind: CliKind, forceCheck = false) {
     return
   }
   const requestId = ++cliOpenRequestId
+
+  // dsh 没有项目工作区：它的界面由 `dsh web` 自己提供，启动器只负责进程与承载。
+  // 这里必须绕开 prepareCliWorkspace，否则会掉进 OpenCode 兜底分支去发现
+  // OpenCode 的项目与会话。服务未启动时只显示空态，不自动启动。
+  if (kind === 'dsh') {
+    const gateStartedAtDsh = performance.now()
+    const finishDshMeasure = beginStartupMeasure('cli-workspace-dsh')
+    mainTab.value = kind
+    projectStore.setActiveCliKind(kind)
+    cliInstallHelpVisible.value = false
+    cliWorkspacePreparation.value = { kind, requestId }
+    try {
+      const status = await cliRuntimeStore.check(kind, forceCheck)
+      if (requestId !== cliOpenRequestId || mainTab.value !== kind) return
+      if (status.state !== 'ready') return
+      const remaining = MIN_CLI_WORKSPACE_GATE_MS - (performance.now() - gateStartedAtDsh)
+      if (remaining > 0) await new Promise<void>((resolve) => setTimeout(resolve, remaining))
+    } finally {
+      if (cliWorkspacePreparation.value?.requestId === requestId) {
+        cliWorkspacePreparation.value = null
+      }
+      finishDshMeasure()
+    }
+    return
+  }
+
   const gateStartedAt = performance.now()
   const finishWorkspaceMeasure = beginStartupMeasure(`cli-workspace-${kind}`)
   mainTab.value = kind
@@ -1478,6 +1556,13 @@ onMounted(async () => {
         scheduleMacFullscreenSync()
       }
     }).catch(() => undefined),
+    // 托盘语义（D2）：窗口隐藏到托盘时隐藏子 WebView，dsh 服务继续运行；
+    // 窗口重新显示后按当前布局恢复，不需要重启服务。
+    win.onFocusChanged(({ payload: focused }) => {
+      if (!dshPanelActive.value) return
+      if (focused) dshPanelRef.value?.refresh()
+      else void dshPanelRef.value?.hide()
+    }).catch(() => undefined),
   ])
 
   // Save window state on close, then explicitly close the window.
@@ -1492,6 +1577,8 @@ onMounted(async () => {
       } catch (e) {
         console.error('Failed to save window state before hiding to tray:', e)
       }
+      // 原生控件不会跟着窗口一起消失，先隐藏再收窗。
+      await dshPanelRef.value?.hide()
       await win.hide().catch(() => {})
       return
     }
@@ -1536,6 +1623,11 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+/* Single owner of the app background: the gradient is painted once over the
+   whole layout box and every chrome surface on top of it stays transparent.
+   Per-element copies could not line up — a narrow sidebar re-runs the same
+   gradient over a fraction of the width — and the mismatch read as a hard seam
+   against the title bar and the tab strip. */
 .app-layout {
   display: flex;
   flex-direction: column;
@@ -1548,51 +1640,76 @@ onBeforeUnmount(() => {
   display: none;
 }
 
+/* The title bar is the top slice of `.app-layout`, which owns the only
+   app-background paint in the window. Keeping every bar and sidebar below it
+   transparent lets that one gradient run edge to edge, so the sidebar column,
+   the tab strip and the content area stay visually continuous — no seam at the
+   sidebar boundary and no darker band along the bottom of the title bar. */
 .title-bar {
+  position: relative;
   flex-shrink: 0;
   height: 38px;
   display: flex;
   align-items: center;
   justify-content: flex-start;
   padding: 0 8px 0 0;
-  background: var(--card-bg-gradient);
+  background: transparent;
   user-select: none;
 }
 
-.title-bar__workspace-section {
-  width: var(--project-nav-width, 219px);
-  flex: 0 0 var(--project-nav-width, 219px);
+/* The sidebar toggle and the workspace switch occupy one fixed slot, so the CLI
+   entries start at a constant x whether the catalog sidebar is 200px or 400px
+   wide — or collapsed altogether. The slot used to be sized from the drag
+   handle's reported width, which dragged the CLI entries along with every
+   sidebar drag.
+   The slot is a little wider than its two controls need because it also has to
+   clear the divider: the selected `配置`/`项目` pill reaches its own edge, and
+   with only the divider's own 1px between them the two read as one shape. The
+   divider below carries that clearance. */
+.title-bar__workspace-switch {
+  flex: 0 0 auto;
+  min-width: 181px;
   align-self: stretch;
   display: flex;
   align-items: center;
-  gap: 6px;
+}
+
+.title-bar__workspace-section {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 0 8px;
-  border-right: 1px solid var(--separator);
-  background: var(--app-bg-gradient);
-  background-attachment: fixed;
+}
+
+/* Divider between the workspace switch and the CLI entries. It is centred and
+   deliberately short of the bar's edges — a hairline that separates without
+   re-creating the full-height rule the two sections used to draw between the
+   sidebar column and the tab strip.
+   A 1px painted centre inside an 18px box: the padding is the clearance that
+   keeps the selected `配置`/`项目` pill off the rule, and it is deliberately
+   asymmetric. On the pill side the rule only needs to stop touching it, while on
+   the tab side the strip's own 8px inset already supplies half the gap. The
+   remaining space is inert, so it still drags the window like the rest of the
+   bar. */
+.title-bar__divider {
+  flex: 0 0 18px;
+  align-self: center;
+  width: 18px;
+  height: 16px;
+  padding: 0 12px 0 5px;
+  background-color: var(--separator);
+  background-clip: content-box;
+  pointer-events: none;
 }
 
 /* The native macOS title bar reserves space for the traffic lights by adding
-   left padding. Compensate the workspace section width so its right divider
-   stays aligned with the content sidebar divider below. Keep the collapsed
-   toggle area intact because it is still visible beside the traffic lights. */
-.app-layout--mac-title-bar .title-bar__workspace-section:not(.title-bar__workspace-section--collapsed) {
-  width: calc(var(--project-nav-width, 219px) - 80px);
-  flex-basis: calc(var(--project-nav-width, 219px) - 80px);
-}
-
-.app-layout--mac-title-bar.app-layout--mac-fullscreen .title-bar__workspace-section:not(.title-bar__workspace-section--collapsed) {
-  width: calc(var(--project-nav-width, 219px) - 8px);
-  flex-basis: calc(var(--project-nav-width, 219px) - 8px);
-}
-
-.app-layout--mac-title-bar .title-bar__workspace-section--collapsed {
-  width: 45px;
-  flex-basis: 45px;
-}
-
-.title-bar__workspace-section--collapsed {
-  gap: 0;
+   left padding. It shifts the whole fixed block right and leaves its width — and
+   therefore the CLI entry positions — untouched. */
+.app-layout--mac-title-bar .title-bar {
+  position: relative;
+  padding-left: 80px;
+  transition: padding-left 0.26s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .title-bar__sidebar-slot {
@@ -1601,35 +1718,25 @@ onBeforeUnmount(() => {
   flex: 0 0 28px;
 }
 
+/* Fixed to their own content: the switch must not stretch to fill the slot, or
+   the divider and the CLI entries after it would be pushed around by the text
+   width of the active mode. */
 .title-bar__mode-tabs {
+  flex: 0 0 auto;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
-.app-layout--mac-title-bar .title-bar {
-  position: relative;
-  padding-left: 80px;
-  transition: padding-left 0.26s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-/* Make the traffic-light area background consistent with the left sidebar */
-.app-layout--mac-title-bar .title-bar::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 80px;
-  height: 100%;
-  pointer-events: none;
-  background: var(--app-bg-gradient);
-  background-attachment: fixed;
+/* Visibility rather than `v-if`: the buttons must keep their box so the fixed
+   workspace slot below never narrows and the CLI entries never shift. */
+.title-bar__mode-tabs--hidden {
+  visibility: hidden;
 }
 
 .app-layout--mac-title-bar.app-layout--mac-fullscreen .title-bar {
   padding-left: 8px;
-}
-
-.app-layout--mac-title-bar.app-layout--mac-fullscreen .title-bar::before {
-  width: 8px;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1648,8 +1755,8 @@ onBeforeUnmount(() => {
 .title-bar__mode-tab {
   position: relative;
   height: 28px;
-  min-width: 44px;
-  padding: 0 9px;
+  min-width: 66px;
+  padding: 0 12px;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -1680,21 +1787,21 @@ onBeforeUnmount(() => {
   background: #ff9500;
 }
 
+/* The CLI entries are pulled up against the workspace switch: the strip starts
+   with no leading padding and the divider itself is the gap. */
 .title-bar__tabs {
   min-width: 0;
   flex: 1;
-  align-self: stretch;
   display: flex;
   align-items: center;
   justify-content: flex-start;
   gap: 4px;
-  padding-left: 8px;
-  border-bottom: 1px solid var(--separator);
+  padding: 0 8px 0 0;
 }
 
 .title-bar__tab {
   height: 28px;
-  padding: 0 14px;
+  padding: 0 12px;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -1748,13 +1855,11 @@ onBeforeUnmount(() => {
 
 .title-bar__controls {
   flex: 0 0 auto;
-  align-self: stretch;
   margin-left: auto;
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 4px;
-  border-bottom: 1px solid var(--separator);
 }
 
 .title-bar__control {
@@ -1975,7 +2080,7 @@ onBeforeUnmount(() => {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: var(--app-bg-gradient);
+  background: var(--card);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   transition: transform 0.15s ease;
 }
@@ -2116,7 +2221,7 @@ onBeforeUnmount(() => {
   flex: 1;
   overflow: hidden;
   position: relative;
-  background: var(--app-bg-gradient);
+  background: transparent;
 }
 
 .app-panel {

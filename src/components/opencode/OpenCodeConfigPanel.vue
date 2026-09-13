@@ -485,7 +485,7 @@ watch(leftWidth, (width) => {
   height: 100%;
   min-height: 0;
   display: flex;
-  background: var(--app-bg-gradient);
+  background: transparent;
 }
 
 .opencode-config-panel__sidebar-shell {
@@ -534,7 +534,9 @@ watch(leftWidth, (width) => {
   content: '';
   width: 1px;
   height: 100%;
-  background-color: var(--separator);
+  /* Grab strip only: the sidebar and the editor pane are different surfaces, so
+     the colour step already marks the boundary. Hover/drag still highlights. */
+  background-color: transparent;
   transition: background-color 0.2s ease, width 0.2s ease, box-shadow 0.2s ease;
 }
 

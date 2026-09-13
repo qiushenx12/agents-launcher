@@ -4,7 +4,7 @@ This file provides repository-specific guidance for coding agents working on Age
 
 ## Project Overview
 
-Agents Launcher is a Windows and macOS desktop workspace for **Claude Code**, **Codex**, and **OpenCode**. It combines CLI-specific configuration profiles, project and session discovery, embedded PTY terminals, file tools, inter-tab communication, and local orchestration features.
+Agents Launcher is a Windows and macOS desktop workspace for **Claude Code**, **Codex**, **OpenCode**, and **DeepSeek Harness (dsh)**. It combines CLI-specific configuration profiles, project and session discovery, embedded PTY terminals, file tools, inter-tab communication, and local orchestration features.
 
 - **Frontend:** Vue 3 Composition API, Pinia, TypeScript, Vite, xterm.js
 - **Backend:** Rust and Tauri 2 commands/events
@@ -56,11 +56,22 @@ Tests:
 # Frontend terminal-output tests; requires Node.js 22 or newer
 node --test tests/codexTerminalOutput.test.ts
 
+# dsh runtime helpers (port/access/bounds/progress rules)
+node --test tests/dshRuntime.test.ts
+
+# Top-bar surface invariants (single owner of the app background)
+node --test tests/topBarSurface.test.ts
+
 # Rust unit tests
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 There is no lint script configured.
+
+> Building the Rust side needs a `target` directory that matches the current
+> checkout path. If `cargo check` fails inside `tauri-build` with a path from an
+> older project directory, delete the stale `src-tauri/target/debug/build/<crate>-*`
+> directories (and their `.fingerprint` entries) instead of running a full clean.
 
 ## Architecture
 
@@ -68,7 +79,7 @@ There is no lint script configured.
 
 `src/main.ts` mounts `src/App.vue`. The root component coordinates these main areas:
 
-- Shared configuration workspace for Claude Code, Codex, and OpenCode
+- Shared configuration workspace for Claude Code, Codex, OpenCode, and DeepSeek Harness
 - CLI-specific project workspaces and session terminals
 - Standalone multi-tab terminal manager
 - Multi-agent orchestration manager
@@ -80,6 +91,7 @@ Important frontend directories:
 - `src/components/claude/` - Claude Code configuration and launch controls
 - `src/components/codex/` - Codex profile editor
 - `src/components/opencode/` - OpenCode provider and profile editor
+- `src/components/dsh/` - DeepSeek Harness runtime settings, child-WebView hosting, and bounds measurement
 - `src/components/project/` - project tree, sessions, terminal area, and file tools
 - `src/components/terminal/` - xterm.js panes, terminal tabs, snapshots, and permissions
 - `src/components/orchestration/` - agent roles and orchestration presets
@@ -97,13 +109,15 @@ Tauri commands are registered in `src-tauri/src/lib.rs`. Major module groups are
 - `cli_migration`, `file_transaction` - migrations, atomic writes, verified backups, and recovery
 - `project_manager`, `session_manager` - project metadata, sessions, recent items, and text files
 - `pty/` - PTY creation, input/output, resize, title parsing, and process lifecycle
+- `dsh_runtime` - supervised external `dsh web` service: overlay generation, readiness parsing, download progress, start/stop, and port diagnostics
+- `dsh_embed` - child WebView hosting the dsh browser UI inside the workspace (Tauri `unstable` feature; keep all `add_child` usage in this file). The control's lifecycle is enforced in that module: creation and destruction are single-flight under one lock (a concurrent `add_child` blocks the event loop for hundreds of milliseconds and can orphan a visible control nothing can hide), visibility follows the `desired_visible` intent instead of call order, a failure after creation destroys the control rather than leaking it, and `set_auto_resize` is deliberately unused so the frontend's measured rectangle stays the only geometry source
 - `tab_cli` - inter-tab commands, permissions, snapshots, and orchestration presets
 - `persistent_state`, `settings_manager` - window, pane, font, profile, and launch state
 - `registry`, `claude_launcher`, `model_fetcher` - Windows integration, Claude launch, environment application, and model discovery
 
 ### CLI Isolation
 
-Claude Code, Codex, and OpenCode share UI and project abstractions, but their runtime state and configuration must remain isolated by `CliKind`.
+Claude Code, Codex, and OpenCode share UI and project abstractions, but their runtime state and configuration must remain isolated by `CliKind`. DeepSeek Harness joins the same contract but not the same runtime shape: it is a supervised HTTP service with its own browser UI, so it has no project store or PTY session and reaches the workspace through a child WebView instead.
 
 - Never infer a CLI from a display label or project name.
 - Persist and query active profiles using both CLI kind and profile ID.
@@ -117,6 +131,7 @@ Claude Code, Codex, and OpenCode share UI and project abstractions, but their ru
 - Preserve unknown fields when rewriting supported external configuration files.
 - Use `file_transaction` helpers for atomic writes, verified backups, and rollback.
 - Never log, serialize into diagnostics, or expose API keys and tokens to the frontend unnecessarily.
+- The dsh access token is the one exception and is delivered to the frontend on purpose (copy link and QR code). Keep it in `DshRuntimePanel` component state only: never in a Pinia store, never on disk, never in `safeDiagnostic`, and always redact `token=` from backend diagnostics.
 - Codex and OpenCode managed secrets use Windows DPAPI where supported.
 - Keep migration logic idempotent and cover legacy or interrupted-write cases with fixtures.
 

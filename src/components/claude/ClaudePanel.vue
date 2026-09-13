@@ -83,8 +83,7 @@ watch(leftWidth, (width) => {
   display: flex;
   height: 100%;
   overflow: hidden;
-  background: var(--app-bg-gradient);
-  background-attachment: fixed;
+  background: transparent;
 }
 
 .claude-panel__sidebar-shell {
@@ -111,8 +110,7 @@ watch(leftWidth, (width) => {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  background: var(--app-bg-gradient);
-  background-attachment: fixed;
+  background: transparent;
   padding: 12px;
   gap: 8px;
   min-width: 0;
@@ -138,7 +136,8 @@ watch(leftWidth, (width) => {
   border-top: 1px solid var(--separator);
 }
 
-/* Resize divider */
+/* Resize divider — the grab strip stays, the resting 1px rule does not: the
+   sidebar and the editor pane are already different surfaces. */
 .claude-panel__divider {
   width: 9px;
   flex-shrink: 0;
@@ -155,7 +154,7 @@ watch(leftWidth, (width) => {
   content: '';
   width: 1px;
   height: 100%;
-  background-color: var(--separator);
+  background-color: transparent;
   transition: background-color 0.2s ease, width 0.2s ease, box-shadow 0.2s ease;
 }
 

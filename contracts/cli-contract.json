@@ -8,6 +8,7 @@
       "claude",
       "codex",
       "opencode",
+      "dsh",
       "terminal",
       "orchestration"
     ],
@@ -37,6 +38,13 @@
       "command": "opencode",
       "configFormat": "jsonc",
       "supportsManagedProfile": true
+    },
+    {
+      "kind": "dsh",
+      "label": "DeepSeek Harness",
+      "command": "dsh",
+      "configFormat": "none",
+      "supportsManagedProfile": false
     }
   ],
   "issueDefinitions": [
@@ -46,7 +54,8 @@
       "messages": {
         "claude": "未检测到 Claude Code。请先安装 Claude Code，再重新检测。",
         "codex": "未检测到 CodeX。请先安装 Codex CLI，再重新检测。",
-        "opencode": "未检测到 OpenCode。请先安装 OpenCode，再重新检测。"
+        "opencode": "未检测到 OpenCode。请先安装 OpenCode，再重新检测。",
+        "dsh": "未检测到 DeepSeek Harness。请先安装 Node.js（含 npx），再重新检测；无需全局安装 dsh，可通过 npx @deepseek-ai/dsh web 直接运行。"
       }
     },
     {
@@ -55,7 +64,8 @@
       "messages": {
         "claude": "已找到 Claude Code，但版本命令执行失败。请检查可执行文件权限和 PATH。",
         "codex": "已找到 CodeX，但版本命令执行失败。请检查可执行文件权限和 PATH。",
-        "opencode": "已找到 OpenCode，但版本命令执行失败。请检查可执行文件权限和 PATH。"
+        "opencode": "已找到 OpenCode，但版本命令执行失败。请检查可执行文件权限和 PATH。",
+        "dsh": "已找到 npx，但 DeepSeek Harness 版本命令执行失败。若为网络或代理问题，请检查网络后重试；若 npx 不可用，请重新安装 Node.js。"
       }
     },
     {
@@ -64,7 +74,8 @@
       "messages": {
         "claude": "当前 Claude Code 版本低于此功能要求。请手动升级后重新检测。",
         "codex": "当前 CodeX 版本低于此功能要求。请手动升级 Codex CLI 后重新检测。",
-        "opencode": "当前 OpenCode 版本低于此功能要求。请手动升级后重新检测。"
+        "opencode": "当前 OpenCode 版本低于此功能要求。请手动升级后重新检测。",
+        "dsh": "当前 DeepSeek Harness 版本低于此功能要求。请清理 npx 缓存后重新检测，以拉取最新版本。"
       }
     },
     {
@@ -73,7 +84,8 @@
       "messages": {
         "claude": "Claude Code 的 JSON 配置无法解析。原文件未修改，请修复配置或恢复备份后重试。",
         "codex": "CodeX 的 TOML 或认证 JSON 无法解析。原文件未修改，请修复配置或恢复备份后重试。",
-        "opencode": "OpenCode 的 JSON/JSONC 配置无法解析。原文件未修改，请修复配置或恢复备份后重试。"
+        "opencode": "OpenCode 的 JSON/JSONC 配置无法解析。原文件未修改，请修复配置或恢复备份后重试。",
+        "dsh": "DeepSeek Harness 的启动配置无法生成或解析。原文件未修改，请检查应用数据目录权限后重试。"
       }
     },
     {
@@ -82,7 +94,8 @@
       "messages": {
         "claude": "Claude Code 尚未配置可用的 Token 或 API Key。请完成认证后重试。",
         "codex": "CodeX 尚未完成 ChatGPT 登录，也没有可用的自定义提供商 API Key。请完成认证后重试。",
-        "opencode": "OpenCode 尚未完成提供商登录，也没有可用的受管 API Key。请完成认证后重试。"
+        "opencode": "OpenCode 尚未完成提供商登录，也没有可用的受管 API Key。请完成认证后重试。",
+        "dsh": "DeepSeek Harness 尚未配置可用的模型凭据。请在 dsh 界面内的设置页配置，或提供 DEEPSEEK_API_KEY 等环境变量。"
       }
     },
     {
@@ -91,7 +104,8 @@
       "messages": {
         "claude": "无法连接 Claude Code 当前模型提供商。已保存配置保持不变，请检查网络、端点和凭据。",
         "codex": "无法连接 CodeX 当前模型提供商。已保存配置保持不变，请检查网络、端点和凭据。",
-        "opencode": "无法连接 OpenCode 当前模型提供商。已保存配置保持不变，请检查网络、端点和凭据。"
+        "opencode": "无法连接 OpenCode 当前模型提供商。已保存配置保持不变，请检查网络、端点和凭据。",
+        "dsh": "DeepSeek Harness 服务正在运行，但当前无法访问。请尝试重启服务后重试。"
       }
     }
   ]

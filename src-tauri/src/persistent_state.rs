@@ -146,6 +146,46 @@ impl Default for TerminalState {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DshRuntimeConfig {
+    /// `"local"` (loopback only) or `"remote"` (`0.0.0.0`, LAN reachable).
+    #[serde(default = "default_dsh_access")]
+    pub access: String,
+    #[serde(default = "default_dsh_port")]
+    pub port: u16,
+}
+
+impl Default for DshRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            access: default_dsh_access(),
+            port: default_dsh_port(),
+        }
+    }
+}
+
+impl DshRuntimeConfig {
+    /// Normalize untrusted values coming from the frontend or an edited file.
+    pub fn normalized(mut self) -> Self {
+        if self.access != "remote" {
+            self.access = "local".to_string();
+        }
+        if self.port == 0 {
+            self.port = default_dsh_port();
+        }
+        self
+    }
+}
+
+fn default_dsh_access() -> String {
+    "local".to_string()
+}
+
+fn default_dsh_port() -> u16 {
+    3080
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct AppState {
     #[serde(default)]
@@ -158,6 +198,10 @@ pub struct AppState {
     pub codex: ToolState,
     #[serde(default)]
     pub opencode: ToolState,
+    #[serde(default)]
+    pub dsh: ToolState,
+    #[serde(default)]
+    pub dsh_runtime: DshRuntimeConfig,
     #[serde(default)]
     pub terminal: TerminalState,
     #[serde(default = "default_last_active_main_tab")]
@@ -177,7 +221,7 @@ fn default_last_active_main_tab() -> String {
 }
 
 fn default_top_bar_order() -> Vec<String> {
-    ["config", "claude", "codex", "opencode"]
+    ["config", "claude", "codex", "opencode", "dsh"]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -434,6 +478,23 @@ fn migrate_legacy() -> Option<AppState> {
     Some(state)
 }
 
+// ---------------------------------------------------------------------------
+// Tauri commands — dsh runtime settings
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn load_dsh_runtime_config() -> Result<DshRuntimeConfig, String> {
+    Ok(load_state()?.dsh_runtime.normalized())
+}
+
+#[tauri::command]
+pub fn save_dsh_runtime_config(config: DshRuntimeConfig) -> Result<DshRuntimeConfig, String> {
+    let normalized = config.normalized();
+    let stored = normalized.clone();
+    update_state(|state| state.dsh_runtime = stored)?;
+    Ok(normalized)
+}
+
 // PLACEHOLDER_COMMANDS
 
 // ---------------------------------------------------------------------------
@@ -445,6 +506,7 @@ fn tool_state_mut<'a>(state: &'a mut AppState, key: &str) -> Result<&'a mut Tool
         "claude" | "claude-panel" => Ok(&mut state.claude),
         "codex" | "codex-panel" | "codex-config-panel" => Ok(&mut state.codex),
         "opencode" | "opencode-panel" | "opencode-config-panel" => Ok(&mut state.opencode),
+        "dsh" | "dsh-panel" | "dsh-config-panel" => Ok(&mut state.dsh),
         _ => Err(format!("Unknown CLI state key: {key}")),
     }
 }
@@ -454,6 +516,7 @@ fn tool_state_ref<'a>(state: &'a AppState, key: &str) -> Result<&'a ToolState, S
         "claude" | "claude-panel" => Ok(&state.claude),
         "codex" | "codex-panel" | "codex-config-panel" => Ok(&state.codex),
         "opencode" | "opencode-panel" | "opencode-config-panel" => Ok(&state.opencode),
+        "dsh" | "dsh-panel" | "dsh-config-panel" => Ok(&state.dsh),
         _ => Err(format!("Unknown CLI state key: {key}")),
     }
 }
@@ -851,8 +914,76 @@ mod tests {
         ];
         assert_eq!(
             normalize_top_bar_order(&order),
-            vec!["codex", "config", "claude", "opencode"]
+            vec!["codex", "config", "claude", "opencode", "dsh"]
         );
+    }
+
+    #[test]
+    fn top_bar_order_keeps_dsh_when_persisted() {
+        let order = vec!["dsh".to_string(), "config".to_string()];
+        assert_eq!(
+            normalize_top_bar_order(&order),
+            vec!["dsh", "config", "claude", "codex", "opencode"]
+        );
+        assert_eq!(
+            normalize_top_bar_hidden(&["dsh".to_string()]),
+            vec!["dsh"]
+        );
+    }
+
+    #[test]
+    fn dsh_tool_state_keys_are_known() {
+        let mut state = AppState::default();
+        assert!(tool_state_mut(&mut state, "dsh").is_ok());
+        assert!(tool_state_mut(&mut state, "dsh-panel").is_ok());
+        assert!(tool_state_mut(&mut state, "dsh-config-panel").is_ok());
+        assert!(tool_state_ref(&state, "dsh").is_ok());
+    }
+    #[test]
+    fn dsh_runtime_config_defaults_and_normalizes() {
+        let state: AppState = serde_json::from_str("{}").expect("empty state should decode");
+        assert_eq!(state.dsh_runtime.access, "local");
+        assert_eq!(state.dsh_runtime.port, 3080);
+
+        // AppState keeps snake_case keys, so the stored key is `dsh_runtime`.
+        let decoded: AppState =
+            serde_json::from_str(r#"{"dsh_runtime":{"access":"remote","port":3199}}"#)
+                .expect("state should decode");
+        assert_eq!(decoded.dsh_runtime.access, "remote");
+        assert_eq!(decoded.dsh_runtime.port, 3199);
+
+        let fallback = DshRuntimeConfig {
+            access: "bogus".to_string(),
+            port: 0,
+        }
+        .normalized();
+        assert_eq!(fallback.access, "local");
+        assert_eq!(fallback.port, 3080);
+    }
+
+    #[test]
+    fn app_state_without_dsh_runtime_still_starts() {
+        // Older app_state.json files have no dsh_runtime key at all; deleting
+        // the key by hand must not break startup either.
+        let stored = serde_json::json!({
+            "minimize_to_tray": true,
+            "last_active_main_tab": "codex"
+        });
+        let mut state: AppState = serde_json::from_value(stored).expect("legacy state should decode");
+        assert_eq!(state.dsh_runtime.access, "local");
+        assert_eq!(state.dsh_runtime.port, 3080);
+
+        state.dsh_runtime = DshRuntimeConfig::default();
+        let output = serde_json::to_value(&state).expect("encode state");
+        assert_eq!(output["dsh_runtime"]["access"], "local");
+        assert_eq!(output["dsh_runtime"]["port"], 3080);
+    }
+
+    #[test]
+    fn dsh_runtime_config_serializes_with_the_documented_keys() {
+        let value = serde_json::to_value(DshRuntimeConfig::default()).expect("encode config");
+        assert_eq!(value["access"], "local");
+        assert_eq!(value["port"], 3080);
     }
 
     #[test]

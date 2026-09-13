@@ -271,6 +271,101 @@
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
 }
 
+/* ── Configuration editor surfaces ───────────────────────── */
+
+/* How far the recessed editor pane is pushed down from the title bar, and the
+   interior top padding it replaces. Panels that declare their own padding top
+   (`codex`/`claude` use 12px) subtract the inset from it, so the first row keeps
+   the offset it had before the pane was lowered. The inset is the single knob for
+   that offset: raise it to lower the pane, lower it to bring the pane up. */
+#app {
+  --editor-pane-inset: 8px;
+  --editor-pane-padding-top: 12px;
+  /* The project pane sits under a 38px toolbar rather than under the title bar,
+     and runs to the window edge on its right and bottom. Only its top edge is
+     tunable, to add breathing room under the toolbar if it is ever needed. */
+  --project-pane-inset: 0;
+}
+
+/* Layout contract for every configuration workspace:
+     · the profile sidebar and the title bar above it are transparent over the
+       app background, so they are literally the same surface — light chrome;
+     · the editor pane to the right of the split is `--editor-surface`, a step
+       below that chrome. In the dark theme that step is decisive; in the light
+       theme it is the same colour, so the pane reads as before;
+     · the pane keeps a small strip of chrome above it, and its top-left corner is
+       rounded where it meets the sidebar, so the recess begins just under the
+       title bar instead of butting straight into it;
+     · editor cards add no fill of their own, so the pane reads as one recessed
+       region and the form fields inside it are what sits above the recess.
+   The theme flag lives on `<html>` (`documentElement`), so it is an ANCESTOR of
+   `#app` and must be written first. Getting that order wrong makes the rule
+   silently dead — `#app [data-theme="dark"]` can never match. The `#app` id also
+   settles specificity against the scoped `.class[data-v-…]` declarations the
+   panels carry, whatever order the bundler emits them in. */
+/* The recessed pane itself. `.config-content` is shared by the OpenCode and dsh
+   workspaces — naming it here is what makes OpenCode match the other three; the
+   `.dsh-config-panel` entry is its wrapper. */
+[data-theme="dark"] #app :is(
+  .codex-config-panel__content,
+  .claude-panel__content,
+  .config-content,
+  .dsh-config-panel
+) {
+  background: var(--editor-surface);
+}
+
+#app :is(
+  .codex-config-panel__content,
+  .claude-panel__content,
+  .config-content
+) {
+  /* Margin, not padding: the inset has to show the light chrome behind it, and
+     the pane's own background must not bleed up to the title bar. The interior
+     padding is trimmed by the same amount so the first row keeps its offset. */
+  margin-top: var(--editor-pane-inset, 12px);
+  padding-top: calc(var(--editor-pane-padding-top, 12px) - var(--editor-pane-inset, 12px));
+  border-top-left-radius: var(--radius-lg, 12px);
+}
+
+/* The project workspaces mirror the configuration ones: light chrome on the left
+   and along the top, and a recessed content pane on the right. The terminal area
+   is that pane, so it carries the same rounded top-left corner as the
+   configuration editor and runs to the window edge on the right and at the
+   bottom — the chrome it exposes is above it and to its left, where the sidebar
+   and the sidebar split live.
+   The top inset stays its own token: the project pane follows a toolbar rather
+   than the title bar, so it is tuned separately from the configuration panes. */
+#app .project-terminal {
+  margin: var(--project-pane-inset, 0) 0 0 0;
+  border-radius: var(--radius-lg, 12px) var(--radius-lg, 12px) var(--radius-lg, 12px) 0;
+}
+
+/* The toolbar reads as the top of the recessed block, so it does not draw the
+   horizontal rule that used to cut the block in two. The boundary is the colour
+   step between the chrome and the pane below it, exactly like the configuration
+   workspaces, and the grab strips keep their hover highlight. */
+[data-theme="dark"] #app .module-toolbar {
+  border-bottom-color: transparent;
+}
+
+/* The project pane is deeper than `--terminal-bg` (#171A1F), which it inherited
+   from the PTY surface: on the lighter chrome the step was too small to read as a
+   separate block. */
+[data-theme="dark"] #app .project-terminal {
+  background: var(--project-surface);
+}
+
+[data-theme="dark"] #app :is(
+  .codex-config-panel__content,
+  .claude-panel__content,
+  .config-content,
+  .dsh-config-panel
+) .card {
+  background-color: transparent;
+  box-shadow: none;
+}
+
 /* ── Settings entry (sidebar footers) ─────────────────────── */
 
 .settings-entry {

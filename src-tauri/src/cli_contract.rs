@@ -11,6 +11,7 @@ pub enum CliKind {
     Claude,
     Codex,
     Opencode,
+    Dsh,
 }
 
 impl CliKind {
@@ -19,6 +20,7 @@ impl CliKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::Dsh => "dsh",
         }
     }
 }
@@ -29,6 +31,7 @@ pub enum CliConfigFormat {
     Json,
     Toml,
     Jsonc,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +40,7 @@ pub enum CliCommand {
     Claude,
     Codex,
     Opencode,
+    Dsh,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +70,7 @@ pub enum MainTab {
     Claude,
     Codex,
     Opencode,
+    Dsh,
     Terminal,
     Orchestration,
 }
@@ -77,6 +82,7 @@ impl MainTab {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::Dsh => "dsh",
             Self::Terminal => "terminal",
             Self::Orchestration => "orchestration",
         }
@@ -168,18 +174,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contract_contains_exactly_three_stable_cli_kinds() {
+    fn contract_contains_exactly_four_stable_cli_kinds() {
         let contract = load_cli_contract().expect("contract should parse");
         assert_eq!(contract.contract_version, 1);
         assert_eq!(contract.serialized_cli_kind_field, "cliKind");
         assert_eq!(contract.legacy_default_cli_kind, CliKind::Claude);
-        assert_eq!(contract.cli_descriptors.len(), 3);
+        assert_eq!(contract.cli_descriptors.len(), 4);
         assert_eq!(contract.cli_descriptors[0].label, "Claude Code");
         assert_eq!(contract.cli_descriptors[0].command, CliCommand::Claude);
         assert_eq!(contract.cli_descriptors[1].label, "CodeX");
         assert_eq!(contract.cli_descriptors[1].command, CliCommand::Codex);
         assert_eq!(contract.cli_descriptors[2].label, "OpenCode");
         assert_eq!(contract.cli_descriptors[2].command, CliCommand::Opencode);
+        assert_eq!(contract.cli_descriptors[3].label, "DeepSeek Harness");
+        assert_eq!(contract.cli_descriptors[3].command, CliCommand::Dsh);
+        assert_eq!(contract.cli_descriptors[3].config_format, CliConfigFormat::None);
+        assert!(!contract.cli_descriptors[3].supports_managed_profile);
     }
 
     #[test]
@@ -190,7 +200,12 @@ mod tests {
                 definition.state,
                 CliStatusState::Blocked | CliStatusState::Degraded
             ));
-            for kind in [CliKind::Claude, CliKind::Codex, CliKind::Opencode] {
+            for kind in [
+                CliKind::Claude,
+                CliKind::Codex,
+                CliKind::Opencode,
+                CliKind::Dsh,
+            ] {
                 assert!(definition.messages.contains_key(&kind));
             }
         }
