@@ -4,10 +4,18 @@
       浮层清单（§4.9 A 组）：子 WebView 是盖在 DOM 之上的原生控件，任何
       fixed / Teleport 浮层都必须先让它隐藏，否则浮层整个看不见。
       让位的条件集中在下面 `embedAllowed` 一处：面板是否当前表面 +
-      App.vue 的 dshOverlayOpen（全局设置浮层、顶栏排序弹窗）+ 二维码浮层 +
-      启动前检测。新增浮层时加进这一处即可，不要另写 hide 调用。
+      App.vue 的 dshOverlayOpen（全局设置浮层、顶栏排序弹窗、CLI 门禁的
+      最短展示窗口）+ 二维码浮层 + 启动前检测。新增浮层时加进这一处即可，
+      不要另写 hide 调用。
     -->
-    <Transition name="dsh-fade">
+    <!--
+      out-in：离场分支先走完再挂载进场分支。默认的交叉过渡会把两个分支同时
+      放进 flex 布局，运行态占位区在过渡的 150ms 内被压成一半高度——子
+      WebView 按错误的 rect 创建，随后被重测阶梯校正，表现为一次可见的跳动；
+      而且创建 WebView2 会阻塞事件循环数百毫秒，正好把交叉过渡冻结在半透明
+      状态，解冻后再次突变。
+    -->
+    <Transition name="dsh-fade" mode="out-in">
       <div v-if="hasError" class="dsh-runtime-panel__error">
         <div class="card dsh-card">
           <div class="card-title">DeepSeek Harness {{ errorAction }}失败</div>

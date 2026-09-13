@@ -45,6 +45,17 @@ interface Bounds {
 const MIN_EMBED_SIZE = 2
 
 /**
+ * The launcher theme, sent with every show so a freshly created WebView2 can
+ * use dsh's own boot-screen color as its default background. WebView2's
+ * built-in default is plain white, which reads as a bright flash in a dark
+ * window before the embedded page paints its first frame.
+ */
+function uiTheme(): 'light' | 'dark' {
+  if (typeof document === 'undefined') return 'light'
+  return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light'
+}
+
+/**
  * Re-measure delays after any layout change, in milliseconds.
  *
  * The list is deliberately front-loaded: the interesting corrections happen in
@@ -179,7 +190,7 @@ export function useDshEmbed(
     const requestGeneration = generation
     let visibleAfter: boolean | undefined
     try {
-      const result = await call('dsh_embed_show', bounds) as { visible?: boolean } | undefined
+      const result = await call('dsh_embed_show', { ...bounds, theme: uiTheme() }) as { visible?: boolean } | undefined
       visibleAfter = result?.visible
     } catch (cause) {
       error.value = String(cause)

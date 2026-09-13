@@ -976,7 +976,13 @@ watch(showSettings, (visible) => {
 // 只要漏掉一条恢复路径，ResizeObserver 就会把控件重新 show 回来，然后它会
 // 一直盖在新的界面上（这正是"切到配置页后 dsh 界面仍在最上层"的原因）。
 // 新增浮层时把它加进 dshOverlayOpen。
-const dshOverlayOpen = computed(() => showSettings.value || topBarOrderModalOpen.value)
+//
+// cliGateVisible 也在此列：§4.9 B 组假设门禁与内容互斥，但 openCliTab 有最短
+// 320ms 的门禁展示窗口——运行状态已 ready、面板已挂载、门禁还盖着内容区。
+// 子 WebView 若在此窗口内创建会直接盖在门禁上，门禁消失时就是一次闪动。
+const dshOverlayOpen = computed(() => showSettings.value
+  || topBarOrderModalOpen.value
+  || cliGateVisible.value)
 
 watch(showClaudeSettings, (visible) => {
   if (
@@ -1556,12 +1562,13 @@ onMounted(async () => {
         scheduleMacFullscreenSync()
       }
     }).catch(() => undefined),
-    // 托盘语义（D2）：窗口隐藏到托盘时隐藏子 WebView，dsh 服务继续运行；
-    // 窗口重新显示后按当前布局恢复，不需要重启服务。
+    // 托盘恢复（D2）：隐藏到托盘由 onCloseRequested 显式 hide（子 WebView 的
+    // 容器是主窗口的 WS_CHILD，最小化/隐藏本就跟随父窗口，无需另行处理）；
+    // 从托盘恢复后窗口重新获得焦点，这里按当前布局重新显示，不需要重启服务。
+    // 绝不能在失焦时隐藏：点击其它应用、Alt-Tab、系统对话框都会触发 blur，
+    // 隐藏后那块区域只剩应用背景，表现为“dsh 界面整片变灰”。
     win.onFocusChanged(({ payload: focused }) => {
-      if (!dshPanelActive.value) return
-      if (focused) dshPanelRef.value?.refresh()
-      else void dshPanelRef.value?.hide()
+      if (focused && dshPanelActive.value) dshPanelRef.value?.refresh()
     }).catch(() => undefined),
   ])
 

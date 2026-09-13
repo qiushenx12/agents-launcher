@@ -49,10 +49,19 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use serde::Serialize;
+use tauri::webview::Color;
 use tauri::{LogicalPosition, LogicalSize, Manager, Webview, WebviewUrl};
 
 /// Label kept distinct from the main webview window's `"main"` label.
 const EMBED_LABEL: &str = "dsh-embed";
+
+/// WebView2's built-in default background is plain white, which reads as a
+/// bright flash in a dark window before the embedded page paints its first
+/// frame. These match the dsh web UI's own boot-screen backgrounds
+/// (`--dsh-boot-bg: #151517` dark / `#fff` light), so the chain
+/// control-created → boot screen → app UI stays the same color throughout.
+const BOOT_BACKGROUND_DARK: Color = Color(0x15, 0x15, 0x17, 0xff);
+const BOOT_BACKGROUND_LIGHT: Color = Color(0xff, 0xff, 0xff, 0xff);
 
 /// Cap for the diagnostic trace, so a long session cannot fill the disk.
 const DEBUG_LOG_MAX_BYTES: u64 = 256 * 1024;
@@ -207,8 +216,14 @@ fn create_webview(
     window: &tauri::Window,
     url: &url::Url,
     bounds: EmbedBounds,
+    dark_theme: bool,
 ) -> Result<Webview, String> {
-    let builder = tauri::webview::WebviewBuilder::new(EMBED_LABEL, WebviewUrl::External(url.clone()));
+    let builder = tauri::webview::WebviewBuilder::new(EMBED_LABEL, WebviewUrl::External(url.clone()))
+        .background_color(if dark_theme {
+            BOOT_BACKGROUND_DARK
+        } else {
+            BOOT_BACKGROUND_LIGHT
+        });
     let webview = window
         .add_child(
             builder,
@@ -226,7 +241,8 @@ fn create_webview(
 /// Show (creating or repositioning as needed) the embedded dsh UI.
 ///
 /// `width`/`height` are logical pixels measured by the frontend's placeholder
-/// element; DPI scaling stays Tauri's business.
+/// element; DPI scaling stays Tauri's business. `theme` is the launcher's
+/// current theme, used only to pick the creation-time background color.
 #[tauri::command]
 pub async fn dsh_embed_show(
     app: tauri::AppHandle,
@@ -234,6 +250,7 @@ pub async fn dsh_embed_show(
     y: f64,
     width: f64,
     height: f64,
+    theme: Option<String>,
 ) -> Result<DshEmbedResult, String> {
     let bounds = EmbedBounds {
         x,
@@ -244,6 +261,7 @@ pub async fn dsh_embed_show(
     if !bounds.is_usable() {
         return Err("dsh 内嵌区域尺寸无效。".to_string());
     }
+    let dark_theme = theme.as_deref() == Some("dark");
     // Everything below blocks (creating a WebView2 environment round-trips to the
     // main thread), so it runs on the blocking pool instead of occupying an async
     // worker — and, more importantly, instead of the event loop.
@@ -252,7 +270,7 @@ pub async fn dsh_embed_show(
             return Err("dsh 服务未运行，无法显示内嵌界面。".to_string());
         };
         let parsed = parse_url(&url)?;
-        show_blocking(&app, &url, parsed, bounds)
+        show_blocking(&app, &url, parsed, bounds, dark_theme)
     })
     .await
     .map_err(|error| format!("dsh 内嵌界面任务异常结束: {error}"))?
@@ -263,6 +281,7 @@ fn show_blocking(
     url: &str,
     parsed: url::Url,
     bounds: EmbedBounds,
+    dark_theme: bool,
 ) -> Result<DshEmbedResult, String> {
     // Intent first, work second: a hide that arrives while the creation below is
     // running must win, and it can only win if it can observe the revocation.
@@ -276,12 +295,16 @@ fn show_blocking(
         return Ok(snapshot(false));
     }
 
-    let (needs_create, needs_navigate) = {
+    let (needs_create, needs_navigate, bounds_unchanged) = {
         let state = state_lock()?;
         match state.webview.as_ref() {
             // A fresh webview is built with the URL already loaded.
-            None => (true, false),
-            Some(_) => (false, state.url.as_deref() != Some(url)),
+            None => (true, false, false),
+            Some(_) => (
+                false,
+                state.url.as_deref() != Some(url),
+                state.bounds == Some(bounds),
+            ),
         }
     };
 
@@ -289,7 +312,7 @@ fn show_blocking(
         let window = app
             .get_window("main")
             .ok_or_else(|| "找不到主窗口".to_string())?;
-        let webview = create_webview(&window, &parsed, bounds)?;
+        let webview = create_webview(&window, &parsed, bounds, dark_theme)?;
         let previous = state_lock()?.webview.replace(webview);
         if let Some(previous) = previous {
             destroy(previous);
@@ -310,12 +333,18 @@ fn show_blocking(
                 .navigate(parsed)
                 .map_err(|error| format!("无法重新加载 dsh 界面: {error}"))?;
         }
-        webview
-            .set_position(LogicalPosition::new(bounds.x, bounds.y))
-            .map_err(|error| format!("无法定位 dsh 内嵌界面: {error}"))?;
-        webview
-            .set_size(LogicalSize::new(bounds.width, bounds.height))
-            .map_err(|error| format!("无法调整 dsh 内嵌界面尺寸: {error}"))?;
+        // Skip geometry that is already applied: WebView2 repaints on every
+        // `put_Bounds`, even for an identical rectangle, and the re-measure
+        // ladder issues several shows while the layout settles — each redundant
+        // repaint used to read as a visible flicker.
+        if !bounds_unchanged {
+            webview
+                .set_position(LogicalPosition::new(bounds.x, bounds.y))
+                .map_err(|error| format!("无法定位 dsh 内嵌界面: {error}"))?;
+            webview
+                .set_size(LogicalSize::new(bounds.width, bounds.height))
+                .map_err(|error| format!("无法调整 dsh 内嵌界面尺寸: {error}"))?;
+        }
         Ok(())
     })();
     if let Err(error) = applied {
@@ -434,6 +463,13 @@ fn reload_blocking() -> Result<DshEmbedResult, String> {
     let Some(webview) = webview else {
         return Ok(snapshot(false));
     };
+    // A restart always mints a new token, i.e. a new URL — so an unchanged URL
+    // means nothing to reload. This matters because the panel also calls reload
+    // on every mount: navigating unconditionally used to re-render the whole
+    // dsh page (a white flash) on every tab switch back to dsh.
+    if state_lock()?.url.as_deref() == Some(url.as_str()) {
+        return Ok(snapshot(false));
+    }
     webview
         .navigate(parsed)
         .map_err(|error| format!("无法重新加载 dsh 界面: {error}"))?;
