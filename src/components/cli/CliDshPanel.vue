@@ -1,5 +1,8 @@
 <template>
-  <DshConfigPanel @left-width-change="emit('left-width-change', $event)" />
+  <DshConfigPanel
+    @left-width-change="emit('left-width-change', $event)"
+    @open-runtime="emit('open-runtime')"
+  />
 </template>
 
 <script setup lang="ts">
@@ -12,5 +15,6 @@ defineProps<{
 }>()
 const emit = defineEmits<{
   (event: 'left-width-change', width: number): void
+  (event: 'open-runtime'): void
 }>()
 </script>

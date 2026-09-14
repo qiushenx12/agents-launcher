@@ -146,7 +146,13 @@ test('the CLI entries hold a fixed position regardless of the sidebar', () => {
   const bar = template('src/App.vue')
   assert.match(bar, /class="title-bar__mode-tabs"[\s\S]*?aria-label="工作区"/)
   assert.doesNotMatch(bar, /v-if="leftSidebarOpen"/)
-  assert.equal(declarations(body(app, '.title-bar__mode-tabs--hidden')).get('visibility'), 'hidden')
+
+  // The switch must also stay visible and interactive: nothing inside the nav
+  // may be driven by the sidebar state, or collapsing the sidebar would hide or
+  // disable 配置/项目 and strand the user in one workspace.
+  const nav = /class="title-bar__mode-tabs"[\s\S]*?<\/nav>/.exec(bar)
+  assert.ok(nav, 'the workspace switch nav is missing')
+  assert.doesNotMatch(nav[0], /leftSidebarOpen/, 'a collapsed sidebar must not hide or disable the switch')
 
   // The bar carries no inline width binding at all.
   assert.doesNotMatch(source, /'--project-nav-width'/)

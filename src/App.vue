@@ -28,19 +28,17 @@
               <span class="sidebar-toggle-icon sidebar-toggle-icon--left" aria-hidden="true"></span>
             </button>
           </span>
-          <!-- Always rendered: a collapsed sidebar hides the switch but must not
-               let the CLI entries slide left underneath the freed space. -->
+          <!-- Always rendered and always interactive: collapsing the sidebar must
+               not make the 配置/项目 switch disappear. Keeping it in the flow also
+               means the CLI entries never slide left underneath the freed space. -->
           <nav
             class="title-bar__mode-tabs"
-            :class="{ 'title-bar__mode-tabs--hidden': !leftSidebarOpen }"
-            :aria-hidden="!leftSidebarOpen"
             aria-label="工作区"
           >
             <button
               class="title-bar__mode-tab"
               :class="{ active: workspaceMode === 'config' }"
-              :disabled="!appReady || !leftSidebarOpen"
-              :tabindex="leftSidebarOpen ? 0 : -1"
+              :disabled="!appReady"
               data-tauri-drag-region="false"
               @click="openConfigTab"
             >
@@ -55,8 +53,7 @@
             <button
               class="title-bar__mode-tab"
               :class="{ active: workspaceMode === 'project' }"
-              :disabled="!appReady || !leftSidebarOpen"
-              :tabindex="leftSidebarOpen ? 0 : -1"
+              :disabled="!appReady"
               data-tauri-drag-region="false"
               @click="openProjectTab"
             >
@@ -126,6 +123,7 @@
         <ConfigWorkspace
           :sidebar-collapsed="!leftSidebarOpen"
           @left-width-change="sharedSidebarHeaderWidth = $event + 5"
+          @open-runtime="openDshRuntimeTab"
         />
       </div>
 
@@ -320,7 +318,7 @@
             <span />
           </span>
         </button>
-        <button class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'project-drop-path' }" type="button" :aria-expanded="activeSettingsSubmenu === 'project-drop-path'" @click="toggleSettingsSubmenu('project-drop-path', $event)">
+        <button v-if="showProjectDropPathSettings" class="settings-dropdown__group-trigger" :class="{ 'is-open': activeSettingsSubmenu === 'project-drop-path' }" type="button" :aria-expanded="activeSettingsSubmenu === 'project-drop-path'" @click="toggleSettingsSubmenu('project-drop-path', $event)">
           <span>项目终端拖入文件</span>
           <span class="settings-dropdown__group-value">{{ claudeStore.projectDropPathMode === 'relative' ? '相对路径' : '仅文件名' }}</span>
           <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5" /></svg>
@@ -597,6 +595,9 @@ const settingsCliKind = computed<CliKind | null>(() => {
 const showDevOnlyClaudeSettings = import.meta.env.DEV
 const showClaudeSettings = computed(() => settingsCliKind.value === 'claude')
 const showClaudeViewSettings = computed(() => showClaudeSettings.value)
+// dsh 没有项目终端（它的界面由 dsh web 自己提供），拖入文件的路径格式选项
+// 对它无意义，在它的设置弹窗里不出现。
+const showProjectDropPathSettings = computed(() => settingsCliKind.value !== 'dsh')
 const activeClaudeView = computed<ClaudeView>(() => (
   claudeViewModeStore.runtimeView
 ))
@@ -694,6 +695,12 @@ function openConfigTab() {
 async function openProjectTab() {
   if (workspaceMode.value === 'project') return
   await openCliTab(activeCliKind.value)
+}
+
+// dsh 配置页里的「进入DeepSeek Harness」：与点顶栏 dsh 标签同一条路径，
+// 未保存的配置改动仍会先弹确认。
+function openDshRuntimeTab() {
+  void openCliTab('dsh')
 }
 
 async function selectCliKind(kind: CliKind) {
@@ -990,6 +997,14 @@ watch(showClaudeSettings, (visible) => {
     && (activeSettingsSubmenu.value === 'claude-view'
       || activeSettingsSubmenu.value === 'busy-input')
   ) {
+    activeSettingsSubmenu.value = null
+  }
+})
+
+// 切到 dsh 时收掉已展开的「项目终端拖入文件」子菜单，避免触发器已隐藏、
+// 子菜单还悬在原位。
+watch(showProjectDropPathSettings, (visible) => {
+  if (!visible && activeSettingsSubmenu.value === 'project-drop-path') {
     activeSettingsSubmenu.value = null
   }
 })
@@ -1734,12 +1749,6 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-}
-
-/* Visibility rather than `v-if`: the buttons must keep their box so the fixed
-   workspace slot below never narrows and the CLI entries never shift. */
-.title-bar__mode-tabs--hidden {
-  visibility: hidden;
 }
 
 .app-layout--mac-title-bar.app-layout--mac-fullscreen .title-bar {

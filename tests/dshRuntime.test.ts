@@ -12,6 +12,7 @@ import {
   dshBindHost,
   formatBytes,
   formatDuration,
+  formatUptimeZh,
   hasAccessToken,
   isUsableEmbedBounds,
   isValidDshPort,
@@ -237,4 +238,30 @@ test('byte and duration formatting stays readable at the boundaries', () => {
   assert.equal(formatDuration(0), '00:00')
   assert.equal(formatDuration(61_000), '01:01')
   assert.equal(formatDuration(-500), '00:00')
+})
+
+test('uptime starts with bare seconds and stacks units as it grows', () => {
+  // 初始只有秒：没有「0分」之类的前导零单位。
+  assert.equal(formatUptimeZh(0), '0秒')
+  assert.equal(formatUptimeZh(5), '5秒')
+  assert.equal(formatUptimeZh(59), '59秒')
+
+  // 满足分钟：mm分ss秒；秒补零，让每秒刷新的列宽稳定。
+  assert.equal(formatUptimeZh(60), '1分00秒')
+  assert.equal(formatUptimeZh(65), '1分05秒')
+  assert.equal(formatUptimeZh(3599), '59分59秒')
+
+  // 满足小时：hh小时mm分ss秒。
+  assert.equal(formatUptimeZh(3600), '1小时00分00秒')
+  assert.equal(formatUptimeZh(3723), '1小时02分03秒')
+  assert.equal(formatUptimeZh(86_399), '23小时59分59秒')
+
+  // 满足一天：d天hh小时mm分ss秒。
+  assert.equal(formatUptimeZh(86_400), '1天00小时00分00秒')
+  assert.equal(formatUptimeZh(90_061), '1天01小时01分01秒')
+  assert.equal(formatUptimeZh(2 * 86_400 + 3599), '2天00小时59分59秒')
+
+  // 负值与非整数防御性归零/取整。
+  assert.equal(formatUptimeZh(-3), '0秒')
+  assert.equal(formatUptimeZh(5.9), '5秒')
 })

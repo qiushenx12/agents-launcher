@@ -367,7 +367,9 @@ def install_deps() -> bool:
         print("正在检查并同步 npm 依赖……")
     else:
         print("未找到 node_modules，正在安装 npm 依赖……")
-    result = subprocess.run([npm, "install"], cwd=PROJECT_DIR)
+    # --no-audit/--no-fund: 这是每次打包都跑的依赖同步，不是依赖审查入口；
+    # 不带这两个开关时 npm 每次都输出 audit/筹款信息，把真正的打包日志淹没。
+    result = subprocess.run([npm, "install", "--no-audit", "--no-fund"], cwd=PROJECT_DIR)
     if result.returncode != 0:
         print("npm install 失败。")
         return False

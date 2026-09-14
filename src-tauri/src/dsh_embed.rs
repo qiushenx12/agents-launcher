@@ -223,7 +223,13 @@ fn create_webview(
             BOOT_BACKGROUND_DARK
         } else {
             BOOT_BACKGROUND_LIGHT
-        });
+        })
+        // Tauri installs its own drag-drop handler on every webview, which
+        // converts drops into `tauri://drag-drop` events the page never sees.
+        // The dsh UI uses plain HTML5 drag & drop (like in a browser), so the
+        // handler has to go — otherwise dropping a file into the embedded page
+        // silently does nothing.
+        .disable_drag_drop_handler();
     let webview = window
         .add_child(
             builder,

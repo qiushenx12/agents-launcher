@@ -24,6 +24,7 @@
         v-show="workspaceStore.activeKind === 'dsh'"
         :sidebar-collapsed="sidebarCollapsed"
         @left-width-change="emit('left-width-change', $event)"
+        @open-runtime="emit('open-runtime')"
       />
     </div>
 
@@ -126,6 +127,8 @@ defineProps<{
 }>()
 const emit = defineEmits<{
   (event: 'left-width-change', width: number): void
+  /** dsh 配置页的「进入DeepSeek Harness」：跳到 dsh 标签页（项目工作区）。 */
+  (event: 'open-runtime'): void
 }>()
 
 const workspaceStore = useConfigWorkspaceStore()

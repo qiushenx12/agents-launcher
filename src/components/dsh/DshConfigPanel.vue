@@ -37,24 +37,24 @@
         </div>
         <p class="field-help">{{ accessHelp }}</p>
 
-        <!-- 端口 -->
+        <!--
+          端口：输入框收窄，「重新检测端口」在同一行最右侧。不再单独输出一行
+          提示文字——占用/非法端口仍由下方 banner 与「一键清理占用」区呈现。
+        -->
         <div class="field-row">
           <label class="field-label" for="dsh-port-input">端口</label>
           <input
             id="dsh-port-input"
             v-model.number="store.port"
-            class="input"
+            class="input input--port"
             type="number"
             :min="DSH_PORT_MIN"
             :max="DSH_PORT_MAX"
             step="1"
             inputmode="numeric"
           >
-        </div>
-        <div class="field-help field-help--row">
-          <span>{{ portHelp }}</span>
           <button
-            class="btn btn-secondary field-help__action"
+            class="btn btn-secondary field-row__port-action"
             type="button"
             :disabled="store.portChecking || store.releasing"
             @click="recheckPort"
@@ -62,6 +62,28 @@
             {{ store.portChecking ? '检测中…' : '重新检测端口' }}
           </button>
         </div>
+
+        <!--
+          固定版本：每次启动成功后后端会记录当时实际运行的版本，下次启动用
+          npx 按该版本启动（命中本地缓存，不再每次解析 latest）。「检查更新」
+          是唯一会重新解析 latest 的入口：先只读查询，发现新版本时弹窗确认，
+          确认后才固定；运行中的服务不会被隐式重启，只标注重启后生效。
+        -->
+        <div class="field-row">
+          <label class="field-label">版本</label>
+          <div class="version-row">
+            <span class="version-row__value">{{ pinnedVersionLabel }}</span>
+            <button
+              class="btn btn-secondary"
+              type="button"
+              :disabled="store.updatingVersion || store.isBusy"
+              @click="checkForUpdate"
+            >
+              {{ store.updatingVersion ? '正在检查更新…' : '检查更新' }}
+            </button>
+          </div>
+        </div>
+        <p class="field-help">{{ versionHelp }}</p>
 
         <ConfigStatusBanner
           v-if="store.isRemote"
@@ -72,7 +94,7 @@
         <ConfigStatusBanner v-if="store.actionError" :message="store.actionError" tone="error" />
         <ConfigStatusBanner
           v-if="store.pendingRestart"
-          :message="`端口或访问范围已保存，重启服务后生效（当前 ${runningDescription}）。`"
+          :message="pendingRestartText"
           tone="warning"
         />
         <ConfigStatusBanner v-if="store.actionNotice" :message="store.actionNotice" tone="success" />
@@ -101,7 +123,7 @@
             <strong>{{ statusLabel }}</strong>
             <span v-if="store.status?.version" class="status-block__version">v{{ store.status.version }}</span>
           </div>
-          <p v-if="store.status?.message" class="status-block__message">{{ store.status.message }}</p>
+          <p v-if="statusMessage" class="status-block__message">{{ statusMessage }}</p>
           <pre v-if="store.status?.detail" class="status-block__detail">{{ store.status.detail }}</pre>
           <div v-if="store.isBusy && store.progress" class="status-block__progress">
             {{ progressText }}
@@ -190,25 +212,27 @@
             </li>
           </ul>
           <p v-else class="address-list__empty">{{ addressHint }}</p>
-          <!--
-            本地模式只绑 127.0.0.1，所以清单里只有「本机」一行。这里说明另外两类
-            地址为什么不在——否则看起来像是没探测到。
-          -->
-          <p v-if="localOnlyHint" class="address-list__foot">
-            当前服务是「本地」模式，只有这台电脑能访问；把访问范围改为「远程」并重启后，
-            这里会列出局域网与 Tailscale 地址。
-          </p>
         </div>
 
-        <div class="preflight-entry">
-          <button class="btn btn-secondary" type="button" @click="workspaceStore.openPreflight()">
-            启动前检测
+        <!--
+          底部行：左侧是设置入口——与其它前端左下角的一致，同一个全局浮层
+          （useSettingsPopover）、同一个 .settings-entry 外观。App.vue 的
+          「点击空白关闭」靠这个类名识别触发按钮，不能换成别的类。dsh 没有
+          侧边栏页脚，设置入口就放在这里。右侧是跳转 dsh 标签页的入口，
+          紫色在配置页里一眼可辨：它不是常规的主/次操作，也不是警告——
+          只是把用户带去 dsh 自己的界面。
+        -->
+        <div class="runtime-entry">
+          <button class="settings-entry runtime-entry__settings" type="button" @click="toggleSettings($event)">
+            ⚙ <span>设置</span>
           </button>
-          <span>在 dsh 标签页里查看界面。</span>
+          <button class="btn runtime-entry__button" type="button" @click="emit('open-runtime')">
+            进入DeepSeek Harness
+          </button>
         </div>
       </section>
 
-      <!-- 局域网二维码：与启动前检测一样是 Teleport 浮层，Rust 侧会先隐藏子 WebView -->
+      <!-- 局域网二维码：Teleport 浮层覆盖全窗，Rust 侧会先隐藏子 WebView -->
       <Teleport to="body">
         <div
           v-if="store.qrVisible"
@@ -239,44 +263,35 @@
           </section>
         </div>
       </Teleport>
-
-      <!-- 凭据说明：不做检测，也不弹引导 -->
-      <section class="card">
-        <div class="card-title">模型与凭据</div>
-        <p class="source-note">
-          DeepSeek Harness 自行管理模型与 API Key，启动器不读取也不写入。
-          凭据按以下优先级解析：环境变量（如 <code>DEEPSEEK_API_KEY</code>）→
-          <code>$DSH_HOME/.credentials.yaml</code> → 启动目录 <code>.env</code> →
-          <code>$DSH_HOME/.env</code>；也可以在 dsh 界面内的设置页配置。
-        </p>
-        <p class="source-note">
-          启动器与手动运行的 <code>dsh web</code> 共用同一份 <code>$DSH_HOME</code>，
-          因此会话、凭据与登录态是同一套。
-        </p>
-      </section>
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { confirm } from '@tauri-apps/plugin-dialog'
 import { open } from '@tauri-apps/plugin-shell'
 import {
-  DSH_DEFAULT_PORT,
   DSH_PORT_MAX,
   DSH_PORT_MIN,
   useDshConfigStore,
   type DshAccess,
 } from '@/stores/dshConfig'
-import { describeCopyTarget, describeInstallProgress, describePortOccupant, type DshAddressRow } from '@/utils/dshRuntime'
+import { describeCopyTarget, describeInstallProgress, formatUptimeZh, type DshAddressRow } from '@/utils/dshRuntime'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
+import { useSettingsPopover } from '@/composables/useSettingsPopover'
 import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
 import { useDshLink } from './useDshLink'
 import { describePortCleanupHint, shouldOfferPortCleanup } from './portCleanup'
 
 const store = useDshConfigStore()
 const workspaceStore = useConfigWorkspaceStore()
+const { toggleSettings } = useSettingsPopover()
+
+const emit = defineEmits<{
+  /** 「进入DeepSeek Harness」：由 App.vue 走与顶栏 CLI 标签相同的路径跳转。 */
+  (event: 'open-runtime'): void
+}>()
 
 /**
  * 访问地址清单：后端列出服务实际监听的每个地址（本机 / 局域网 / Tailscale），
@@ -294,14 +309,6 @@ const { copiedKey, copyAddress, loadUrls, resolveAddress, rows } = useDshLink({
 const addressHint = computed(() => (store.isRunning
   ? '正在读取访问地址…'
   : '服务运行后，这里会列出本机、局域网与 Tailscale 地址，每个地址都能单独复制。'))
-
-/**
- * 运行中的服务如果是「本地」模式，就只会有一行回环地址。判定用运行状态里的
- * access（服务实际绑定的范围），不是草稿：切到「远程」但还没重启时提示不该出现。
- */
-const localOnlyHint = computed(() => store.isRunning
-  && store.status?.access === 'local'
-  && rows.value.every((row) => row.kind === 'loopback'))
 
 function copyRowLink(row: DshAddressRow) {
   void copyAddress(row)
@@ -427,20 +434,6 @@ const accessHelp = computed(() => (
     : '仅监听 127.0.0.1，只有这台电脑可以访问。'
 ))
 
-const portHelp = computed(() => {
-  if (store.portChecking) return '正在检测端口占用情况…'
-  const portStatus = store.portStatus
-  if (!portStatus) return `dsh 默认端口为 ${DSH_DEFAULT_PORT}；端口被占用时不会自动更换。`
-  if (portStatus.available) {
-    return store.isDirty
-      ? `端口 ${store.port} 可用。修改后需要重新启动服务才能生效。`
-      : `端口 ${store.port} 可用。`
-  }
-  // 占用时先说清是谁（与其它入口同一句文案），再把用户直接指向操作入口。
-  return `端口 ${store.port} 已被占用，${describePortOccupant(portStatus.occupant, store.port)}`
-    + '可用下方「一键清理占用」结束它，或改用其它端口。'
-})
-
 const statusTone = computed(() => {
   switch (store.status?.phase) {
     case 'running': return 'running'
@@ -461,11 +454,110 @@ const statusLabel = computed(() => {
   }
 })
 
+// 「已运行 …」实时刷新：后端只随状态给 uptimeSecs 快照（与 statusFetchedAt
+// 配对），停在本界面时由这里每秒推进本地时钟，时长会一直走。显示格式随量级
+// 扩展：5秒 → 1分05秒 → 1小时02分03秒 → 1天02小时03分04秒。
+const uptimeTick = ref(Date.now())
+let uptimeTimer: ReturnType<typeof setInterval> | null = null
+
+const uptimeActive = computed(() => (
+  store.status?.phase === 'running' && store.status.uptimeSecs != null
+))
+
+const liveUptimeText = computed(() => {
+  const status = store.status
+  if (!status || !uptimeActive.value) return ''
+  const extra = Math.max(0, Math.floor((uptimeTick.value - store.statusFetchedAt) / 1000))
+  return formatUptimeZh((status.uptimeSecs ?? 0) + extra)
+})
+
+/**
+ * 状态消息行。后端的 message 是完整句（带句号）；运行中把实时「已运行 …」
+ * 插到句号前，保持「DeepSeek Harness 正在运行（已运行 1分05秒）。」的读法。
+ */
+const statusMessage = computed(() => {
+  const status = store.status
+  if (!status?.message) return ''
+  const uptime = liveUptimeText.value
+  if (!uptime) return status.message
+  const base = status.message.endsWith('。') ? status.message.slice(0, -1) : status.message
+  return `${base}（已运行 ${uptime}）。`
+})
+
+watch(uptimeActive, (active) => {
+  if (uptimeTimer !== null) {
+    clearInterval(uptimeTimer)
+    uptimeTimer = null
+  }
+  if (active) {
+    uptimeTick.value = Date.now()
+    uptimeTimer = setInterval(() => { uptimeTick.value = Date.now() }, 1000)
+  }
+}, { immediate: true })
+
+onBeforeUnmount(() => {
+  if (uptimeTimer !== null) {
+    clearInterval(uptimeTimer)
+    uptimeTimer = null
+  }
+})
+
 const runningDescription = computed(() => {
   const status = store.status
   if (!status) return '未知'
   return `${status.access === 'remote' ? '远程' : '本地'} · 端口 ${status.port}`
 })
+
+/**
+ * 版本行的显示值。固定版本来自持久化配置（不是运行状态）：服务停止时也要
+ * 能看到下次启动会用哪个版本；运行中的实际版本仍由下方状态块展示。
+ */
+const pinnedVersionLabel = computed(() => (
+  store.saved.pinnedVersion ? `v${store.saved.pinnedVersion}（固定）` : '未记录'
+))
+
+const versionHelp = computed(() => {
+  if (store.updatingVersion) return '正在向 npm 注册表查询最新版本…'
+  return store.saved.pinnedVersion
+    ? '启动时使用记录的固定版本（命中本地缓存，不再每次拉取最新版）。'
+    : '尚未记录版本：首次启动会解析最新版并在启动成功后记录下来。'
+})
+
+const runningVersionDescription = computed(() => (
+  store.status?.version ? `v${store.status.version}` : '旧版本'
+))
+
+/**
+ * 重启提示按原因区分：配置改动沿用原文案；版本更新则指出正在运行的还是旧
+ * 版本（status.version 是本次启动时记录的版本，正是要换掉的那个）。
+ */
+const pendingRestartText = computed(() => (
+  store.pendingRestartReason === 'version'
+    ? `新版本 v${store.saved.pinnedVersion} 已记录，重启服务后生效（当前运行 ${runningVersionDescription.value}）。`
+    : `端口或访问范围已保存，重启服务后生效（当前 ${runningDescription.value}）。`
+))
+
+/**
+ * 「检查更新」的完整流程：先只读查询注册表，已是最新时只提示不弹窗；发现
+ * 新版本时弹窗确认（写清会从哪个版本换到哪个版本、运行中的服务不受影响、
+ * 重启后生效），确认后才固定。弹窗里展示的就是即将固定的版本，后端按确认
+ * 值写入，不会在确认与写入之间重新解析 latest。
+ */
+async function checkForUpdate() {
+  const report = await store.checkUpdate()
+  if (!report || !report.updateAvailable) return
+  const pinned = report.pinned ? `v${report.pinned}` : '未固定'
+  const accepted = await confirm(
+    `npm 注册表最新版本为 v${report.latest}，当前固定版本为 ${pinned}。\n\n`
+    + (store.isRunning
+      ? '确认后将固定到新版本；正在运行的服务不受影响，重启 dsh 服务后生效。'
+      : '确认后将固定到新版本，下次启动时使用。')
+    + '是否更新？',
+    { title: '更新 dsh 版本', kind: 'info' },
+  )
+  if (!accepted) return
+  await store.applyVersion(report.latest)
+}
 
 /**
  * 冷缓存与缓存命中的文案必须分开：命中时字节几乎不增长，显示 0 MB/s 会误导。
@@ -579,26 +671,42 @@ function refreshStatus() {
   flex: 1;
 }
 
+/* 端口行：输入框收窄，「重新检测端口」放同一行最右侧（margin-left: auto
+   吃掉中间的剩余空间），提示文字不再单独占一行。 */
+.field-row > .input--port {
+  flex: 0 0 auto;
+  width: 110px;
+}
+
+.field-row__port-action {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: var(--font-size-small);
+}
+
 .field-help {
   margin: 2px 0 8px 120px;
   color: var(--text-secondary);
   font-size: var(--font-size-small);
 }
 
-/* 端口说明 + 重新检测：占用状态可能随时变化，给一个显式入口。 */
-.field-help--row {
+/* 版本行：当前固定版本 + 「更新版本」按钮，与端口行的操作位对齐。 */
+.version-row {
+  min-width: 0;
+  flex: 1;
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 2px 0 8px 120px;
 }
 
-.field-help--row > span {
+.version-row__value {
   min-width: 0;
   flex: 1;
+  color: var(--text-primary);
+  font-size: var(--font-size-small);
 }
 
-.field-help__action {
+.version-row .btn {
   flex: 0 0 auto;
   padding: 2px 8px;
   font-size: var(--font-size-small);
@@ -693,26 +801,30 @@ function refreshStatus() {
   border-top: 1px solid var(--separator);
 }
 
-.preflight-entry {
+.runtime-entry {
   margin-top: 10px;
   display: flex;
   align-items: center;
+  /* 设置入口靠左，「进入DeepSeek Harness」靠右。 */
+  justify-content: space-between;
   gap: 10px;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
 }
 
-.source-note {
-  margin: 6px 0;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-  line-height: 1.55;
+/* 设置入口沿用侧边栏页脚的 .settings-entry 外观；行内用法收回整行宽度。 */
+.runtime-entry__settings {
+  width: auto;
+  flex: 0 0 auto;
 }
 
-.source-note code {
-  padding: 1px 4px;
-  border-radius: 3px;
-  background: var(--tab-bg);
+/* 与主色蓝、成功绿、警告/危险都拉开距离的紫色：它是跳转入口而非操作。 */
+.runtime-entry__button {
+  background-color: #6B5CE7;
+  color: #FFFFFF;
+}
+
+.runtime-entry__button:hover:not(:disabled),
+.runtime-entry__button:active:not(:disabled) {
+  background-color: #5848C9;
 }
 
 /* 端口占用时的清理行：按钮 + 后果说明。 */
@@ -763,17 +875,11 @@ function refreshStatus() {
 }
 
 .address-list__note,
-.address-list__empty,
-.address-list__foot {
+.address-list__empty {
   margin: 0;
   color: var(--text-secondary);
   font-size: var(--font-size-small);
   line-height: 1.5;
-}
-
-/* 清单下方的补充说明：与列表之间留一点距离，读起来是"清单的注脚"。 */
-.address-list__foot {
-  margin-top: 6px;
 }
 
 .address-list__items {
@@ -845,7 +951,7 @@ function refreshStatus() {
   font-size: var(--font-size-small);
 }
 
-/* 二维码浮层：与启动前检测同层，Teleport 到 body 覆盖全屏（含标题栏）。 */
+/* 二维码浮层：Teleport 到 body 覆盖全屏（含标题栏）。 */
 .dsh-qr-overlay {
   position: fixed;
   inset: 0;

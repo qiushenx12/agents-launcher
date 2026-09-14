@@ -46,6 +46,52 @@ const DEFAULT_PORT: u16 = 3080;
 /// installed the package globally, and this feature must work without that.
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 
+/// Package spec handed to npx. A recorded version pins the start to exactly
+/// that release (`@deepseek-ai/dsh@0.1.0`), which npx serves from its cache
+/// without re-resolving `latest`; without a record the bare spec keeps the
+/// previous "resolve latest" behaviour for the first-ever start.
+fn dsh_package_spec(version: Option<&str>) -> String {
+    match version {
+        Some(version) => format!("{DSH_PACKAGE}@{version}"),
+        None => DSH_PACKAGE.to_string(),
+    }
+}
+
+/// A recorded version becomes part of a command line, so accept only the
+/// charset a semver/npm dist-tag can actually use. Anything else means the
+/// state file was edited by hand; the start then falls back to the bare spec
+/// and the post-start version record heals the stored value.
+fn is_valid_pinned_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+'))
+}
+
+/// The pinned version a start should use. A corrupted entry is dropped here
+/// so it can never reach the npx command line.
+fn start_pinned_version() -> Option<String> {
+    crate::persistent_state::load_dsh_pinned_version()
+        .filter(|version| is_valid_pinned_version(version))
+}
+
+/// Persist the version that just started, unless the stored pin moved while
+/// this start was in flight (the user clicked 「更新版本」 during the download):
+/// the newer record must survive a slower start of the older pin.
+fn record_started_version(started_with: Option<&str>, version: &str) {
+    if !is_valid_pinned_version(version) || started_with == Some(version) {
+        return;
+    }
+    let current = crate::persistent_state::load_dsh_pinned_version();
+    if current.as_deref() != started_with {
+        return;
+    }
+    if let Err(error) = crate::persistent_state::save_dsh_pinned_version(version) {
+        eprintln!("未能记录 dsh 版本（{version}）：{error}");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DshAccess {
@@ -106,6 +152,11 @@ pub struct DshRuntimeStatus {
     pub executable: Option<String>,
     /// User-facing Chinese description, rendered verbatim.
     pub message: String,
+    /// Seconds since the supervised service started; `Some` only while Running.
+    /// The frontend turns this into a live-ticking「已运行 …」label, so the
+    /// backend reports a plain number instead of baking a stale value into
+    /// `message`.
+    pub uptime_secs: Option<u64>,
     /// Short machine-readable code for the failed phase:
     /// `port_in_use` / `npx_missing` / `spawn_failed` / `ready_timeout` /
     /// `exited` / `stop_failed`.
@@ -215,6 +266,38 @@ struct DshInstallProgress {
     elapsed_ms: u64,
     /// The cache is not growing, so the package came from the local cache.
     cached: bool,
+}
+
+/// Outcome of 「检查更新」's read-only half: what the registry's `latest` is
+/// and whether pinning to it would change what the next start runs. Nothing
+/// is written here — the update itself is a separate, confirmed command.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshVersionCheck {
+    /// The registry's current `latest`.
+    pub latest: String,
+    /// The version future starts are pinned to, when one has been recorded.
+    pub pinned: Option<String>,
+    /// True when the pin differs from `latest`, i.e. there is something the
+    /// confirmation dialog can offer to apply.
+    pub update_available: bool,
+    /// User-facing Chinese summary, rendered verbatim by the panel.
+    pub message: String,
+}
+
+/// Outcome of the confirmed 「更新版本」: `version` has been recorded as the
+/// pinned version future starts use.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshVersionUpdate {
+    /// The version future starts are now pinned to.
+    pub version: String,
+    /// The pin this update replaced, when there was one.
+    pub previous: Option<String>,
+    /// False when the recorded version was already the pinned one.
+    pub changed: bool,
+    /// User-facing Chinese summary, rendered verbatim by the panel.
+    pub message: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -744,10 +827,10 @@ fn configure_process_tree(_command: &mut Command) {
 /// launcher parses its own flags and hands *everything after the first unknown
 /// token* to the app, so `--patch` after `--port` would reach the web app and
 /// be rejected with `unknown option '--patch'`.
-fn dsh_arguments(overlay: &Path, port: u16) -> Vec<String> {
+fn dsh_arguments(overlay: &Path, port: u16, version: Option<&str>) -> Vec<String> {
     vec![
         "--yes".to_string(),
-        DSH_PACKAGE.to_string(),
+        dsh_package_spec(version),
         "web".to_string(),
         "--patch".to_string(),
         overlay.to_string_lossy().to_string(),
@@ -1329,10 +1412,11 @@ fn spawn_and_wait(
     npx: &Path,
     overlay: &Path,
     port: u16,
+    version: Option<&str>,
 ) -> Result<SpawnOutcome, SpawnFailure> {
     let mut command = hidden_command(npx);
     command
-        .args(dsh_arguments(overlay, port))
+        .args(dsh_arguments(overlay, port, version))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1600,9 +1684,13 @@ fn with_shutdown_error(detail: Option<String>, outcome: Result<(), String>) -> O
     })
 }
 
-fn read_version(npx: &Path) -> Option<String> {
+/// The version of the dsh package behind one spec. A pinned spec is served
+/// from the npx cache without a registry round-trip; the bare spec resolves
+/// `latest`, which is why it is only used before the first version record
+/// exists.
+fn read_version(npx: &Path, spec: &str) -> Option<String> {
     let output = hidden_command(npx)
-        .args(["--yes", DSH_PACKAGE, "-V"])
+        .args(["--yes", spec, "-V"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1627,6 +1715,46 @@ fn read_version(npx: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+fn locate_npm() -> Option<PathBuf> {
+    crate::platform_env::locate_executable("npm")
+}
+
+/// The `latest` dist-tag of the dsh package, from npm registry metadata.
+///
+/// `npm view` answers without downloading the package, keeping 「更新版本」 a
+/// quick check; the download happens on the next start, under the same
+/// progress reporting as any other start.
+fn query_latest_version(npm: &Path) -> Result<String, String> {
+    let output = hidden_command(npm)
+        .args(["view", DSH_PACKAGE, "version"])
+        .output()
+        .map_err(|error| format!("无法运行 npm: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail: Vec<&str> = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(3)
+            .collect();
+        return Err(format!(
+            "查询 dsh 最新版本失败（{}）。请检查网络与代理后重试。",
+            if detail.is_empty() {
+                format!("npm 退出码 {}", output.status.code().unwrap_or(-1))
+            } else {
+                detail.join("；")
+            }
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| is_valid_pinned_version(line))
+        .map(str::to_string)
+        .ok_or_else(|| "npm 返回的 dsh 版本号无法识别。".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Start / stop / status
 // ---------------------------------------------------------------------------
@@ -1645,6 +1773,7 @@ fn failure_status(
         version: None,
         executable: locate_npx().map(|path| path.to_string_lossy().to_string()),
         message: message.to_string(),
+        uptime_secs: None,
         issue: Some(issue.to_string()),
         detail,
     }
@@ -1658,6 +1787,7 @@ fn stopped_status(access: DshAccess, port: u16) -> DshRuntimeStatus {
         version: None,
         executable: locate_npx().map(|path| path.to_string_lossy().to_string()),
         message: "DeepSeek Harness 未启动。".to_string(),
+        uptime_secs: None,
         issue: None,
         detail: None,
     }
@@ -1695,6 +1825,9 @@ fn start_server(app: &AppHandle, access: DshAccess, port: u16) -> DshRuntimeStat
         );
     };
     let executable = npx.to_string_lossy().to_string();
+    // The recorded version is read at the start of the launch so the whole
+    // attempt runs against one pin, even if 「更新版本」 moves it meanwhile.
+    let pinned = start_pinned_version();
 
     if port_is_occupied(access.probe_host(), port) {
         let occupant = describe_occupant(port);
@@ -1710,7 +1843,7 @@ fn start_server(app: &AppHandle, access: DshAccess, port: u16) -> DshRuntimeStat
         Err(error) => return failure_status(access, port, "spawn_failed", &error, None),
     };
 
-    let outcome = match spawn_and_wait(app, &npx, &overlay, port) {
+    let outcome = match spawn_and_wait(app, &npx, &overlay, port, pinned.as_deref()) {
         Ok(outcome) => outcome,
         Err((issue, message, detail)) => {
             return failure_status(access, port, &issue, &message, detail)
@@ -1735,7 +1868,13 @@ fn start_server(app: &AppHandle, access: DshAccess, port: u16) -> DshRuntimeStat
             detail,
         );
     }
-    let version = read_version(&npx);
+    let version = read_version(&npx, &dsh_package_spec(pinned.as_deref()));
+    if let Some(version) = version.as_deref() {
+        // This is the version record every later start is pinned to. Persisting
+        // it is best-effort: a failed write must not turn a healthy start into
+        // a failure.
+        record_started_version(pinned.as_deref(), version);
+    }
     if shutdown_requested() {
         let detail = with_shutdown_error(
             None,
@@ -1781,6 +1920,7 @@ fn start_server(app: &AppHandle, access: DshAccess, port: u16) -> DshRuntimeStat
             Some(_) => "DeepSeek Harness 正在运行，局域网内其它设备也可以访问。".to_string(),
             None => "DeepSeek Harness 正在运行，仅本机可访问。".to_string(),
         },
+        uptime_secs: Some(0),
         issue: None,
         detail: None,
     }
@@ -1824,10 +1964,9 @@ fn live_status(guard: &mut DshRegistry) -> Option<DshRuntimeStatus> {
             port,
             version: server.version.clone(),
             executable: Some(server.executable.clone()),
-            message: format!(
-                "DeepSeek Harness 正在运行（已运行 {} 秒）。",
-                server.started_at.elapsed().as_secs()
-            ),
+            // 「已运行 …」由前端按 uptime_secs 每秒刷新，这里只给快照值。
+            message: "DeepSeek Harness 正在运行。".to_string(),
+            uptime_secs: Some(server.started_at.elapsed().as_secs()),
             issue: None,
             detail: None,
         }),
@@ -1840,6 +1979,7 @@ fn live_status(guard: &mut DshRegistry) -> Option<DshRuntimeStatus> {
                 version: None,
                 executable: None,
                 message: format!("dsh 服务已意外退出（{}）。", describe_exit_status(&status)),
+                uptime_secs: None,
                 issue: Some("exited".to_string()),
                 detail: None,
             };
@@ -1853,6 +1993,7 @@ fn live_status(guard: &mut DshRegistry) -> Option<DshRuntimeStatus> {
             version: None,
             executable: None,
             message: format!("无法查询 dsh 进程状态: {error}"),
+            uptime_secs: None,
             issue: Some("exited".to_string()),
             detail: None,
         }),
@@ -2008,6 +2149,85 @@ pub async fn dsh_release_port(port: u16) -> Result<DshPortReleaseReport, String>
     tauri::async_runtime::spawn_blocking(move || release_port(port))
         .await
         .map_err(|error| format!("清理端口任务异常结束: {error}"))
+}
+
+/// 「检查更新」: resolve the registry's `latest` and compare it with the
+/// recorded pin. Read-only — whether to apply the update is decided by the
+/// frontend's confirmation dialog and carried out by `dsh_update_version`.
+///
+/// `npm view` answers from registry metadata without downloading the package,
+/// so this check stays quick; the download happens on the next start, under
+/// the same progress reporting as any other start.
+#[tauri::command]
+pub async fn dsh_check_update() -> Result<DshVersionCheck, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Some(npm) = locate_npm() else {
+            return Err("未检测到 npm。请先安装 Node.js（含 npm/npx）后重试。".to_string());
+        };
+        let latest = query_latest_version(&npm)?;
+        let pinned = start_pinned_version();
+        let update_available = pinned.as_deref() != Some(latest.as_str());
+        let message = if update_available {
+            match pinned.as_deref() {
+                Some(old) => format!("发现新版本：v{old} → v{latest}。"),
+                None => format!("尚未固定版本，注册表最新版本为 v{latest}。"),
+            }
+        } else {
+            format!("当前已是最新版本（v{latest}）。")
+        };
+        Ok(DshVersionCheck {
+            latest,
+            pinned,
+            update_available,
+            message,
+        })
+    })
+    .await
+    .map_err(|error| format!("检查 dsh 更新任务异常结束: {error}"))?
+}
+
+/// 「更新版本」的确认后一半: record `version` (the value `dsh_check_update`
+/// just reported and the user confirmed) as the pinned version.
+///
+/// The version comes from the check instead of being re-queried here: the
+/// dialog showed that exact version, and re-resolving `latest` could pin a
+/// release the user never saw. Deliberately not tied to the start/stop lock:
+/// the pin only takes effect on the *next* start, and a start already in
+/// flight keeps the pin it began with (`record_started_version` refuses to
+/// overwrite a pin that moved). Restarting a running service is the
+/// frontend's follow-up decision, not part of this command.
+#[tauri::command]
+pub async fn dsh_update_version(version: String) -> Result<DshVersionUpdate, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let version = version.trim().to_string();
+        if !is_valid_pinned_version(&version) {
+            return Err("要固定的 dsh 版本号无法识别，未做任何更改。".to_string());
+        }
+        let previous = start_pinned_version();
+        if previous.as_deref() == Some(version.as_str()) {
+            return Ok(DshVersionUpdate {
+                message: format!("v{version} 已是当前固定版本。"),
+                version,
+                previous,
+                changed: false,
+            });
+        }
+        crate::persistent_state::save_dsh_pinned_version(&version)?;
+        let message = match previous.as_deref() {
+            Some(old) => {
+                format!("已更新 dsh 版本：v{old} → v{version}。重启 dsh 服务后生效。")
+            }
+            None => format!("已固定 dsh 版本 v{version}，下次启动将使用该版本。"),
+        };
+        Ok(DshVersionUpdate {
+            version,
+            previous,
+            changed: true,
+            message,
+        })
+    })
+    .await
+    .map_err(|error| format!("更新 dsh 版本任务异常结束: {error}"))?
 }
 
 /// Stop the managed server during application shutdown.
@@ -2352,7 +2572,7 @@ mod tests {
 
     #[test]
     fn dsh_arguments_put_launcher_flags_before_app_flags() {
-        let args = dsh_arguments(Path::new("/tmp/overlay.yml"), 3199);
+        let args = dsh_arguments(Path::new("/tmp/overlay.yml"), 3199, None);
         assert_eq!(
             args,
             vec![
@@ -2366,6 +2586,42 @@ mod tests {
                 "--no-open",
             ]
         );
+    }
+
+    #[test]
+    fn dsh_arguments_pin_the_package_to_the_recorded_version() {
+        let args = dsh_arguments(Path::new("/tmp/overlay.yml"), 3199, Some("0.1.0"));
+        assert_eq!(args[1], "@deepseek-ai/dsh@0.1.0");
+        assert_eq!(args[0], "--yes");
+        assert_eq!(args[2], "web");
+
+        assert_eq!(dsh_package_spec(None), "@deepseek-ai/dsh");
+        assert_eq!(dsh_package_spec(Some("0.2.0-beta.1")), "@deepseek-ai/dsh@0.2.0-beta.1");
+    }
+
+    /// The recorded version ends up inside an npx package spec on a command
+    /// line, so anything outside the semver/dist-tag charset is rejected —
+    /// a hand-edited state file must fall back to the bare spec, never reach
+    /// the shell.
+    #[test]
+    fn pinned_versions_accept_only_the_npm_spec_charset() {
+        for valid in ["0.1.0", "1.2.3-beta.4", "0.0.0-nightly.20240101+build.5"] {
+            assert!(is_valid_pinned_version(valid), "{valid} should be pinnable");
+        }
+        for invalid in [
+            "",
+            " 0.1.0",
+            "0.1.0 ",
+            "0.1.0;rm -rf",
+            "0.1.0&calc",
+            "$(x)",
+            "0.1.0/next",
+            "0.1.0\n0.2.0",
+        ] {
+            assert!(!is_valid_pinned_version(invalid), "{invalid:?} must be rejected");
+        }
+        let too_long = "1".repeat(65);
+        assert!(!is_valid_pinned_version(&too_long), "an over-long pin must be rejected");
     }
 
     #[test]

@@ -283,6 +283,8 @@ pub fn run() {
             dsh_runtime::dsh_runtime_stop,
             dsh_runtime::dsh_check_port,
             dsh_runtime::dsh_release_port,
+            dsh_runtime::dsh_check_update,
+            dsh_runtime::dsh_update_version,
             // DeepSeek Harness embedded browser surface (child WebView)
             dsh_embed::dsh_embed_show,
             dsh_embed::dsh_embed_hide,

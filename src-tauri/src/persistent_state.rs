@@ -154,6 +154,14 @@ pub struct DshRuntimeConfig {
     pub access: String,
     #[serde(default = "default_dsh_port")]
     pub port: u16,
+    /// The dsh version future starts are pinned to (`npx @deepseek-ai/dsh@<v>`).
+    ///
+    /// Recorded by the backend after every successful start, so the next start
+    /// reuses exactly the version that worked instead of re-resolving `latest`
+    /// on every launch. `None` only before the first recorded start; the
+    /// frontend never writes this field (see `save_dsh_runtime_config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_version: Option<String>,
 }
 
 impl Default for DshRuntimeConfig {
@@ -161,6 +169,7 @@ impl Default for DshRuntimeConfig {
         Self {
             access: default_dsh_access(),
             port: default_dsh_port(),
+            pinned_version: None,
         }
     }
 }
@@ -174,6 +183,7 @@ impl DshRuntimeConfig {
         if self.port == 0 {
             self.port = default_dsh_port();
         }
+        self.pinned_version = normalize_dsh_pinned_version(self.pinned_version);
         self
     }
 }
@@ -184,6 +194,32 @@ fn default_dsh_access() -> String {
 
 fn default_dsh_port() -> u16 {
     3080
+}
+
+/// A blank stored pin is no pin at all. Charset validation happens in
+/// `dsh_runtime`, which owns everything version-sensitive (the value ends up
+/// inside an npx package spec).
+fn normalize_dsh_pinned_version(version: Option<String>) -> Option<String> {
+    version
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Merge an incoming config with the stored one: the frontend save carries
+/// only `access`/`port`, so a missing pin must preserve the stored one rather
+/// than wiping the version the backend recorded.
+fn merge_dsh_runtime_config(
+    incoming: DshRuntimeConfig,
+    stored: &DshRuntimeConfig,
+) -> DshRuntimeConfig {
+    if incoming.pinned_version.is_some() {
+        incoming
+    } else {
+        DshRuntimeConfig {
+            pinned_version: stored.pinned_version.clone(),
+            ..incoming
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -489,10 +525,30 @@ pub fn load_dsh_runtime_config() -> Result<DshRuntimeConfig, String> {
 
 #[tauri::command]
 pub fn save_dsh_runtime_config(config: DshRuntimeConfig) -> Result<DshRuntimeConfig, String> {
-    let normalized = config.normalized();
-    let stored = normalized.clone();
-    update_state(|state| state.dsh_runtime = stored)?;
-    Ok(normalized)
+    let incoming = config.normalized();
+    let mut merged: Option<DshRuntimeConfig> = None;
+    update_state(|state| {
+        let next = merge_dsh_runtime_config(incoming, &state.dsh_runtime);
+        state.dsh_runtime = next.clone();
+        merged = Some(next);
+    })?;
+    merged.ok_or_else(|| "保存 dsh 运行设置失败：状态更新未执行。".to_string())
+}
+
+/// The version future dsh starts are pinned to. `None` before the first
+/// recorded start. Read by `dsh_runtime` when it builds the npx invocation.
+pub(crate) fn load_dsh_pinned_version() -> Option<String> {
+    load_state()
+        .ok()
+        .and_then(|state| normalize_dsh_pinned_version(state.dsh_runtime.pinned_version))
+}
+
+/// Record the dsh version that just started successfully. A write failure is
+/// reported to the caller but must never fail the launch itself.
+pub(crate) fn save_dsh_pinned_version(version: &str) -> Result<(), String> {
+    let normalized = normalize_dsh_pinned_version(Some(version.to_string()))
+        .ok_or_else(|| "dsh 版本号为空，无法记录。".to_string())?;
+    update_state(|state| state.dsh_runtime.pinned_version = Some(normalized))
 }
 
 // PLACEHOLDER_COMMANDS
@@ -955,10 +1011,27 @@ mod tests {
         let fallback = DshRuntimeConfig {
             access: "bogus".to_string(),
             port: 0,
+            pinned_version: None,
         }
         .normalized();
         assert_eq!(fallback.access, "local");
         assert_eq!(fallback.port, 3080);
+
+        let padded = DshRuntimeConfig {
+            access: "local".to_string(),
+            port: 3080,
+            pinned_version: Some("  0.1.0  ".to_string()),
+        }
+        .normalized();
+        assert_eq!(pinned_version_of(&padded), Some("0.1.0"));
+
+        let blank = DshRuntimeConfig {
+            access: "local".to_string(),
+            port: 3080,
+            pinned_version: Some("   ".to_string()),
+        }
+        .normalized();
+        assert_eq!(blank.pinned_version, None, "a blank pin is no pin");
     }
 
     #[test]
@@ -984,6 +1057,51 @@ mod tests {
         let value = serde_json::to_value(DshRuntimeConfig::default()).expect("encode config");
         assert_eq!(value["access"], "local");
         assert_eq!(value["port"], 3080);
+        // No recorded version yet: the key is omitted, so pre-pin state files
+        // and post-pin ones are distinguishable.
+        assert!(value.get("pinnedVersion").is_none());
+
+        let pinned = DshRuntimeConfig {
+            pinned_version: Some("0.1.0".to_string()),
+            ..DshRuntimeConfig::default()
+        };
+        let value = serde_json::to_value(pinned).expect("encode pinned config");
+        assert_eq!(value["pinnedVersion"], "0.1.0");
+    }
+
+    /// The frontend save carries only access/port. It must never wipe the
+    /// version the backend recorded after a start; an explicit pin in the
+    /// payload (a future API) still wins.
+    #[test]
+    fn saving_dsh_runtime_config_preserves_the_pinned_version() {
+        let stored = DshRuntimeConfig {
+            pinned_version: Some("0.1.0".to_string()),
+            ..DshRuntimeConfig::default()
+        };
+        let incoming = DshRuntimeConfig {
+            access: "remote".to_string(),
+            port: 3199,
+            pinned_version: None,
+        };
+        let merged = merge_dsh_runtime_config(incoming, &stored);
+        assert_eq!(merged.access, "remote");
+        assert_eq!(merged.port, 3199);
+        assert_eq!(pinned_version_of(&merged), Some("0.1.0"));
+
+        let explicit = DshRuntimeConfig {
+            pinned_version: Some("0.2.0".to_string()),
+            ..DshRuntimeConfig::default()
+        };
+        let merged = merge_dsh_runtime_config(explicit, &stored);
+        assert_eq!(pinned_version_of(&merged), Some("0.2.0"));
+
+        let merged = merge_dsh_runtime_config(DshRuntimeConfig::default(), &DshRuntimeConfig::default());
+        assert_eq!(merged.pinned_version, None);
+    }
+
+    /// Decode helper so the assertions above read as strings.
+    fn pinned_version_of(config: &DshRuntimeConfig) -> Option<&str> {
+        config.pinned_version.as_deref()
     }
 
     #[test]

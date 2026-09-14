@@ -331,3 +331,31 @@ export function formatDuration(elapsedMs: number): string {
   const seconds = String(total % 60).padStart(2, '0')
   return `${minutes}:${seconds}`
 }
+
+/**
+ * 「已运行 …」label for the supervised dsh service. Units stack as the duration
+ * grows: `5秒` → `1分05秒` → `1小时02分03秒` → `1天02小时03分04秒`. Lower units
+ * are zero-padded once a higher unit leads, so the ticking seconds column keeps
+ * a steady width.
+ */
+export function formatUptimeZh(totalSeconds: number): string {
+  const total = Math.max(0, Math.floor(totalSeconds))
+  const seconds = total % 60
+  const minutes = Math.floor(total / 60) % 60
+  const hours = Math.floor(total / 3600) % 24
+  const days = Math.floor(total / 86400)
+  if (days > 0) {
+    return `${days}天${pad2(hours)}小时${pad2(minutes)}分${pad2(seconds)}秒`
+  }
+  if (total >= 3600) {
+    return `${Math.floor(total / 3600)}小时${pad2(minutes)}分${pad2(seconds)}秒`
+  }
+  if (total >= 60) {
+    return `${Math.floor(total / 60)}分${pad2(seconds)}秒`
+  }
+  return `${seconds}秒`
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, '0')
+}

@@ -33,6 +33,11 @@ export interface DshRuntimeStatus {
   version: string | null
   executable: string | null
   message: string
+  /**
+   * Seconds since the supervised service started; non-null only while running.
+   * Pair with `statusFetchedAt` to render a live-ticking「已运行 …」label.
+   */
+  uptimeSecs: number | null
   issue: string | null
   detail: string | null
 }
@@ -71,6 +76,40 @@ export interface DshInstallProgress {
 export interface DshRuntimeConfig {
   access: DshAccess
   port: number
+  /**
+   * The version future starts are pinned to, recorded by the backend after
+   * each successful start. Absent before the first recorded start; the
+   * frontend never writes it (a save without it preserves the stored pin).
+   */
+  pinnedVersion?: string | null
+}
+
+/** Read-only outcome of 「检查更新」 (`dsh_check_update`): nothing is written. */
+export interface DshVersionCheck {
+  /** The registry's current `latest`. */
+  latest: string
+  /** The version future starts are pinned to, when one has been recorded. */
+  pinned: string | null
+  /** True when the pin differs from `latest`, i.e. an update can be offered. */
+  updateAvailable: boolean
+  /** Backend-provided user-facing summary, rendered verbatim. */
+  message: string
+}
+
+/** Outcome of the confirmed 「更新版本」 command (`dsh_update_version`). */
+export interface DshVersionUpdate {
+  /** The version future starts are now pinned to. */
+  version: string
+  /** The pin this update replaced, when there was one. */
+  previous: string | null
+  /** False when the recorded version was already the pinned one. */
+  changed: boolean
+  /** Backend-provided user-facing summary, rendered verbatim. */
+  message: string
+}
+
+function normalizePinnedVersion(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
 function normalizeStatusAccess(value: unknown): DshAccess {
@@ -79,7 +118,11 @@ function normalizeStatusAccess(value: unknown): DshAccess {
 
 export const useDshConfigStore = defineStore('dshConfig', () => {
   /** Last persisted values; the draft is compared against these. */
-  const saved = reactive<DshRuntimeConfig>({ access: 'local', port: DSH_DEFAULT_PORT })
+  const saved = reactive<DshRuntimeConfig>({
+    access: 'local',
+    port: DSH_DEFAULT_PORT,
+    pinnedVersion: null,
+  })
   const access = ref<DshAccess>('local')
   const port = ref<number>(DSH_DEFAULT_PORT)
   const loading = ref(false)
@@ -87,6 +130,12 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
   const loaded = ref(false)
 
   const status = ref<DshRuntimeStatus | null>(null)
+  /**
+   * Local clock reading (Date.now()) of the moment `status` last came back from
+   * the backend. `uptimeSecs` is a snapshot; a live label adds the local time
+   * elapsed since this reading.
+   */
+  const statusFetchedAt = ref(0)
   const statusChecking = ref(false)
   const portStatus = ref<DshPortStatus | null>(null)
   const portChecking = ref(false)
@@ -98,6 +147,10 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
   const progress = ref<DshInstallProgress | null>(null)
   /** Set when a saved change needs a service restart to take effect. */
   const pendingRestart = ref(false)
+  /** What `pendingRestart` is about: a config edit or a version update. */
+  const pendingRestartReason = ref<'config' | 'version' | null>(null)
+  /** True while 「检查更新」/「更新版本」 is talking to the registry or writing. */
+  const updatingVersion = ref(false)
   /** The address QR dialog lives in the configuration panel. */
   const qrVisible = ref(false)
   let loadPromise: Promise<void> | null = null
@@ -143,6 +196,7 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
       version: null,
       executable: null,
       message: 'DeepSeek Harness 未启动。',
+      uptimeSecs: null,
       issue: null,
       detail: null,
     }
@@ -157,6 +211,7 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
         const config = await invoke<DshRuntimeConfig>('load_dsh_runtime_config')
         saved.access = normalizeDshAccess(config.access)
         saved.port = isValidDshPort(config.port) ? config.port : DSH_DEFAULT_PORT
+        saved.pinnedVersion = normalizePinnedVersion(config.pinnedVersion)
         access.value = saved.access
         port.value = saved.port
         loaded.value = true
@@ -178,17 +233,20 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     saving.value = true
     actionError.value = ''
     try {
+      // 保存只带访问范围与端口；固定版本由后端保留（pinnedVersion 缺省不清除）。
       const config = await invoke<DshRuntimeConfig>('save_dsh_runtime_config', {
         config: { access: access.value, port: port.value },
       })
       saved.access = normalizeDshAccess(config.access)
       saved.port = config.port
+      saved.pinnedVersion = normalizePinnedVersion(config.pinnedVersion) ?? saved.pinnedVersion
       access.value = saved.access
       port.value = saved.port
       // 改端口/访问范围后按既有约定标注"下次启动生效"，由面板询问是否立即重启。
       if (isRunning.value) {
         pendingRestart.value = status.value?.access !== saved.access
           || status.value?.port !== saved.port
+        if (pendingRestart.value) pendingRestartReason.value = 'config'
       }
     } catch (error) {
       actionError.value = `保存 dsh 运行设置失败：${String(error)}`
@@ -211,6 +269,7 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
       const next = await invoke<DshRuntimeStatus>('dsh_runtime_status')
       if (requestId === statusRequestId) {
         status.value = { ...next, access: normalizeStatusAccess(next.access) }
+        statusFetchedAt.value = Date.now()
       }
     } catch (error) {
       if (requestId === statusRequestId) {
@@ -314,6 +373,54 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     qrVisible.value = true
   }
 
+  /**
+   * 「检查更新」: ask the registry for the latest dsh release and compare it
+   * with the recorded pin. Read-only — applying the update is `applyVersion`,
+   * called only after the panel's confirmation dialog is accepted.
+   */
+  async function checkUpdate(): Promise<DshVersionCheck | null> {
+    updatingVersion.value = true
+    actionError.value = ''
+    actionNotice.value = ''
+    try {
+      const report = await invoke<DshVersionCheck>('dsh_check_update')
+      // 没有可更新的内容时，结论直接作为提示展示，无需弹窗。
+      if (!report.updateAvailable) actionNotice.value = report.message
+      return report
+    } catch (error) {
+      actionError.value = `检查 dsh 更新失败：${String(error)}`
+      return null
+    } finally {
+      updatingVersion.value = false
+    }
+  }
+
+  /**
+   * 「更新版本」的确认后一半: pin the version the check reported and the user
+   * confirmed. The running service is never restarted implicitly — when the
+   * pin moved, a restart-pending marker tells the panel to offer one.
+   */
+  async function applyVersion(version: string): Promise<boolean> {
+    updatingVersion.value = true
+    actionError.value = ''
+    actionNotice.value = ''
+    try {
+      const report = await invoke<DshVersionUpdate>('dsh_update_version', { version })
+      saved.pinnedVersion = normalizePinnedVersion(report.version)
+      if (report.changed && isRunning.value) {
+        pendingRestart.value = true
+        pendingRestartReason.value = 'version'
+      }
+      actionNotice.value = report.message
+      return true
+    } catch (error) {
+      actionError.value = `更新 dsh 版本失败：${String(error)}`
+      return false
+    } finally {
+      updatingVersion.value = false
+    }
+  }
+
   function closeQr() {
     qrVisible.value = false
   }
@@ -329,6 +436,21 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     progressUnlisten?.()
     progressUnlisten = null
     progress.value = null
+  }
+
+  /**
+   * Re-read just the persisted pin (a cheap local state read). A successful
+   * start records the started version backend-side, so without this refresh
+   * the version row would keep showing 「未记录」 after the first-ever start
+   * until the panel happens to reload.
+   */
+  async function refreshPinnedVersion() {
+    try {
+      const config = await invoke<DshRuntimeConfig>('load_dsh_runtime_config')
+      saved.pinnedVersion = normalizePinnedVersion(config.pinnedVersion)
+    } catch {
+      // 版本行停留在旧值即可，不影响启动结果。
+    }
   }
 
   /**
@@ -358,11 +480,14 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
       })
       invalidateStatusRequests()
       status.value = { ...started, access: normalizeStatusAccess(started.access) }
+      statusFetchedAt.value = Date.now()
       if (started.phase === 'failed') {
         actionError.value = started.message
         return false
       }
       pendingRestart.value = false
+      pendingRestartReason.value = null
+      await refreshPinnedVersion()
       return true
     } catch (error) {
       actionError.value = String(error)
@@ -397,11 +522,13 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
       const stopped = await invoke<DshRuntimeStatus>('dsh_runtime_stop')
       invalidateStatusRequests()
       status.value = { ...stopped, access: normalizeStatusAccess(stopped.access) }
+      statusFetchedAt.value = Date.now()
       if (stopped.phase !== 'stopped') {
         actionError.value = stopped.message
         return false
       }
       pendingRestart.value = false
+      pendingRestartReason.value = null
       return true
     } catch (error) {
       actionError.value = String(error)
@@ -427,6 +554,7 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     saving,
     loaded,
     status,
+    statusFetchedAt,
     statusChecking,
     portStatus,
     portChecking,
@@ -436,6 +564,8 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     actionNotice,
     progress,
     pendingRestart,
+    pendingRestartReason,
+    updatingVersion,
     qrVisible,
     isDirty,
     isRunning,
@@ -453,6 +583,8 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     releasePort,
     openQr,
     closeQr,
+    checkUpdate,
+    applyVersion,
     start,
     startWith,
     stop,
