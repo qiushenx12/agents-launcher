@@ -30,10 +30,23 @@ const READY_PREFIX: &str = "dsh web: ";
 const READY_LAN_MARKER: &str = " (LAN: ";
 
 /// First start may have to download the whole package closure through npx.
+///
+/// This bounds *staleness*, not the whole attempt: as long as the download is
+/// demonstrably still growing the wait goes on (see [`ready_deadline`]).
+/// Interrupting a healthy download at 180s throws away everything already
+/// transferred and leaves the user to start over, which is worse than waiting.
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
+/// Absolute ceiling for one start attempt, however briskly it is downloading.
+/// Without it a connection that trickles for hours would hold the `busy` flag
+/// and the 「正在启动」 state forever.
+const READY_TIMEOUT_CEILING: Duration = Duration::from_secs(30 * 60);
 /// How often the first-download sampler reads the npm cache directory.
 const PROGRESS_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 /// Below this many bytes the npm cache is considered untouched, i.e. a hit.
+///
+/// The same amount of *accumulated* growth is what counts as one observation of
+/// progress. Accumulating rather than judging single samples keeps a slow but
+/// steady download (a few tens of KB per 500ms) from being read as stalled.
 const PROGRESS_ACTIVE_THRESHOLD_BYTES: u64 = 64 * 1024;
 const STDERR_TAIL_LINES: usize = 20;
 const STDERR_BUFFER_LINES: usize = 200;
@@ -1349,22 +1362,139 @@ fn directory_size(path: &Path) -> u64 {
     total
 }
 
+/// The first-download sampler's state, shared with the readiness wait.
+///
+/// The sampler owns the npm cache measurement; the wait loop needs only two
+/// facts from it — how much has arrived and when the last real growth was — so
+/// that a healthy download keeps a first start alive past [`READY_TIMEOUT`].
+#[derive(Debug)]
+struct DownloadProgress {
+    /// Cache size before the download, measured by the sampler on its first
+    /// pass. `None` until then, so a reading can never be compared against an
+    /// unset baseline and reported as a huge burst of growth.
+    baseline: Option<u64>,
+    /// Bytes added since `baseline`.
+    bytes: u64,
+    /// Bytes accumulated since growth was last recorded. Kept because the
+    /// threshold has to be reached by *summing* samples: a download that gains
+    /// 20 KB per 500ms is making steady progress, but no single sample crosses
+    /// the threshold on its own.
+    bytes_since_growth: u64,
+    /// When the cache last grew by a whole threshold. Set at construction, and
+    /// a cache hit never moves it — which is exactly why a start that downloads
+    /// nothing keeps the plain 180s deadline instead of waiting indefinitely.
+    last_growth: Instant,
+    /// True once any threshold-sized growth has been observed.
+    grew: bool,
+}
+
+impl DownloadProgress {
+    fn new() -> Self {
+        Self {
+            baseline: None,
+            bytes: 0,
+            bytes_since_growth: 0,
+            last_growth: Instant::now(),
+            grew: false,
+        }
+    }
+
+    /// Fold one cache measurement in, returning `(bytes so far, growth since the
+    /// previous reading)`. The first call only establishes the baseline.
+    fn observe(&mut self, total_bytes: u64) -> (u64, u64) {
+        let Some(baseline) = self.baseline else {
+            self.baseline = Some(total_bytes);
+            return (0, 0);
+        };
+        let bytes = total_bytes.saturating_sub(baseline);
+        let growth = bytes.saturating_sub(self.bytes);
+        self.bytes = bytes;
+        self.bytes_since_growth = self.bytes_since_growth.saturating_add(growth);
+        if self.bytes_since_growth >= PROGRESS_ACTIVE_THRESHOLD_BYTES {
+            self.bytes_since_growth = 0;
+            self.last_growth = Instant::now();
+            self.grew = true;
+        }
+        (bytes, growth)
+    }
+}
+
+/// A consistent read of the shared sampler state for the wait loop.
+#[derive(Debug, Clone, Copy)]
+struct ProgressSnapshot {
+    bytes: u64,
+    last_growth: Instant,
+    grew: bool,
+}
+
+/// Snapshot the sampler, or `None` when there is no sampler (no npm cache
+/// directory could be resolved) or the lock is poisoned. `None` means "fall back
+/// to the plain absolute timeout" — never "wait forever".
+fn progress_snapshot(shared: &Option<Arc<Mutex<DownloadProgress>>>) -> Option<ProgressSnapshot> {
+    let guard = shared.as_ref()?.lock().ok()?;
+    Some(ProgressSnapshot {
+        bytes: guard.bytes,
+        last_growth: guard.last_growth,
+        grew: guard.grew,
+    })
+}
+
+/// The moment the readiness wait gives up.
+///
+/// [`READY_TIMEOUT`] bounds *staleness*, not the whole attempt: every fresh
+/// observation of cache growth slides the deadline forward, so a first start
+/// that is still pulling the package closure down is not interrupted halfway
+/// through. Two things keep that from becoming an unbounded wait — the deadline
+/// only moves while the cache is demonstrably growing (a cached start, or a
+/// process wedged before it printed anything, keeps the original 180s), and it
+/// can never pass `started_at + READY_TIMEOUT_CEILING`.
+fn ready_deadline(snapshot: Option<ProgressSnapshot>, started_at: Instant) -> Instant {
+    match snapshot {
+        Some(snapshot) => {
+            (snapshot.last_growth + READY_TIMEOUT).min(started_at + READY_TIMEOUT_CEILING)
+        }
+        None => started_at + READY_TIMEOUT,
+    }
+}
+
+/// `13.4 MiB`. The timeout message reports what actually arrived, so a download
+/// cut off at the ceiling is visibly non-zero rather than silently discarded.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.0} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Emit `dsh_install_progress` from the moment npx starts until the ready line
-/// arrives (or the sampler is switched off again).
-fn spawn_progress_sampler(app: AppHandle, cache_dir: PathBuf, active: Arc<AtomicBool>) {
+/// arrives (or the sampler is switched off again), and keep `progress` current
+/// so the readiness wait can tell "still downloading" from "nothing is
+/// happening".
+fn spawn_progress_sampler(
+    app: AppHandle,
+    cache_dir: PathBuf,
+    active: Arc<AtomicBool>,
+    progress: Arc<Mutex<DownloadProgress>>,
+) {
     std::thread::spawn(move || {
         let started_at = Instant::now();
-        let baseline = directory_size(&cache_dir);
-        let mut previous_bytes = 0_u64;
         let mut cached = false;
         while active.load(Ordering::Relaxed) {
             std::thread::sleep(PROGRESS_SAMPLE_INTERVAL);
             if !active.load(Ordering::Relaxed) {
                 return;
             }
-            let bytes = directory_size(&cache_dir).saturating_sub(baseline);
-            let growth = bytes.saturating_sub(previous_bytes);
-            previous_bytes = bytes;
+            // A poisoned lock only costs the wait loop its progress signal; the
+            // event traffic below is still worth emitting.
+            let (bytes, growth) = match progress.lock() {
+                Ok(mut progress) => progress.observe(directory_size(&cache_dir)),
+                Err(_) => (0, 0),
+            };
             if growth >= PROGRESS_ACTIVE_THRESHOLD_BYTES {
                 cached = false;
             } else if bytes < PROGRESS_ACTIVE_THRESHOLD_BYTES
@@ -1453,12 +1583,21 @@ fn spawn_and_wait(
         });
     }
 
+    let started_at = Instant::now();
     let progress_active = Arc::new(AtomicBool::new(true));
-    if let Some(cache_dir) = npm_cache_dir() {
-        spawn_progress_sampler(app.clone(), cache_dir, progress_active.clone());
-    }
+    // Only sampled when the npm cache location could be resolved; without it the
+    // wait has no growth signal and falls back to the plain absolute timeout.
+    let progress = npm_cache_dir().map(|cache_dir| {
+        let shared = Arc::new(Mutex::new(DownloadProgress::new()));
+        spawn_progress_sampler(
+            app.clone(),
+            cache_dir,
+            progress_active.clone(),
+            shared.clone(),
+        );
+        shared
+    });
 
-    let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         if shutdown_requested() {
             progress_active.store(false, Ordering::Relaxed);
@@ -1472,6 +1611,11 @@ fn spawn_and_wait(
                 detail,
             ));
         }
+        // Re-derived every pass: a first-download sampler that is still seeing
+        // cache growth keeps pushing this forward, so only a *stalled* start
+        // ever reaches the deadline.
+        let snapshot = progress_snapshot(&progress);
+        let deadline = ready_deadline(snapshot, started_at);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             progress_active.store(false, Ordering::Relaxed);
@@ -1480,14 +1624,21 @@ fn spawn_and_wait(
                 detail,
                 terminate_managed_process(&mut child, DshAccess::Local, port),
             );
-            return Err((
-                "ready_timeout".to_string(),
-                format!(
+            // Two distinct causes, two distinct messages: a download that was
+            // still moving when the ceiling arrived is a very different problem
+            // from one that never got going.
+            let message = match snapshot {
+                Some(snapshot) if snapshot.grew => format!(
+                    "启动 dsh 超过 {} 分钟上限仍未就绪（已下载 {}）。下载一直在进行，但耗时过长，请检查网络与代理后重试。",
+                    READY_TIMEOUT_CEILING.as_secs() / 60,
+                    human_bytes(snapshot.bytes)
+                ),
+                _ => format!(
                     "启动 dsh 超时（{} 秒内未就绪）。首次运行需要下载依赖，请检查网络与代理后重试。",
                     READY_TIMEOUT.as_secs()
                 ),
-                detail,
-            ));
+            };
+            return Err(("ready_timeout".to_string(), message, detail));
         }
 
         match line_rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
@@ -2057,10 +2208,11 @@ pub async fn dsh_runtime_start(
             guard.last_access = Some(access);
             guard.last_port = Some(port);
         }
-        // The registry lock must NOT be held while the child starts: the start
-        // can wait up to 180s for the first npx download, and the UI thread
-        // calls into the registry (`dsh_embed_show`) while it runs. Only the
-        // `busy` flag is needed to keep a second start out.
+        // The registry lock must NOT be held while the child starts: a first
+        // start waits on the npx download (180s of no progress, up to a 30
+        // minute ceiling while it keeps growing), and the UI thread calls into
+        // the registry (`dsh_embed_show`) while it runs. Only the `busy` flag is
+        // needed to keep a second start out.
         let status = start_server(&app, access, port);
         finish_start(status)
     })
@@ -2883,5 +3035,120 @@ mod tests {
             !port_is_occupied(DshAccess::Remote.probe_host(), port),
             "tree listener survived a successful stop"
         );
+    }
+
+    // ── first-download progress vs. the readiness deadline ───────────────────
+
+    fn snapshot_at(bytes: u64, last_growth: Instant, grew: bool) -> ProgressSnapshot {
+        ProgressSnapshot {
+            bytes,
+            last_growth,
+            grew,
+        }
+    }
+
+    /// A cached start downloads nothing, so the deadline must stay exactly where
+    /// it always was: 180s from the spawn. Sliding it here would mean a wedged
+    /// process could hold the app in 「正在启动」 forever.
+    #[test]
+    fn a_download_that_never_grows_keeps_the_absolute_deadline() {
+        let started_at = Instant::now();
+        let snapshot = snapshot_at(0, started_at, false);
+        assert_eq!(
+            ready_deadline(Some(snapshot), started_at),
+            started_at + READY_TIMEOUT
+        );
+    }
+
+    /// The point of the change: growth buys more time, measured from the last
+    /// growth rather than from the spawn.
+    #[test]
+    fn download_growth_slides_the_deadline_forward() {
+        let started_at = Instant::now();
+        let last_growth = started_at + Duration::from_secs(170);
+        let snapshot = snapshot_at(40 * 1024 * 1024, last_growth, true);
+        assert_eq!(
+            ready_deadline(Some(snapshot), started_at),
+            last_growth + READY_TIMEOUT
+        );
+        assert!(
+            ready_deadline(Some(snapshot), started_at) > started_at + READY_TIMEOUT,
+            "growth must extend the wait past the plain 180s window"
+        );
+    }
+
+    /// However long the download keeps trickling, one attempt cannot outlive the
+    /// ceiling — otherwise the `busy` flag would never clear.
+    #[test]
+    fn the_deadline_never_passes_the_ceiling() {
+        let started_at = Instant::now();
+        let snapshot = snapshot_at(1, started_at + Duration::from_secs(10_000), true);
+        assert_eq!(
+            ready_deadline(Some(snapshot), started_at),
+            started_at + READY_TIMEOUT_CEILING
+        );
+    }
+
+    /// No npm cache directory means no growth signal at all. That must degrade
+    /// to the old absolute timeout rather than to an unbounded wait.
+    #[test]
+    fn a_missing_sampler_falls_back_to_the_absolute_timeout() {
+        let started_at = Instant::now();
+        assert_eq!(
+            ready_deadline(None, started_at),
+            started_at + READY_TIMEOUT
+        );
+    }
+
+    /// The first reading only establishes the baseline: treating it as growth
+    /// would report the entire existing cache as freshly downloaded.
+    #[test]
+    fn the_first_reading_only_establishes_the_baseline() {
+        let mut progress = DownloadProgress::new();
+        assert_eq!(progress.observe(500 * 1024 * 1024), (0, 0));
+        assert_eq!(progress.bytes, 0);
+        assert!(!progress.grew);
+        assert_eq!(progress.observe(500 * 1024 * 1024 + 4096), (4096, 4096));
+    }
+
+    /// A slow-but-steady download must count as progress. Judging single samples
+    /// would call 20 KB per 500ms (≈40 KB/s) stalled, and then kill it.
+    #[test]
+    fn sub_threshold_samples_accumulate_into_observed_growth() {
+        let mut progress = DownloadProgress::new();
+        progress.observe(0);
+        let before = progress.last_growth;
+        let per_sample = PROGRESS_ACTIVE_THRESHOLD_BYTES / 4;
+        let mut total = 0;
+        for _ in 0..4 {
+            total += per_sample;
+            progress.observe(total);
+        }
+        assert!(progress.grew, "four quarter-threshold samples are progress");
+        assert!(progress.last_growth >= before);
+        assert_eq!(progress.bytes, 4 * per_sample);
+    }
+
+    /// Nothing arrives at all: the deadline must not move, so the wait ends on
+    /// the original schedule.
+    #[test]
+    fn a_stalled_cache_leaves_the_deadline_alone() {
+        let mut progress = DownloadProgress::new();
+        progress.observe(1024);
+        let before = progress.last_growth;
+        for _ in 0..20 {
+            progress.observe(1024);
+        }
+        assert!(!progress.grew);
+        assert_eq!(progress.last_growth, before);
+    }
+
+    #[test]
+    fn human_bytes_switches_units_at_the_expected_thresholds() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(14 * 1024 * 1024 + 512 * 1024), "14.5 MiB");
     }
 }
