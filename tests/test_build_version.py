@@ -2,11 +2,28 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import build
 
 
 class BuildVersionTests(unittest.TestCase):
+    def test_install_deps_syncs_existing_node_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            (project_dir / "package.json").write_text("{}", encoding="utf-8")
+            (project_dir / "node_modules").mkdir()
+
+            completed = build.subprocess.CompletedProcess(["npm", "install"], 0)
+            with (
+                patch.object(build, "PROJECT_DIR", project_dir),
+                patch.object(build, "find_npm", return_value="npm"),
+                patch.object(build.subprocess, "run", return_value=completed) as run,
+            ):
+                self.assertTrue(build.install_deps())
+
+            run.assert_called_once_with(["npm", "install"], cwd=project_dir)
+
     def test_next_version_increments_patch_until_nine(self) -> None:
         self.assertEqual(build.next_version("1.0.0"), "1.0.1")
         self.assertEqual(build.next_version("1.0.8"), "1.0.9")

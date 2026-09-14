@@ -359,14 +359,14 @@ def install_deps() -> bool:
     if not package_json.exists():
         print("未找到 package.json。")
         return False
-    if node_modules.exists():
-        print("npm 依赖已安装。")
-        return True
 
     npm = find_npm()
     if npm is None:
         return False
-    print("未找到 node_modules，正在安装 npm 依赖……")
+    if node_modules.exists():
+        print("正在检查并同步 npm 依赖……")
+    else:
+        print("未找到 node_modules，正在安装 npm 依赖……")
     result = subprocess.run([npm, "install"], cwd=PROJECT_DIR)
     if result.returncode != 0:
         print("npm install 失败。")
