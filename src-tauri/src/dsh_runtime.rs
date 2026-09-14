@@ -1021,7 +1021,7 @@ fn listening_pids(port: u16) -> Vec<u32> {
             if !fields[3].eq_ignore_ascii_case("listening") {
                 continue;
             }
-            if authority_port(fields[1]) != Some(port) {
+            if parse_authority_port(fields[1]) != Some(port) {
                 continue;
             }
             if let Ok(pid) = fields[4].parse::<u32>() {
@@ -1051,16 +1051,6 @@ fn listening_pids(port: u16) -> Vec<u32> {
         }
         pids
     }
-}
-
-/// `host:port` or `[::]:port` → port. Bracketed IPv6 is handled explicitly
-/// because it also contains colons.
-fn authority_port(authority: &str) -> Option<u16> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (_, tail) = rest.split_once(']')?;
-        return tail.strip_prefix(':')?.parse().ok();
-    }
-    authority.rsplit_once(':')?.1.parse().ok()
 }
 
 fn process_name(pid: u32) -> String {
@@ -2665,13 +2655,13 @@ mod tests {
 
     #[test]
     fn netstat_local_address_ports_are_parsed() {
-        assert_eq!(authority_port("127.0.0.1:3080"), Some(3080));
-        assert_eq!(authority_port("0.0.0.0:3080"), Some(3080));
-        assert_eq!(authority_port("[::]:3080"), Some(3080));
-        assert_eq!(authority_port("[::1]:3199"), Some(3199));
-        assert_eq!(authority_port("127.0.0.1:"), None);
-        assert_eq!(authority_port("garbage"), None);
-        assert_eq!(authority_port(""), None);
+        assert_eq!(parse_authority_port("127.0.0.1:3080"), Some(3080));
+        assert_eq!(parse_authority_port("0.0.0.0:3080"), Some(3080));
+        assert_eq!(parse_authority_port("[::]:3080"), Some(3080));
+        assert_eq!(parse_authority_port("[::1]:3199"), Some(3199));
+        assert_eq!(parse_authority_port("127.0.0.1:"), None);
+        assert_eq!(parse_authority_port("garbage"), None);
+        assert_eq!(parse_authority_port(""), None);
     }
 
     /// The occupant lookup must return the process actually listening on the
