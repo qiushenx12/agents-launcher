@@ -1692,6 +1692,126 @@ fn describe_exit_status(status: &std::process::ExitStatus) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// npx cache self-repair
+// ---------------------------------------------------------------------------
+
+/// The corrupt npx cache entry named by an npm ENOENT failure, if this stderr
+/// output is that failure.
+///
+/// An interrupted `npx` install leaves `<npm-cache>/_npx/<key>/` behind with a
+/// populated `node_modules` but no `package.json`. Every later start of the
+/// same spec then dies before dsh itself runs, because npx only *reads* the
+/// existing entry and never reinstalls it:
+///
+/// ```text
+/// npm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open 'C:\…\npm-cache\_npx\1da1392061ab1944\package.json'
+/// ```
+///
+/// Both spellings of the path are accepted — the quoted `open '…'` clause and
+/// the bare `npm error path …` line — and the result is only ever the entry
+/// directory exactly one level below `_npx`, so the `_npx` root itself can
+/// never be returned.
+fn corrupt_npx_cache_dir(detail: &str) -> Option<PathBuf> {
+    if !detail.contains("ENOENT") {
+        return None;
+    }
+    for line in detail.lines() {
+        let candidate = line
+            .split_once("open '")
+            .and_then(|(_, tail)| tail.split_once('\''))
+            .map(|(path, _)| path.trim())
+            .or_else(|| line.trim().strip_prefix("npm error path ").map(str::trim));
+        let Some(candidate) = candidate else { continue };
+        let path = Path::new(candidate);
+        if path.file_name().and_then(|name| name.to_str()) != Some("package.json") {
+            continue;
+        }
+        let Some(entry) = path.parent() else { continue };
+        let under_npx = entry
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("_npx");
+        if under_npx {
+            return Some(entry.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Remove one corrupt npx cache entry so the next start reinstalls it.
+///
+/// The stderr text is the only evidence pointing at `dir`, so two facts are
+/// re-checked against the filesystem before anything is deleted: the target is
+/// exactly `<cache>/_npx/<entry>` (never the `_npx` root or an unrelated
+/// directory) and the claimed missing `package.json` is genuinely missing —
+/// deleting a healthy entry would only cost a re-download, but a misparsed
+/// path must never delete anything at all.
+fn purge_corrupt_npx_cache(dir: &Path) -> Result<(), String> {
+    let entry_name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let under_npx = dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("_npx");
+    if entry_name.is_empty() || !under_npx {
+        return Err(format!(
+            "路径不是 npx 缓存条目，已拒绝清理：{}",
+            dir.display()
+        ));
+    }
+    if !dir.is_dir() {
+        // Nothing to purge — another process may have cleaned it up already;
+        // the retry below simply starts against a fresh cache.
+        return Ok(());
+    }
+    if dir.join("package.json").exists() {
+        return Err("package.json 存在，该缓存并未损坏，已取消清理。".to_string());
+    }
+    std::fs::remove_dir_all(dir)
+        .map_err(|error| format!("清理损坏的 npx 缓存（{}）失败：{error}", dir.display()))
+}
+
+/// One spawn attempt plus a single self-heal retry for the corrupt-npx-cache
+/// failure. Clearing the broken entry and starting over is exactly what a user
+/// would do by hand; the retry gets exactly one chance so a persistent failure
+/// still surfaces instead of looping.
+fn spawn_with_cache_repair(
+    app: &AppHandle,
+    npx: &Path,
+    overlay: &Path,
+    port: u16,
+    version: Option<&str>,
+) -> Result<SpawnOutcome, SpawnFailure> {
+    let first = match spawn_and_wait(app, npx, overlay, port, version) {
+        Ok(outcome) => return Ok(outcome),
+        Err(failure) => failure,
+    };
+    let Some(cache_dir) = first.2.as_deref().and_then(corrupt_npx_cache_dir) else {
+        return Err(first);
+    };
+    if let Err(error) = purge_corrupt_npx_cache(&cache_dir) {
+        eprintln!("dsh 启动失败，且无法自动修复 npx 缓存：{error}");
+        return Err((
+            first.0,
+            format!("{}（检测到 npx 缓存损坏，自动清理失败：{error}）", first.1),
+            first.2,
+        ));
+    }
+    eprintln!(
+        "检测到损坏的 npx 缓存（{}），已自动清理并重新尝试启动 dsh。",
+        cache_dir.display()
+    );
+    spawn_and_wait(app, npx, overlay, port, version).map_err(|(issue, message, detail)| {
+        (
+            issue,
+            format!("{message}（已自动清理损坏的 npx 缓存并重试一次。）"),
+            detail,
+        )
+    })
+}
+
 fn exit_reason(child: &mut Child) -> String {
     match child.try_wait() {
         Ok(Some(status)) => describe_exit_status(&status),
@@ -1984,7 +2104,7 @@ fn start_server(app: &AppHandle, access: DshAccess, port: u16) -> DshRuntimeStat
         Err(error) => return failure_status(access, port, "spawn_failed", &error, None),
     };
 
-    let outcome = match spawn_and_wait(app, &npx, &overlay, port, pinned.as_deref()) {
+    let outcome = match spawn_with_cache_repair(app, &npx, &overlay, port, pinned.as_deref()) {
         Ok(outcome) => outcome,
         Err((issue, message, detail)) => {
             return failure_status(access, port, &issue, &message, detail)
@@ -2144,6 +2264,23 @@ fn live_status(guard: &mut DshRegistry) -> Option<DshRuntimeStatus> {
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
+
+/// Proof that the dsh CLI is usable: the supervised server is alive right now.
+///
+/// `cli_runtime`'s capability check probes dsh through `npx … -V`, which costs
+/// seconds even on a warm cache; a running supervised service already proves
+/// everything that probe would, and knows its version, so the check asks here
+/// first. Returns the server's recorded version and the npx path it started
+/// with. A dead-but-registered server is reaped by `live_status` and reports
+/// as not-running.
+pub(crate) fn running_supervised_proof() -> Option<(Option<String>, String)> {
+    let mut guard = lock_registry().ok()?;
+    let status = live_status(&mut guard)?;
+    if status.phase != DshPhase::Running {
+        return None;
+    }
+    Some((status.version, status.executable?))
+}
 
 #[tauri::command]
 pub fn dsh_runtime_status() -> Result<DshRuntimeStatus, String> {
@@ -2475,6 +2612,122 @@ mod tests {
         let line = "dsh web: http://127.0.0.1:3080?token=abc";
         let (local, _) = parse_ready_line(line, 3080).expect("ready line should parse");
         assert_eq!(local, "http://127.0.0.1:3080/?token=abc");
+    }
+
+    /// A native `<cache>/_npx` root for cache-repair tests: the parser works on
+    /// real `Path` components, so each platform builds its own spelling.
+    fn npx_root() -> PathBuf {
+        let base = if cfg!(windows) {
+            "C:\\npm-cache"
+        } else {
+            "/home/tester/.npm"
+        };
+        Path::new(base).join("_npx")
+    }
+
+    fn npx_entry(key: &str) -> PathBuf {
+        npx_root().join(key)
+    }
+
+    /// The stderr block npm 11 prints for the corrupt-cache failure.
+    fn npm_enoent_detail(package_json: &Path) -> String {
+        format!(
+            "npm error code ENOENT\n\
+             npm error syscall open\n\
+             npm error path {}\n\
+             npm error errno -4058\n\
+             npm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '{}'\n\
+             npm error enoent This is related to npm not being able to find a file.\n\
+             npm error enoent \n\
+             npm error A complete log of this run can be found in: C:\\logs\\debug-0.log",
+            package_json.display(),
+            package_json.display()
+        )
+    }
+
+    #[test]
+    fn corrupt_cache_dir_is_read_from_the_npm_enoent_block() {
+        let entry = npx_entry("1da1392061ab1944");
+        let detail = npm_enoent_detail(&entry.join("package.json"));
+        assert_eq!(corrupt_npx_cache_dir(&detail).as_deref(), Some(entry.as_path()));
+    }
+
+    #[test]
+    fn corrupt_cache_dir_accepts_the_bare_path_line() {
+        let entry = npx_entry("b86ed90107c62dab");
+        let detail = format!(
+            "npm error code ENOENT\nnpm error path {}",
+            entry.join("package.json").display()
+        );
+        assert_eq!(corrupt_npx_cache_dir(&detail).as_deref(), Some(entry.as_path()));
+    }
+
+    #[test]
+    fn corrupt_cache_dir_rejects_unrelated_or_unsafe_paths() {
+        // An ENOENT about a file outside the npx cache is not this failure.
+        let outside = if cfg!(windows) {
+            "D:\\project\\package.json"
+        } else {
+            "/tmp/project/package.json"
+        };
+        assert_eq!(corrupt_npx_cache_dir(&npm_enoent_detail(Path::new(outside))), None);
+        // A package.json directly inside `_npx` names no entry directory, and
+        // deleting `_npx` itself must never be on the table.
+        assert_eq!(
+            corrupt_npx_cache_dir(&npm_enoent_detail(&npx_root().join("package.json"))),
+            None
+        );
+        // A different missing file inside an entry is not the signature.
+        assert_eq!(
+            corrupt_npx_cache_dir(&npm_enoent_detail(&npx_entry("abc").join("index.js"))),
+            None
+        );
+        // Without the ENOENT marker the lines are not treated as this failure.
+        let detail = format!("npm error path {}", npx_entry("abc").join("package.json").display());
+        assert_eq!(corrupt_npx_cache_dir(&detail), None);
+    }
+
+    #[test]
+    fn purge_removes_a_proven_corrupt_entry() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let entry = directory.path().join("_npx").join("1da1392061ab1944");
+        std::fs::create_dir_all(entry.join("node_modules")).expect("create corrupt entry");
+        std::fs::write(entry.join("node_modules").join("dsh.js"), "x").expect("write payload");
+        purge_corrupt_npx_cache(&entry).expect("purge should succeed");
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn purge_refuses_an_entry_with_a_package_json() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let entry = directory.path().join("_npx").join("healthy");
+        std::fs::create_dir_all(&entry).expect("create entry");
+        std::fs::write(entry.join("package.json"), "{}").expect("write package.json");
+        let error = purge_corrupt_npx_cache(&entry).expect_err("healthy entry must be kept");
+        assert!(error.contains("并未损坏"));
+        assert!(entry.join("package.json").exists());
+    }
+
+    #[test]
+    fn purge_refuses_a_path_that_is_not_an_npx_cache_entry() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let outside = directory.path().join("projects").join("app");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        let error = purge_corrupt_npx_cache(&outside).expect_err("outside path must be refused");
+        assert!(error.contains("已拒绝清理"));
+        assert!(outside.exists());
+        // The `_npx` root itself is not an entry either.
+        let root = directory.path().join("_npx");
+        std::fs::create_dir_all(&root).expect("create _npx root");
+        assert!(purge_corrupt_npx_cache(&root).is_err());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn purge_tolerates_an_entry_someone_else_already_removed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let entry = directory.path().join("_npx").join("gone");
+        purge_corrupt_npx_cache(&entry).expect("a missing entry is already clean");
     }
 
     fn address(ip: &str, interface: Option<&str>, has_gateway: bool) -> LocalAddress {

@@ -203,6 +203,25 @@ pub fn locate_cli(kind: CliKind) -> Option<PathBuf> {
 }
 
 fn inspect_cli(kind: CliKind) -> CliStatus {
+    // A running supervised dsh service is definitive proof that the CLI works
+    // and already knows its version: entering the dsh workspace while the
+    // service is up must not pay for the seconds-long npx probe below.
+    if kind == CliKind::Dsh {
+        if let Some((version, executable)) = crate::dsh_runtime::running_supervised_proof() {
+            return CliStatus {
+                kind,
+                state: CliStatusState::Ready,
+                issue_code: None,
+                message: format!(
+                    "{} 服务正在运行，已跳过版本探测。",
+                    label(kind).unwrap_or_else(|_| command_name(kind).to_string())
+                ),
+                executable_path: Some(executable),
+                version,
+            };
+        }
+    }
+
     let Some(path) = locate_cli(kind) else {
         return status_for_issue(kind, CliIssueCode::ExecutableMissing).unwrap_or(CliStatus {
             kind,
