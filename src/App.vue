@@ -1144,6 +1144,12 @@ async function openCliTab(kind: CliKind, forceCheck = false) {
   // dsh 没有项目工作区：它的界面由 `dsh web` 自己提供，启动器只负责进程与承载。
   // 这里必须绕开 prepareCliWorkspace，否则会掉进 OpenCode 兜底分支去发现
   // OpenCode 的项目与会话。服务未启动时只显示空态，不自动启动。
+  //
+  // 「进入项目」前的那段确认对话框（confirmDiscardActiveChanges / selectKind）
+  // 是原生窗口，focusout 会让界面感觉"卡了好几下"。dsh 因此不等检测结论：
+  // 切页与检测同步起步，运行面板（未启动时的空态卡片）立刻就位，检测结论
+  // 回来后被直接采用。dsh 可不可用这个门禁管不了（它经 npx 运行，可用性由
+  // 运行面板自己的启动链路兜底），为门禁等一次 npx 解析只是白白拖住切页。
   if (kind === 'dsh') {
     const gateStartedAtDsh = performance.now()
     const finishDshMeasure = beginStartupMeasure('cli-workspace-dsh')
@@ -1152,9 +1158,13 @@ async function openCliTab(kind: CliKind, forceCheck = false) {
     cliInstallHelpVisible.value = false
     cliWorkspacePreparation.value = { kind, requestId }
     try {
-      const status = await cliRuntimeStore.check(kind, forceCheck)
-      if (requestId !== cliOpenRequestId || mainTab.value !== kind) return
-      if (status.state !== 'ready') return
+      // 后台补齐缓存里的 dsh 状态（不 await）：已有结论原样展示，检测结论
+      // 回来后会被直接采用；没有结论时它把状态摆成 checking，门禁表现与
+      // 改动前一致。卡住几秒 npx 解析的窗口被挪出了进入路径。检测挂在
+      // cliWorkspacePreparation 之外、失败也不打断切页。
+      void cliRuntimeStore.check(kind, forceCheck).catch(() => undefined)
+      const status = cliRuntimeStore.statuses[kind]
+      if (status?.state !== 'ready') return
       const remaining = MIN_CLI_WORKSPACE_GATE_MS - (performance.now() - gateStartedAtDsh)
       if (remaining > 0) await new Promise<void>((resolve) => setTimeout(resolve, remaining))
     } finally {

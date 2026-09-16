@@ -37,7 +37,10 @@ export const useCliRuntimeStore = defineStore('cliRuntime', () => {
     if (existing) return existing
 
     checking[kind] = true
-    statuses[kind] = checkingStatus(kind)
+    // 后台补齐（kicked-off 与轮询）不能把 UI 打回“正在检查”：已有结论
+    // （哪怕是 blocked）就保留原状，只在没有结论时才摆出 checking 占位。
+    const silent = cached != null
+    if (!silent) statuses[kind] = checkingStatus(kind)
     return inFlight.run(kind, async () => {
       try {
         const status = await invoke<CliStatus>('check_cli', { kind })

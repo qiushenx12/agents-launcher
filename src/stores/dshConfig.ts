@@ -471,7 +471,8 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
       phase: 'preparing',
       access: startAccess,
       port: startPort,
-      message: '正在准备 dsh，首次运行需要下载依赖。',
+      // 首次下载的说明由进度文案（describeInstallProgress）给出，这里保持中性。
+      message: '正在准备 dsh。',
     }
     try {
       const started = await invoke<DshRuntimeStatus>('dsh_runtime_start', {

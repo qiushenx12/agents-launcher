@@ -20,7 +20,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
@@ -36,6 +36,12 @@ const READY_LAN_MARKER: &str = " (LAN: ";
 /// Interrupting a healthy download at 180s throws away everything already
 /// transferred and leaves the user to start over, which is worse than waiting.
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
+/// A cache hit downloads nothing, so there is no progress to wait for: dsh
+/// either prints its ready line quickly or something is wedged (a damaged
+/// `_npx` entry is the known case). Give it far less rope than a real
+/// download — the sooner this surfaces, the sooner the corrupt-cache
+/// self-repair can clean the entry and retry.
+const READY_TIMEOUT_CACHED: Duration = Duration::from_secs(30);
 /// Absolute ceiling for one start attempt, however briskly it is downloading.
 /// Without it a connection that trickles for hours would hold the `busy` flag
 /// and the 「正在启动」 state forever.
@@ -54,6 +60,15 @@ const STDERR_BUFFER_LINES: usize = 200;
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
 const DEFAULT_PORT: u16 = 3080;
+
+/// The npm registry the dsh download is pointed at. The default
+/// `registry.npmjs.org` is reachable but extremely slow from the target
+/// network (a metadata fetch alone takes ~12s, so the package closure never
+/// lands inside the readiness window), while the npmmirror.com mirror answers
+/// the same fetch in ~4s. Injecting `NPM_CONFIG_REGISTRY` into the child only
+/// — never the user's global config — is the least invasive way to make the
+/// download actually finish.
+const DSH_NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 
 /// `npx` is always used: dsh's bin name is not on `PATH` unless the user
 /// installed the package globally, and this feature must work without that.
@@ -1330,18 +1345,42 @@ fn supervised_listens_on(port: u16) -> bool {
 // ---------------------------------------------------------------------------
 
 fn npm_cache_dir() -> Option<PathBuf> {
-    if let Ok(output) = hidden_command("npm")
-        .args(["config", "get", "cache"])
-        .output()
-    {
-        if output.status.success() {
+    // Resolve npm the same way the dsh launch resolves npx — by full path via
+    // `locate_executable`, which honours PATHEXT (`npm.cmd`). `Command::new("npm")`
+    // alone fails in a GUI process whose PATH does not resolve bare names, which
+    // is exactly the case that sent us down the fallback below.
+    let npm = crate::platform_env::locate_executable("npm");
+    self_repair_log(&format!("npm_cache_dir: locate_executable(npm) = {npm:?}"));
+    let config_result = npm
+        .as_ref()
+        .map(|path| hidden_command(path).args(["config", "get", "cache"]).output());
+    match config_result {
+        Some(Ok(output)) if output.status.success() => {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() && path != "undefined" {
+                self_repair_log(&format!("npm_cache_dir: npm config 返回 {path}"));
                 return Some(PathBuf::from(path));
             }
+            self_repair_log(&format!("npm_cache_dir: npm config 输出无效 {path:?}，走兜底"));
         }
+        Some(Ok(output)) => self_repair_log(&format!(
+            "npm_cache_dir: npm config 退出码 {:?}，走兜底",
+            output.status.code()
+        )),
+        Some(Err(error)) => self_repair_log(&format!(
+            "npm_cache_dir: 无法执行 npm config（{error}），走兜底"
+        )),
+        None => self_repair_log("npm_cache_dir: 定位不到 npm 可执行文件，走兜底"),
     }
-    dirs::cache_dir().map(|path| path.join("npm"))
+    // npm's default cache on Windows is %LOCALAPPDATA%\npm-cache — NOT `npm`.
+    // Falling back to `…\npm` would silently watch a directory that never
+    // exists, which is exactly how the corrupt `_npx` entries went unseen.
+    let fallback = dirs::cache_dir().map(|path| path.join("npm-cache"));
+    self_repair_log(&format!(
+        "npm_cache_dir: 兜底解析为 {:?}",
+        fallback.as_ref().map(|p| p.display().to_string())
+    ));
+    fallback
 }
 
 fn directory_size(path: &Path) -> u64 {
@@ -1382,7 +1421,8 @@ struct DownloadProgress {
     bytes_since_growth: u64,
     /// When the cache last grew by a whole threshold. Set at construction, and
     /// a cache hit never moves it — which is exactly why a start that downloads
-    /// nothing keeps the plain 180s deadline instead of waiting indefinitely.
+    /// nothing is bounded by [`READY_TIMEOUT_CACHED`] instead of the download
+    /// window.
     last_growth: Instant,
     /// True once any threshold-sized growth has been observed.
     grew: bool,
@@ -1446,13 +1486,24 @@ fn progress_snapshot(shared: &Option<Arc<Mutex<DownloadProgress>>>) -> Option<Pr
 /// that is still pulling the package closure down is not interrupted halfway
 /// through. Two things keep that from becoming an unbounded wait — the deadline
 /// only moves while the cache is demonstrably growing (a cached start, or a
-/// process wedged before it printed anything, keeps the original 180s), and it
-/// can never pass `started_at + READY_TIMEOUT_CEILING`.
-fn ready_deadline(snapshot: Option<ProgressSnapshot>, started_at: Instant) -> Instant {
+/// process wedged before it printed anything, keeps its own shorter
+/// [`READY_TIMEOUT_CACHED`]), and it can never pass
+/// `started_at + READY_TIMEOUT_CEILING`.
+///
+/// `fresh_download` skips the cache-hit window entirely: the self-repair retry
+/// has just emptied the cache, so it is by definition downloading and must not
+/// be cut off by the 30s window that fired the timeout it is recovering from.
+fn ready_deadline(
+    snapshot: Option<ProgressSnapshot>,
+    started_at: Instant,
+    fresh_download: bool,
+) -> Instant {
     match snapshot {
-        Some(snapshot) => {
+        Some(snapshot) if snapshot.grew => {
             (snapshot.last_growth + READY_TIMEOUT).min(started_at + READY_TIMEOUT_CEILING)
         }
+        Some(_) if fresh_download => started_at + READY_TIMEOUT,
+        Some(_) => started_at + READY_TIMEOUT_CACHED,
         None => started_at + READY_TIMEOUT,
     }
 }
@@ -1525,7 +1576,26 @@ struct SpawnOutcome {
     lan_url: Option<String>,
 }
 
+/// Why one spawn attempt failed, in the vocabulary `SpawnFailure.issue` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnIssue {
+    /// `READY_TIMEOUT` / ceiling hit: the process is alive but never printed
+    /// the ready line. This is the one failure a cache-hit npx leaves on the
+    /// table when its `_npx` entry came from an interrupted install.
+    ReadyTimeout,
+    /// Anything else (spawn, early exit, stream close).
+    Other,
+}
+
 type SpawnFailure = (String, String, Option<String>);
+
+fn spawn_failure_issue(failure: &SpawnFailure) -> SpawnIssue {
+    if failure.0 == "ready_timeout" {
+        SpawnIssue::ReadyTimeout
+    } else {
+        SpawnIssue::Other
+    }
+}
 
 fn spawn_and_wait(
     app: &AppHandle,
@@ -1533,10 +1603,17 @@ fn spawn_and_wait(
     overlay: &Path,
     port: u16,
     version: Option<&str>,
+    // `true` on the self-repair retry: the cache was just purged, so this
+    // attempt *is* a fresh download and must get the sliding download window,
+    // not the 30s cache-hit window that fired the first timeout.
+    fresh_download: bool,
 ) -> Result<SpawnOutcome, SpawnFailure> {
     let mut command = hidden_command(npx);
     command
         .args(dsh_arguments(overlay, port, version))
+        // Route only this download through the fast mirror; the user's global
+        // npm config is untouched. See `DSH_NPM_REGISTRY`.
+        .env("NPM_CONFIG_REGISTRY", DSH_NPM_REGISTRY)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1613,9 +1690,11 @@ fn spawn_and_wait(
         }
         // Re-derived every pass: a first-download sampler that is still seeing
         // cache growth keeps pushing this forward, so only a *stalled* start
-        // ever reaches the deadline.
+        // ever reaches the deadline. A self-repair retry has just emptied the
+        // cache, so it is forced onto the download window rather than the
+        // cache-hit window that fired the timeout being repaired.
         let snapshot = progress_snapshot(&progress);
-        let deadline = ready_deadline(snapshot, started_at);
+        let deadline = ready_deadline(snapshot, started_at, fresh_download);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             progress_active.store(false, Ordering::Relaxed);
@@ -1624,14 +1703,49 @@ fn spawn_and_wait(
                 detail,
                 terminate_managed_process(&mut child, DshAccess::Local, port),
             );
-            // Two distinct causes, two distinct messages: a download that was
-            // still moving when the ceiling arrived is a very different problem
-            // from one that never got going.
+            self_repair_log(&format!(
+                "ready_timeout 触发: fresh_download={fresh_download} snapshot={}",
+                match &snapshot {
+                    Some(s) => format!(
+                        "Some(grew={} bytes={} last_growth_age={:?})",
+                        s.grew,
+                        s.bytes,
+                        s.last_growth.elapsed()
+                    ),
+                    None => "None".to_string(),
+                }
+            ));
+            // Dump whatever the process actually said, so a stalled download is
+            // distinguishable from a stalled npx that never reached the network.
+            let stderr_lines = stderr_tail
+                .lock()
+                .map(|guard| guard.len())
+                .unwrap_or(0);
+            self_repair_log(&format!(
+                "  超时时刻 stderr 行数={stderr_lines} detail_len={}",
+                detail.as_deref().map(str::len).unwrap_or(0)
+            ));
+            if let Some(detail_text) = detail.as_deref() {
+                for line in detail_text.lines().take(STDERR_TAIL_LINES) {
+                    self_repair_log(&format!("  stderr> {line}"));
+                }
+            }
+            // The message names the cause. A download still moving at the
+            // ceiling, and one that never got going, are the two download
+            // cases. A *cache hit* that never became ready is the corrupt
+            // `_npx` entry case — but only a first attempt can claim that: the
+            // self-repair retry just emptied the cache, so it is downloading
+            // even before any growth has been observed, and must not be
+            // mislabelled as a cache hit.
             let message = match snapshot {
                 Some(snapshot) if snapshot.grew => format!(
                     "启动 dsh 超过 {} 分钟上限仍未就绪（已下载 {}）。下载一直在进行，但耗时过长，请检查网络与代理后重试。",
                     READY_TIMEOUT_CEILING.as_secs() / 60,
                     human_bytes(snapshot.bytes)
+                ),
+                Some(_) if !fresh_download => format!(
+                    "启动 dsh 超时（使用本地缓存，{} 秒内未就绪）。本地缓存可能已损坏，正在自动清理并重试；若仍失败请重试。",
+                    READY_TIMEOUT_CACHED.as_secs()
                 ),
                 _ => format!(
                     "启动 dsh 超时（{} 秒内未就绪）。首次运行需要下载依赖，请检查网络与代理后重试。",
@@ -1773,6 +1887,207 @@ fn purge_corrupt_npx_cache(dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("清理损坏的 npx 缓存（{}）失败：{error}", dir.display()))
 }
 
+/// One `_npx` entry a readiness timeout has reason to suspect.
+///
+/// The ENOENT repair above keys off stderr, but a timeout after a cache *hit*
+/// never produces that stderr: npx found the entry and simply never got dsh
+/// running. That is the failure an interrupted install leaves behind — the
+/// entry directory exists, so npx reuses it as-is forever.
+///
+/// Two independent facts must both hold before an entry is touched:
+///
+/// 1. **Touched inside the start's window.** The entry (or anything directly
+///    inside it) changed at or after `window_start`, so it belongs to *this*
+///    attempt rather than to some other package's healthy cache.
+/// 2. **Structurally incomplete.** Either the entry `package.json` is missing
+///    (the ENOENT shape, proven before the first purge existed) or the dsh
+///    package directory itself is absent from `node_modules`
+///    (`node_modules/@deepseek-ai/dsh`), i.e. the payload never landed.
+///
+/// Both checks are re-derived from the filesystem at scan time; nothing from
+/// the timed-out process's output is trusted to name a directory.
+fn suspect_npx_cache_entries(cache_dir: &Path, window_start: Instant) -> Vec<PathBuf> {
+    let mut suspects = Vec::new();
+    let npx_root = cache_dir.join("_npx");
+    let Ok(entries) = std::fs::read_dir(&npx_root) else {
+        self_repair_log(&format!("扫描失败：无法读取 {}", npx_root.display()));
+        return suspects;
+    };
+    // Instants cannot be compared against filesystem mtimes directly; convert
+    // the window start to wall time once and compare in that domain.
+    let window_start_system = SystemTime::now()
+        .checked_sub(window_start.elapsed())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    self_repair_log(&format!(
+        "扫描 {}（window_start={:?} epoch_secs）",
+        npx_root.display(),
+        window_start_system
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    ));
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let mtime = latest_mtime(&dir, 1);
+        let touched = mtime.is_some_and(|mtime| mtime >= window_start_system);
+        let mtime_secs = mtime
+            .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        if !touched {
+            self_repair_log(&format!(
+                "  跳过 {}：mtime={mtime_secs:?} 早于窗口",
+                dir.display()
+            ));
+            continue;
+        }
+        let has_manifest = dir.join("package.json").exists();
+        let has_payload = dir
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .is_dir();
+        let incomplete = !has_manifest || !has_payload;
+        self_repair_log(&format!(
+            "  候选 {}：mtime={mtime_secs:?} 在窗口内, manifest={has_manifest} payload={has_payload} -> 嫌疑={incomplete}",
+            dir.display()
+        ));
+        if incomplete {
+            suspects.push(dir);
+        }
+    }
+    self_repair_log(&format!("扫描结束，嫌疑条目数={}", suspects.len()));
+    suspects
+}
+
+/// Newest mtime of `dir` itself or anything directly inside it, down to
+/// `depth` levels. A start that so much as looks at its cache entry bumps the
+/// entry's own mtime on some filesystems and the payload's on all of them, so
+/// a shallow scan is enough — and it never descends into `node_modules`.
+fn latest_mtime(dir: &Path, depth: u8) -> Option<SystemTime> {
+    let mut latest = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+    if depth > 0 {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Some(candidate) = latest_mtime(&entry.path(), depth - 1) {
+                    if latest.is_none_or(|current| candidate > current) {
+                        latest = Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    latest
+}
+
+/// Remove every suspect entry from a timed-out start. A purge failure on one
+/// entry is logged and does not stop the others: the retry still gets whatever
+/// cleanup was possible.
+fn purge_suspect_npx_cache_entries(cache_dir: &Path, window_start: Instant) -> bool {
+    let suspects = suspect_npx_cache_entries(cache_dir, window_start);
+    if suspects.is_empty() {
+        return false;
+    }
+    let mut purged = false;
+    for dir in suspects {
+        // The entry-level guard from the stderr path is reused verbatim: even
+        // though the scan already checked structure, the purge must refuse a
+        // directory that stopped looking corrupt between scan and delete.
+        match purge_incomplete_npx_entry(&dir) {
+            Ok(()) => {
+                purged = true;
+                self_repair_log(&format!(
+                    "dsh 启动超时，检测到疑似中断的 npx 缓存（{}），已自动清理。",
+                    dir.display()
+                ));
+            }
+            Err(error) => {
+                self_repair_log(&format!("dsh 启动超时，自动清理 npx 缓存被拒绝：{error}"));
+            }
+        }
+    }
+    purged
+}
+
+/// Purge one `_npx` entry that a timeout scan judged incomplete. Distinct from
+/// [`purge_corrupt_npx_cache`]: that one proves corruption through npm's own
+/// ENOENT report (missing `package.json`), while a timeout can also face an
+/// entry whose `package.json` landed but whose payload did not. The guard is
+/// the same in spirit — re-verify before deleting, never touch the `_npx`
+/// root, tolerate an entry someone else already removed.
+fn purge_incomplete_npx_entry(dir: &Path) -> Result<(), String> {
+    let entry_name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let under_npx = dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("_npx");
+    if entry_name.is_empty() || !under_npx {
+        return Err(format!(
+            "路径不是 npx 缓存条目，已拒绝清理：{}",
+            dir.display()
+        ));
+    }
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let has_manifest = dir.join("package.json").exists();
+    let has_payload = dir
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .is_dir();
+    if has_manifest && has_payload {
+        return Err("条目同时具有 package.json 与 dsh 载荷，结构完整，已取消清理。".to_string());
+    }
+    std::fs::remove_dir_all(dir)
+        .map_err(|error| format!("清理不完整的 npx 缓存条目（{}）失败：{error}", dir.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Temporary self-repair diagnostics (added to trace why the repair retry does
+// not fire in the field; remove once the root cause is confirmed)
+// ---------------------------------------------------------------------------
+
+/// Append one line to `terminal_logs/dsh-self-repair.log`, mirroring to stderr.
+/// Never fails the caller: a diagnostic that cannot be written is useless but
+/// must not take the repair down with it.
+fn self_repair_log(message: &str) {
+    let stamp = diagnostic_timestamp();
+    let line = format!("[{stamp}] {message}");
+    eprintln!("{line}");
+    if let Ok(dir) = app_data_dir().map(|d| d.join("terminal_logs")) {
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let path = dir.join("dsh-self-repair.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+            {
+                use std::io::Write;
+                let _ = writeln!(file, "{line}");
+            }
+        }
+    }
+}
+
+/// `HH:MM:SS.mmm` wall clock (local, UTC+8 for this audience) — precise enough
+/// to order the events of one start attempt without pulling in a date crate.
+fn diagnostic_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let local = now.as_secs() + 8 * 3600;
+    let secs_of_day = local % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+        now.subsec_millis()
+    )
+}
+
+
 /// One spawn attempt plus a single self-heal retry for the corrupt-npx-cache
 /// failure. Clearing the broken entry and starting over is exactly what a user
 /// would do by hand; the retry gets exactly one chance so a persistent failure
@@ -1784,32 +2099,84 @@ fn spawn_with_cache_repair(
     port: u16,
     version: Option<&str>,
 ) -> Result<SpawnOutcome, SpawnFailure> {
-    let first = match spawn_and_wait(app, npx, overlay, port, version) {
+    let attempt_started_at = Instant::now();
+    let first = match spawn_and_wait(app, npx, overlay, port, version, false) {
         Ok(outcome) => return Ok(outcome),
         Err(failure) => failure,
     };
-    let Some(cache_dir) = first.2.as_deref().and_then(corrupt_npx_cache_dir) else {
-        return Err(first);
-    };
-    if let Err(error) = purge_corrupt_npx_cache(&cache_dir) {
-        eprintln!("dsh 启动失败，且无法自动修复 npx 缓存：{error}");
-        return Err((
-            first.0,
-            format!("{}（检测到 npx 缓存损坏，自动清理失败：{error}）", first.1),
-            first.2,
+    self_repair_log(&format!(
+        "首次尝试失败: issue={} message={:?} detail_len={}",
+        first.0,
+        first.1,
+        first.2.as_deref().map(str::len).unwrap_or(0)
+    ));
+
+    // Fast path, keyed off npm's own report: the entry is corrupt and npm said
+    // exactly which one. Works for the early-exit failure shape.
+    if let Some(cache_dir) = first.2.as_deref().and_then(corrupt_npx_cache_dir) {
+        self_repair_log(&format!("快速路径命中 ENOENT 条目: {}", cache_dir.display()));
+        if let Err(error) = purge_corrupt_npx_cache(&cache_dir) {
+            self_repair_log(&format!("快速路径清理被拒绝: {error}"));
+            return Err((
+                first.0,
+                format!("{}（检测到 npx 缓存损坏，自动清理失败：{error}）", first.1),
+                first.2,
+            ));
+        }
+        self_repair_log(&format!("快速路径已清理，按首次下载重试: {}", cache_dir.display()));
+        // The entry was just deleted, so the retry downloads from scratch: it
+        // must not inherit the cache-hit window that fired this timeout.
+        return spawn_and_wait(app, npx, overlay, port, version, true).map_err(
+            |(issue, message, detail)| {
+                (
+                    issue,
+                    format!("{message}（已自动清理损坏的 npx 缓存并重试一次。）"),
+                    detail,
+                )
+            },
+        );
+    }
+    self_repair_log("快速路径未命中（detail 中无 ENOENT package.json）");
+
+    // Slow path: a readiness *timeout* produces no npm error to parse — the
+    // cache-hit start just never became ready because its `_npx` entry came
+    // from an interrupted install. Identify the entry structurally instead:
+    // touched inside this attempt's window and missing its manifest or its
+    // dsh payload. Only a timeout earns this scan; an early exit already had
+    // its chance through the stderr above.
+    if spawn_failure_issue(&first) == SpawnIssue::ReadyTimeout {
+        self_repair_log("进入慢速路径（ready_timeout）");
+        match npm_cache_dir() {
+            Some(cache_dir) => {
+                self_repair_log(&format!("npm_cache_dir 解析为: {}", cache_dir.display()));
+                let purged = purge_suspect_npx_cache_entries(&cache_dir, attempt_started_at);
+                self_repair_log(&format!("purge_suspect_npx_cache_entries 返回 purged={purged}"));
+                if purged {
+                    self_repair_log("慢速路径已清理，按首次下载重试");
+                    // Same reasoning as the fast path: the retry is a fresh
+                    // download, so give it the download window, not the
+                    // cache-hit window that just fired.
+                    return spawn_and_wait(app, npx, overlay, port, version, true).map_err(
+                        |(issue, message, detail)| {
+                            (
+                                issue,
+                                format!("{message}（已自动清理疑似中断的 npx 缓存并重试一次。）"),
+                                detail,
+                            )
+                        },
+                    );
+                }
+            }
+            None => self_repair_log("npm_cache_dir() 返回 None，慢速路径无法扫描"),
+        }
+    } else {
+        self_repair_log(&format!(
+            "非 ready_timeout（issue={}），不走慢速路径",
+            first.0
         ));
     }
-    eprintln!(
-        "检测到损坏的 npx 缓存（{}），已自动清理并重新尝试启动 dsh。",
-        cache_dir.display()
-    );
-    spawn_and_wait(app, npx, overlay, port, version).map_err(|(issue, message, detail)| {
-        (
-            issue,
-            format!("{message}（已自动清理损坏的 npx 缓存并重试一次。）"),
-            detail,
-        )
-    })
+    self_repair_log("自愈未触发任何重试，原样返回首次失败");
+    Err(first)
 }
 
 fn exit_reason(child: &mut Child) -> String {
@@ -2730,6 +3097,113 @@ mod tests {
         purge_corrupt_npx_cache(&entry).expect("a missing entry is already clean");
     }
 
+    // ── readiness-timeout self-heal ────────────────────────────────────────
+
+    /// Build `_npx/<key>` under a temp cache root with the given structure.
+    fn cache_entry(root: &Path, key: &str, manifest: bool, payload: bool) -> PathBuf {
+        let entry = root.join("_npx").join(key);
+        std::fs::create_dir_all(&entry).expect("create entry");
+        if manifest {
+            std::fs::write(entry.join("package.json"), "{}").expect("write manifest");
+        }
+        if payload {
+            let package = entry.join("node_modules").join("@deepseek-ai").join("dsh");
+            std::fs::create_dir_all(&package).expect("create payload");
+            std::fs::write(package.join("index.js"), "x").expect("write payload file");
+        }
+        entry
+    }
+
+    #[test]
+    fn timeout_scan_flags_an_entry_that_is_missing_its_manifest() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        let entry = cache_entry(cache.path(), "1da1392061ab1944", false, false);
+        let suspects = suspect_npx_cache_entries(cache.path(), Instant::now() - Duration::from_secs(1));
+        assert_eq!(suspects, vec![entry]);
+    }
+
+    #[test]
+    fn timeout_scan_flags_an_entry_that_is_missing_its_dsh_payload() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        let entry = cache_entry(cache.path(), "1e7f6d9597241db0", true, false);
+        let suspects = suspect_npx_cache_entries(cache.path(), Instant::now() - Duration::from_secs(1));
+        assert_eq!(suspects, vec![entry]);
+    }
+
+    #[test]
+    fn timeout_scan_keeps_a_structurally_complete_entry() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        cache_entry(cache.path(), "healthy", true, true);
+        let suspects = suspect_npx_cache_entries(cache.path(), Instant::now() - Duration::from_secs(1));
+        assert!(suspects.is_empty());
+    }
+
+    #[test]
+    fn timeout_scan_ignores_entries_older_than_the_attempt_window() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        let entry = cache_entry(cache.path(), "stale", false, false);
+        // A window that starts *after* the entry was built must not claim it:
+        // it belongs to some earlier attempt, not to the one that timed out.
+        let suspects = suspect_npx_cache_entries(cache.path(), Instant::now() + Duration::from_secs(3600));
+        assert!(suspects.is_empty());
+        assert!(entry.exists());
+    }
+
+    #[test]
+    fn timeout_scan_flags_an_entry_whose_own_mtime_is_inside_the_window() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        // The start touched the entry directory itself but never wrote a
+        // manifest or payload — the classic lock-file-only remnant.
+        let entry = cache.path().join("_npx").join("1da1392061ab1944");
+        std::fs::create_dir_all(&entry).expect("create entry");
+        let suspects = suspect_npx_cache_entries(cache.path(), Instant::now() - Duration::from_secs(1));
+        assert_eq!(suspects, vec![entry]);
+    }
+
+    #[test]
+    fn timeout_purge_removes_suspects_and_reports_progress() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        let corrupt = cache_entry(cache.path(), "corrupt", false, false);
+        let payload_less = cache_entry(cache.path(), "payloadless", true, false);
+        let complete = cache_entry(cache.path(), "complete", true, true);
+        assert!(purge_suspect_npx_cache_entries(
+            cache.path(),
+            Instant::now() - Duration::from_secs(1)
+        ));
+        assert!(!corrupt.exists());
+        assert!(!payload_less.exists());
+        assert!(complete.exists());
+    }
+
+    #[test]
+    fn timeout_purge_reports_nothing_to_do_on_a_healthy_cache() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        cache_entry(cache.path(), "complete", true, true);
+        assert!(!purge_suspect_npx_cache_entries(
+            cache.path(),
+            Instant::now() - Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn timeout_purge_refuses_an_entry_that_healed_between_scan_and_delete() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let entry = cache_entry(directory.path(), "healed", true, true);
+        let error = purge_incomplete_npx_entry(&entry).expect_err("complete entry must be kept");
+        assert!(error.contains("结构完整"));
+        assert!(entry.exists());
+    }
+
+    #[test]
+    fn spawn_issue_recognizes_only_the_ready_timeout() {
+        let timeout: SpawnFailure = ("ready_timeout".to_string(), "msg".to_string(), None);
+        assert_eq!(spawn_failure_issue(&timeout), SpawnIssue::ReadyTimeout);
+        let exit: SpawnFailure = ("exited".to_string(), "msg".to_string(), None);
+        assert_eq!(spawn_failure_issue(&exit), SpawnIssue::Other);
+        let spawn: SpawnFailure = ("spawn_failed".to_string(), "msg".to_string(), None);
+        assert_eq!(spawn_failure_issue(&spawn), SpawnIssue::Other);
+    }
+
     fn address(ip: &str, interface: Option<&str>, has_gateway: bool) -> LocalAddress {
         LocalAddress {
             ip: ip.parse().expect("test address should parse"),
@@ -3300,16 +3774,17 @@ mod tests {
         }
     }
 
-    /// A cached start downloads nothing, so the deadline must stay exactly where
-    /// it always was: 180s from the spawn. Sliding it here would mean a wedged
-    /// process could hold the app in 「正在启动」 forever.
+    /// A cached start downloads nothing, so there is no progress to wait for:
+    /// it gets the short cache-hit window instead of the download window.
+    /// Sliding it here would mean a wedged process could hold the app in
+    /// 「正在启动」 forever.
     #[test]
     fn a_download_that_never_grows_keeps_the_absolute_deadline() {
         let started_at = Instant::now();
         let snapshot = snapshot_at(0, started_at, false);
         assert_eq!(
-            ready_deadline(Some(snapshot), started_at),
-            started_at + READY_TIMEOUT
+            ready_deadline(Some(snapshot), started_at, false),
+            started_at + READY_TIMEOUT_CACHED
         );
     }
 
@@ -3321,12 +3796,65 @@ mod tests {
         let last_growth = started_at + Duration::from_secs(170);
         let snapshot = snapshot_at(40 * 1024 * 1024, last_growth, true);
         assert_eq!(
-            ready_deadline(Some(snapshot), started_at),
+            ready_deadline(Some(snapshot), started_at, false),
             last_growth + READY_TIMEOUT
         );
         assert!(
-            ready_deadline(Some(snapshot), started_at) > started_at + READY_TIMEOUT,
+            ready_deadline(Some(snapshot), started_at, false) > started_at + READY_TIMEOUT,
             "growth must extend the wait past the plain 180s window"
+        );
+    }
+
+    /// The two windows must stay distinct: a cache hit never inherits the
+    /// download timeout, and a download never falls back to the short
+    /// cache-hit one — a slow network is not a wedged cache.
+    #[test]
+    fn the_cache_hit_window_stays_shorter_than_the_download_window() {
+        assert!(READY_TIMEOUT_CACHED < READY_TIMEOUT);
+
+        let started_at = Instant::now();
+        // Grew, but only just: the deadline is the download window from the
+        // last growth, not the cache-hit window from the spawn.
+        let grew = snapshot_at(
+            PROGRESS_ACTIVE_THRESHOLD_BYTES,
+            started_at + READY_TIMEOUT_CACHED + Duration::from_secs(5),
+            true,
+        );
+        assert_eq!(
+            ready_deadline(Some(grew), started_at, false),
+            grew.last_growth + READY_TIMEOUT
+        );
+        // Same shape without observed growth: the cache-hit window applies,
+        // and the longer download window must not leak into it.
+        let cached = snapshot_at(0, started_at, false);
+        assert_eq!(
+            ready_deadline(Some(cached), started_at, false),
+            started_at + READY_TIMEOUT_CACHED
+        );
+    }
+
+    /// The self-repair retry has just emptied the cache, so it downloads from
+    /// scratch. Even with no growth observed yet, it must get the download
+    /// window — the 30s cache-hit window that fired the timeout being repaired
+    /// would cut a healthy reinstall off almost immediately.
+    #[test]
+    fn a_self_repair_retry_uses_the_download_window_until_growth() {
+        let started_at = Instant::now();
+        let snapshot = snapshot_at(0, started_at, false);
+        assert_eq!(
+            ready_deadline(Some(snapshot), started_at, true),
+            started_at + READY_TIMEOUT
+        );
+        // Once growth is observed the flag stops mattering: the sliding window
+        // takes over either way.
+        let grew = snapshot_at(
+            PROGRESS_ACTIVE_THRESHOLD_BYTES,
+            started_at + Duration::from_secs(60),
+            true,
+        );
+        assert_eq!(
+            ready_deadline(Some(grew), started_at, true),
+            grew.last_growth + READY_TIMEOUT
         );
     }
 
@@ -3337,7 +3865,7 @@ mod tests {
         let started_at = Instant::now();
         let snapshot = snapshot_at(1, started_at + Duration::from_secs(10_000), true);
         assert_eq!(
-            ready_deadline(Some(snapshot), started_at),
+            ready_deadline(Some(snapshot), started_at, false),
             started_at + READY_TIMEOUT_CEILING
         );
     }
@@ -3348,7 +3876,7 @@ mod tests {
     fn a_missing_sampler_falls_back_to_the_absolute_timeout() {
         let started_at = Instant::now();
         assert_eq!(
-            ready_deadline(None, started_at),
+            ready_deadline(None, started_at, false),
             started_at + READY_TIMEOUT
         );
     }

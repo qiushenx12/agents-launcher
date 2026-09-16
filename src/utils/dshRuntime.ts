@@ -313,7 +313,9 @@ export function describeInstallProgress(progress: {
 } | null): string {
   if (!progress) return '正在准备 dsh…'
   const elapsed = formatDuration(progress.elapsedMs)
-  if (progress.cached) return `使用本地缓存，正在启动 · 已用 ${elapsed}`
+  // 缓存命中的启动（npx 跳过下载、直接跑 `_npx` 里的既有安装）也可能挂起
+  // ——dsh 进程自己初始化慢——所以文案别写死"正在启动"，带着已用时间即可。
+  if (progress.cached) return `正在准备 dsh · 使用本地缓存 · 已用 ${elapsed}`
   return `正在准备 dsh（首次运行需要下载）· 已下载 ${formatBytes(progress.bytes)}`
     + ` · ${formatBytes(progress.bytesPerSecond)}/s · ${elapsed}`
 }

@@ -214,6 +214,8 @@ test('first-download progress never reports a cache hit as 0 MB/s', () => {
   assert.match(cached, /本地缓存/)
   assert.doesNotMatch(cached, /0 B\/s/)
   assert.match(cached, /00:04/)
+  // 缓存命中的启动也可能挂起，文案不写死「正在启动」。
+  assert.doesNotMatch(cached, /正在启动/)
 
   const downloading = describeInstallProgress({
     bytes: 12 * 1024 * 1024,
