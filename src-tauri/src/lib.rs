@@ -6,6 +6,7 @@ pub mod cli_migration;
 pub mod cli_runtime;
 pub mod codex_config;
 pub mod codex_proxy;
+pub mod codex_session_chain;
 pub mod config_store;
 pub mod dependency_manager;
 pub mod dsh_embed;
@@ -199,6 +200,8 @@ pub fn run() {
             cli_runtime::load_codex_workspace,
             cli_runtime::list_codex_threads,
             cli_runtime::list_all_codex_threads,
+            cli_runtime::scan_codex_session_integrity,
+            cli_runtime::repair_codex_session_chain,
             cli_runtime::discover_opencode_projects,
             cli_runtime::list_opencode_sessions,
             cli_runtime::list_all_opencode_sessions,

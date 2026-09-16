@@ -4,6 +4,26 @@
     class="project-terminal"
     :class="{ 'project-terminal--drag-over': dragOver }"
   >
+    <div
+      v-if="store.activeCliKind === 'codex' && codexSessionIssueCount > 0"
+      class="session-issues-banner"
+    >
+      <span class="session-issues-banner__text">
+        检测到 {{ codexSessionIssueCount }} 个 Codex 会话存在分页断链或版本问题，部分聊天内容可能显示不全（数据未丢失）。
+      </span>
+      <button
+        class="btn btn-secondary session-issues-banner__btn"
+        @click="codexIssuesDialogOpen = true"
+      >
+        查看与修复
+      </button>
+    </div>
+    <CodexSessionIssuesDialog
+      v-if="codexIssuesDialogOpen"
+      :issues="store.codexSessionIssues"
+      mode="workspace"
+      @close="codexIssuesDialogOpen = false"
+    />
     <div v-if="!store.activeProject" class="project-terminal__empty">
       <div
         v-if="store.activeCliKind === 'codex'"
@@ -116,6 +136,7 @@ import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import { isInSidebarDropZone, isInTopSidebarDropZone } from '@/composables/useSidebarDropZone'
 import TerminalPane from '@/components/terminal/TerminalPane.vue'
 import AsyncPanelLoading from '@/components/common/AsyncPanelLoading'
+import CodexSessionIssuesDialog from '@/components/codex/CodexSessionIssuesDialog.vue'
 import {
   ClaudeStartupPromptCancelledError,
   waitForClaudePromptReady,
@@ -142,6 +163,10 @@ const conversationEmptyPaneRef = ref<ClaudeConversationPaneExpose | null>(null)
 const dragOver = ref(false)
 const claudeEmptyError = ref('')
 const claudeEmptyPending = ref(false)
+const codexIssuesDialogOpen = ref(false)
+const codexSessionIssueCount = computed(() =>
+  new Set(store.codexSessionIssues.map(issue => issue.threadId)).size,
+)
 const claudeStartupPermissionMode = ref<ClaudeDefaultPermissionMode>('auto')
 const claudeEmptyDrafts = ref<Record<string, string>>({})
 const claudeEmptyAttachmentPaths = ref<Record<string, string[]>>({})
@@ -551,6 +576,32 @@ useTauriDrop((paths, position) => {
 </script>
 
 <style scoped>
+.session-issues-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: rgba(210, 140, 30, 0.16);
+  border-bottom: 1px solid rgba(210, 140, 30, 0.4);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.session-issues-banner__text {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-issues-banner__btn {
+  flex-shrink: 0;
+}
+
 .project-terminal {
   flex: 1;
   min-width: 0;

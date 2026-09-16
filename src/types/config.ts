@@ -83,6 +83,41 @@ export interface CodexAuthStatus {
   error: string | null
 }
 
+export type CodexSessionIssueKind =
+  | 'orphaned_tail'
+  | 'parent_missing'
+  | 'base_beyond_end'
+  | 'writer_newer_than_cli'
+
+export interface CodexSessionIssue {
+  threadId: string
+  cwd: string
+  projectName: string
+  preview: string
+  kind: CodexSessionIssueKind | string
+  repairable: boolean
+  orphanedBytes: number
+  orphanedRecords: number
+  orphanedUserMessages: number
+  orphanedFirstAt: string | null
+  orphanedLastAt: string | null
+  pageCount: number
+  writerCliVersion: string | null
+  localCliVersion: string | null
+  message: string
+}
+
+export interface CodexSessionRepairResult {
+  threadId: string
+  strategy: string
+  backupDir: string
+  pageCount: number
+  mergedBytes: number
+  keptRecords: number
+  skippedRecords: number
+  message: string
+}
+
 export interface CodexProfilesPayload {
   profiles: CodexProfile[]
   order: string[]
@@ -99,6 +134,10 @@ export interface CodexProfilesPayload {
   customGlobalKeySyncSupported: boolean
   secretStorageKind: 'windows_dpapi' | 'macos_plaintext' | 'unsupported'
   platform: string
+  /** 切换配置前的会话完整性预检结果；仅在 apply 流程中填充 */
+  sessionIssues?: CodexSessionIssue[]
+  /** true 表示本次 apply 因检测到可修复的会话断链而未执行 */
+  sessionIssuesBlocked?: boolean
 }
 
 export interface CodexLaunchContext {

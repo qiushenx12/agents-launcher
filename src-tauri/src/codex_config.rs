@@ -301,6 +301,10 @@ pub struct CodexProfilesPayload {
     pub custom_global_key_sync_supported: bool,
     pub secret_storage_kind: &'static str,
     pub platform: &'static str,
+    /// 切换配置前的会话完整性预检结果；仅在 apply 流程中填充。
+    pub session_issues: Vec<crate::codex_session_chain::CodexSessionIssue>,
+    /// true 表示本次 apply 因检测到可修复的会话断链而未执行，前端应引导修复或强制继续。
+    pub session_issues_blocked: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -349,6 +353,9 @@ pub struct ApplyCodexProfileRequest {
     pub profile_id: String,
     #[serde(default)]
     pub apply_to_global: bool,
+    /// 用户在断链提示中选择"仍然切换"后置 true，跳过预检拦截。
+    #[serde(default)]
+    pub allow_session_issues: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -379,6 +386,12 @@ fn app_data_dir() -> Result<PathBuf, String> {
 
 fn codex_data_dir() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("codex"))
+}
+
+/// 会话修复备份根目录。必须位于 CODEX_HOME 的 sessions/ 之外，
+/// 否则备份文件会被会话扫描再次计入。
+pub(crate) fn codex_session_repair_backup_root() -> Result<PathBuf, String> {
+    Ok(codex_data_dir()?.join("session-repair-backups"))
 }
 
 fn profiles_path() -> Result<PathBuf, String> {
@@ -970,20 +983,11 @@ fn merge_rollout_file(
         return copy_file_if_missing(source, &alternate);
     }
 
-    let source_newer = source_is_newer(source, target);
-    if source_newer {
-        let backup = migration_backup_path(
-            backup_root,
-            directory,
-            relative,
-            "replaced-shared.jsonl",
-        )?;
-        copy_file_if_missing(target, &backup)?;
-        write_raw_atomic(target, &source_bytes, "CodeX 共享会话")
-    } else {
-        let backup = migration_backup_path(backup_root, directory, relative, "isolated.jsonl")?;
-        copy_file_if_missing(source, &backup)
-    }
+    // 同一线程的会话文件发生分叉时，共享 home 是权威：保留共享侧，
+    // 隔离侧进备份。共享侧可能是修复后的合并文件（更短但更完整），
+    // 隔离 home 只是冻结存档，没有任何读取方再写它。
+    let backup = migration_backup_path(backup_root, directory, relative, "isolated.jsonl")?;
+    copy_file_if_missing(source, &backup)
 }
 
 fn migrate_rollout_tree(
@@ -993,6 +997,7 @@ fn migrate_rollout_tree(
     backup_root: &Path,
     directory_name: &str,
     migrated_ids: &mut HashSet<String>,
+    known_thread_ids: &HashSet<String>,
 ) -> Result<(), String> {
     if !source_root.is_dir() {
         return Ok(());
@@ -1021,9 +1026,16 @@ fn migrate_rollout_tree(
             let relative = path.strip_prefix(source_root).map_err(|error| {
                 format!("无法计算 CodeX 会话相对路径：{error}")
             })?;
+            let target = target_root.join(relative);
+            // 共享端已存在该线程（任意文件）而目标路径缺失：说明这个文件是
+            // 被会话修复移除的分页/旧副本，或共享端早已分叉。共享 home 是权威，
+            // 不回灌，否则修复后的断链会反复复活。
+            if !target.exists() && known_thread_ids.contains(&id) {
+                continue;
+            }
             merge_rollout_file(
                 &path,
-                &target_root.join(relative),
+                &target,
                 profile_id,
                 backup_root,
                 directory_name,
@@ -1135,6 +1147,10 @@ fn prepare_shared_profile_storage(profile: &CodexProfile) -> Result<(), String> 
         .join("migration-backups")
         .join("shared-home-v1")
         .join(&profile.id);
+    // 共享端已存在的线程集合：迁移只补齐共享端完全没有的线程，
+    // 已有线程的缺失文件（例如修复时被移除的分页）不得回灌。
+    let mut known_thread_ids = collect_rollout_ids(&shared_home.join("sessions"))?;
+    known_thread_ids.extend(collect_rollout_ids(&shared_home.join("archived_sessions"))?);
     for directory in ["sessions", "archived_sessions"] {
         migrate_rollout_tree(
             &isolated_home.join(directory),
@@ -1143,6 +1159,7 @@ fn prepare_shared_profile_storage(profile: &CodexProfile) -> Result<(), String> 
             &backup_root,
             directory,
             &mut migrated_ids,
+            &known_thread_ids,
         )?;
     }
     merge_jsonl(
@@ -3315,6 +3332,8 @@ fn load_payload() -> Result<CodexProfilesPayload, String> {
         custom_global_key_sync_supported: custom_global_key_sync_supported(),
         secret_storage_kind: secret_storage_kind(),
         platform: platform_name(),
+        session_issues: Vec::new(),
+        session_issues_blocked: false,
     })
 }
 
@@ -3611,6 +3630,30 @@ pub fn apply_codex_profile(
         .find(|profile| profile.id == request.profile_id)
         .cloned()
         .ok_or_else(|| format!("CodeX 配置方案 '{}' 不存在", request.profile_id))?;
+    // 切换配置预检：会话分页断链不会丢失数据，但重启 Codex 桌面端后读取端
+    // 只能看到断链前的内容。切换前扫描出来，引导用户先修复，避免"切换后
+    // 会话内容看起来丢失"。
+    if !request.allow_session_issues {
+        if let Ok(home) = codex_home() {
+            let sessions_root = home.join("sessions");
+            if sessions_root.is_dir() {
+                let local_cli_version = crate::codex_session_chain::local_codex_cli_version();
+                let issues: Vec<_> = crate::codex_session_chain::scan_sessions_integrity(
+                    &sessions_root,
+                    local_cli_version.as_deref(),
+                )
+                .into_iter()
+                .filter(|issue| issue.repairable)
+                .collect();
+                if !issues.is_empty() {
+                    let mut payload = load_payload()?;
+                    payload.session_issues = issues;
+                    payload.session_issues_blocked = true;
+                    return Ok(payload);
+                }
+            }
+        }
+    }
     if request.apply_to_global && !custom_global_sync_supported() {
         return Err("当前平台不支持同步 CodeX 全局配置".to_string());
     }
@@ -5454,6 +5497,7 @@ mod tests {
             &directory.join("backups/profile-test"),
             "sessions",
             &mut ids,
+            &HashSet::new(),
         )
         .expect("migrate all sessions");
         merge_jsonl(
@@ -5516,23 +5560,91 @@ mod tests {
         .expect("merge divergent rollout");
 
         let canonical = fs::read(&target).expect("read canonical rollout");
-        let suffix = if canonical == source_bytes {
-            "replaced-shared.jsonl"
-        } else {
-            "isolated.jsonl"
-        };
+        // 共享 home 是权威：分叉时共享侧保持不变，隔离侧进入备份。
+        assert_eq!(canonical, target_bytes);
         let backup_path = migration_backup_path(
             &backup_root,
             "sessions",
             Path::new("2026/08/15/thread.jsonl"),
-            suffix,
+            "isolated.jsonl",
         )
         .expect("backup path");
         let backup = fs::read(backup_path).expect("read conflict backup");
-        assert!(
-            (canonical == source_bytes && backup == target_bytes)
-                || (canonical == target_bytes && backup == source_bytes)
+        assert_eq!(backup, source_bytes);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn repaired_thread_files_are_not_reimported_from_legacy_home() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-session-reimport-{}",
+            Uuid::new_v4()
+        ));
+        let thread_id = "01a03324-bad1-7c81-a458-4ca57d6b87ea";
+        let source_sessions = directory.join("isolated/sessions/2026/08/24");
+        let target_sessions = directory.join("shared/sessions/2026/08/24");
+        fs::create_dir_all(&source_sessions).expect("create isolated sessions");
+        fs::create_dir_all(&target_sessions).expect("create shared sessions");
+
+        // 隔离 home 仍保存断链的两页原件。
+        let legacy_parent = source_sessions.join(format!("rollout-2026-08-24T17-40-40-{thread_id}.jsonl"));
+        let legacy_page = source_sessions.join(format!(
+            "rollout-2026-08-24T20-14-25-{thread_id}_01a033b1-7d0c-7102-bb6c-748e4ccfbf10.jsonl"
+        ));
+        fs::write(
+            &legacy_parent,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"01a03324-bad1-7c81-a458-4ca57d6b87ea\",\"model_provider\":\"openai\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"message\":\"legacy-tail\"}}\n"
+            ),
+        )
+        .expect("write legacy parent");
+        fs::write(
+            &legacy_page,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"01a03324-bad1-7c81-a458-4ca57d6b87ea\",\"model_provider\":\"openai\"}}\n",
+        )
+        .expect("write legacy page");
+
+        // 共享端是修复后的合并文件（与隔离父页分叉，且分页文件已被移除）。
+        let shared_consolidated = target_sessions.join(format!("rollout-2026-08-24T17-40-40-{thread_id}.jsonl"));
+        let consolidated_bytes = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"01a03324-bad1-7c81-a458-4ca57d6b87ea\",\"model_provider\":\"openai\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"message\":\"consolidated\"}}\n"
+        )
+        .as_bytes();
+        fs::write(&shared_consolidated, consolidated_bytes).expect("write consolidated");
+
+        let mut ids = HashSet::new();
+        let known = HashSet::from([thread_id.to_string()]);
+        migrate_rollout_tree(
+            &directory.join("isolated/sessions"),
+            &directory.join("shared/sessions"),
+            "profile-test",
+            &directory.join("backups/profile-test"),
+            "sessions",
+            &mut ids,
+            &known,
+        )
+        .expect("migrate with known threads");
+
+        // 分页文件不得回灌；合并文件不得被隔离父页覆盖；隔离分叉版进备份。
+        assert!(!target_sessions
+            .join(format!(
+                "rollout-2026-08-24T20-14-25-{thread_id}_01a033b1-7d0c-7102-bb6c-748e4ccfbf10.jsonl"
+            ))
+            .exists());
+        assert_eq!(
+            fs::read(&shared_consolidated).expect("read shared"),
+            consolidated_bytes
         );
+        let backup_path = migration_backup_path(
+            &directory.join("backups/profile-test"),
+            "sessions",
+            Path::new(&format!("2026/08/24/rollout-2026-08-24T17-40-40-{thread_id}.jsonl")),
+            "isolated.jsonl",
+        )
+        .expect("backup path");
+        assert!(backup_path.exists());
         let _ = fs::remove_dir_all(directory);
     }
 

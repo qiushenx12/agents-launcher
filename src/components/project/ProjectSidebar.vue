@@ -124,6 +124,11 @@
                 >
                   <span class="session-row__status" :class="sessionStatus(session.id)" />
                   <span class="session-row__name">{{ displaySessionName(session.name) }}</span>
+                  <span
+                    v-if="codexSessionIssueTooltip(session)"
+                    class="session-row__issue"
+                    :title="codexSessionIssueTooltip(session)"
+                  >⚠</span>
                   <span class="session-row__meta">
                     <span class="session-row__time">{{ formatRelativeTime(session.updatedAt) }}</span>
                     <button
@@ -359,6 +364,15 @@ function sessionStatus(sessionId: unknown) {
 
 function sessionIsCloseable(sessionId: unknown) {
   return sessionStatus(sessionId) !== 'off'
+}
+
+function codexSessionIssueTooltip(session: ProjectSession) {
+  if (session.cliKind !== 'codex') return ''
+  const threadId = session.nativeSessionId ?? ''
+  if (!threadId) return ''
+  const issues = store.codexSessionIssueByThreadId.get(threadId)
+  if (!issues || issues.length === 0) return ''
+  return issues.map(issue => issue.message).join('\n')
 }
 
 function hiddenSessionCount(projectId: string) {
@@ -945,6 +959,13 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-row__issue {
+  flex: 0 0 auto;
+  color: #b05f00;
+  font-size: 11px;
+  cursor: help;
 }
 
 .project-row__actions {

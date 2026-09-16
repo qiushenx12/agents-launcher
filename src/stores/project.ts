@@ -7,7 +7,7 @@ import { useCodexConfigStore } from './codexConfig'
 import { useOpencodeConfigStore } from './opencodeConfig'
 import { useTerminalStore } from './terminal'
 import { useClaudeViewModeStore } from './claudeViewMode'
-import type { CliProfileRef, SessionEntry } from '@/types/config'
+import type { CliProfileRef, CodexSessionIssue, CodexSessionRepairResult, SessionEntry } from '@/types/config'
 import { CLI_DESCRIPTORS, type CliKind } from '@/types/cli'
 import { useCliRuntimeStore } from './cliRuntime'
 import { getDefaultShell } from '@/composables/useDefaultShell'
@@ -136,6 +136,7 @@ interface CodexThreadList {
 interface CodexWorkspaceSnapshot {
   discovery: CodexProjectDiscovery
   threads: CodexThreadList
+  sessionIssues?: CodexSessionIssue[]
 }
 
 interface CodexProjectEntry {
@@ -1292,6 +1293,17 @@ export const useProjectStore = defineStore('project', () => {
   const HISTORY_SYNC_CONCURRENCY = 4
   const historySyncedAt: Record<string, number> = {}
   const discoverySyncedAt: Partial<Record<CliKind, number>> = {}
+  /** Codex 分页会话链完整性问题（随 load_codex_workspace 刷新） */
+  const codexSessionIssues = ref<CodexSessionIssue[]>([])
+  const codexSessionIssueByThreadId = computed(() => {
+    const map = new Map<string, CodexSessionIssue[]>()
+    for (const issue of codexSessionIssues.value) {
+      const list = map.get(issue.threadId)
+      if (list) list.push(issue)
+      else map.set(issue.threadId, [issue])
+    }
+    return map
+  })
 
   async function discoverCliProjects(kind: 'codex' | 'opencode', force: boolean) {
     const now = Date.now()
@@ -1450,6 +1462,7 @@ export const useProjectStore = defineStore('project', () => {
 
     const projectsChanged = applyCodexProjectDiscovery(snapshot.discovery)
     discoverySyncedAt.codex = now
+    codexSessionIssues.value = snapshot.sessionIssues ?? []
     const sessionsChanged = await applyBatchedSessionEntries('codex', snapshot.threads.threads, {
       codexResultComplete: snapshot.threads.complete,
       now,
@@ -1509,6 +1522,18 @@ export const useProjectStore = defineStore('project', () => {
     } catch (error) {
       statusMessage.value = `CodeX 配置切换后会话刷新失败：${String(error)}`
     }
+  }
+
+  async function repairCodexSessionChain(threadId: string): Promise<string> {
+    const result = await invoke<CodexSessionRepairResult>('repair_codex_session_chain', {
+      request: { threadId },
+    })
+    codexSessionIssues.value = codexSessionIssues.value.filter(
+      issue => !(issue.threadId === threadId && issue.repairable),
+    )
+    await prepareCodexWorkspace(true).catch(() => false)
+    statusMessage.value = `CodeX 会话修复完成：${result.message}`
+    return result.message
   }
 
   async function refreshClaudeHistory() {
@@ -2467,6 +2492,9 @@ export const useProjectStore = defineStore('project', () => {
     setActiveCliKind,
     refreshActiveCliHistory,
     refreshCodexProfileSessions,
+    codexSessionIssues,
+    codexSessionIssueByThreadId,
+    repairCodexSessionChain,
     refreshClaudeHistory,
     handleClaudeSessionLifecycleEvent,
     toggleClaudeWslMode,

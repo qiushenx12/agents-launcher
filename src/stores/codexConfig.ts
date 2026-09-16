@@ -10,6 +10,7 @@ import type {
   CodexLaunchContext,
   CodexProfile,
   CodexProfilesPayload,
+  CodexSessionIssue,
 } from '@/types/config'
 
 const TEMPLATE_MODEL_FIELDS = new Set([
@@ -221,6 +222,8 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
   const customGlobalKeySyncSupported = ref(false)
   const secretStorageKind = ref<CodexProfilesPayload['secretStorageKind']>('unsupported')
   const platform = ref('unknown')
+  /** 切换配置被会话断链预检拦截时待确认的问题列表；null 表示无弹窗 */
+  const sessionIssuePrompt = ref<CodexSessionIssue[] | null>(null)
 
   const orderedProfiles = computed(() => {
     const byId = new Map(profiles.value.map(profile => [profile.id, profile]))
@@ -616,7 +619,7 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     }
   }
 
-  async function applyProfile(): Promise<boolean> {
+  async function applyProfile(options: { allowSessionIssues?: boolean } = {}): Promise<boolean> {
     const profile = profiles.value.find(item => item.id === selectedProfileId.value)
     if (!profile || isDirty.value || applying.value || apiKeyRevealing.value) return false
     const applyToGlobal = syncToGlobal.value
@@ -662,8 +665,16 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
         request: {
           profileId: profile.id,
           applyToGlobal,
+          allowSessionIssues: options.allowSessionIssues ?? false,
         },
       })
+      if (payload.sessionIssuesBlocked) {
+        // 切换前预检发现可修复的会话分页断链：本次未切换，交由弹窗引导修复或强制继续。
+        sessionIssuePrompt.value = payload.sessionIssues ?? []
+        statusMessage.value = '检测到 Codex 会话存在分页断链，建议先修复再切换配置'
+        return false
+      }
+      sessionIssuePrompt.value = null
       applyPayload(payload, profile.id)
       if (payload.activeProfileId !== profile.id) {
         throw new Error('活动方案写入后回读不一致')
@@ -701,8 +712,17 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     }
   }
 
-  async function revealApiKey(): Promise<boolean> {
-    const profile = editingProfile.value
+  function dismissSessionIssuePrompt() {
+    sessionIssuePrompt.value = null
+  }
+
+  /** 用户在断链提示中选择"仍然切换"：跳过预检拦截重新应用。 */
+  async function applyProfileDespiteSessionIssues(): Promise<boolean> {
+    sessionIssuePrompt.value = null
+    return applyProfile({ allowSessionIssues: true })
+  }
+
+  async function revealApiKey(): Promise<boolean> {    const profile = editingProfile.value
     if (!profile.id
       || profile.authMode !== 'custom'
       || !profile.hasStoredApiKey
@@ -882,6 +902,9 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     saveProfile,
     reorderProfiles,
     applyProfile,
+    sessionIssuePrompt,
+    dismissSessionIssuePrompt,
+    applyProfileDespiteSessionIssues,
     revealApiKey,
     fetchModels,
     deleteProfile,

@@ -477,6 +477,16 @@
       </section>
 
     </main>
+
+    <!-- 对话框必须留在组件根节点内部：ConfigWorkspace 靠 v-show 切换本面板，
+         多根片段会让 v-show 失效，导致 Codex 面板常驻并盖住其他配置页。 -->
+    <CodexSessionIssuesDialog
+      v-if="store.sessionIssuePrompt"
+      :issues="store.sessionIssuePrompt"
+      mode="apply"
+      @close="store.dismissSessionIssuePrompt()"
+      @continue-apply="store.applyProfileDespiteSessionIssues()"
+    />
   </div>
 </template>
 
@@ -485,6 +495,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useCodexConfigStore } from '@/stores/codexConfig'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
 import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
+import CodexSessionIssuesDialog from '@/components/codex/CodexSessionIssuesDialog.vue'
 import ModelField from '@/components/config/ModelField.vue'
 import SecretField from '@/components/config/SecretField.vue'
 import { useDragReorder } from '@/composables/useDragReorder'

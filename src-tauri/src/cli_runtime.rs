@@ -73,6 +73,8 @@ pub struct CodexProjectDiscovery {
 pub struct CodexWorkspaceSnapshot {
     pub discovery: CodexProjectDiscovery,
     pub threads: CodexThreadList,
+    /// 分页会话链完整性问题（断链 / 写入方版本高于本机 CLI 等）。
+    pub session_issues: Vec<crate::codex_session_chain::CodexSessionIssue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,10 +548,71 @@ pub async fn load_codex_workspace(
                 CodexThreadList { threads, complete }
             }
         };
-        Ok(CodexWorkspaceSnapshot { discovery, threads })
+        // 分页会话链完整性只读扫描：断链检测 + 写入方版本高于本机 CLI 提示。
+        let session_issues = if sessions_root.is_dir() {
+            let local_cli_version = crate::codex_session_chain::local_codex_cli_version();
+            crate::codex_session_chain::scan_sessions_integrity(
+                &sessions_root,
+                local_cli_version.as_deref(),
+            )
+        } else {
+            Vec::new()
+        };
+        Ok(CodexWorkspaceSnapshot {
+            discovery,
+            threads,
+            session_issues,
+        })
     })
     .await
     .map_err(|error| format!("CodeX 工作区读取任务异常结束: {error}"))?
+}
+
+#[tauri::command]
+pub async fn scan_codex_session_integrity(
+    profile_id: Option<String>,
+) -> Result<Vec<crate::codex_session_chain::CodexSessionIssue>, String> {
+    tokio::task::spawn_blocking(move || {
+        let runtime = crate::codex_config::resolve_codex_runtime_context(profile_id.as_deref())?;
+        let sessions_root = codex_sessions_root(&runtime)
+            .ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
+        if !sessions_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let local_cli_version = crate::codex_session_chain::local_codex_cli_version();
+        Ok(crate::codex_session_chain::scan_sessions_integrity(
+            &sessions_root,
+            local_cli_version.as_deref(),
+        ))
+    })
+    .await
+    .map_err(|error| format!("CodeX 会话完整性扫描任务异常结束: {error}"))?
+}
+
+#[tauri::command]
+pub async fn repair_codex_session_chain(
+    request: crate::codex_session_chain::RepairCodexSessionChainRequest,
+) -> Result<crate::codex_session_chain::CodexSessionRepairResult, String> {
+    tokio::task::spawn_blocking(move || {
+        // 修复前必须确认没有 Codex 客户端在运行（退出时会用内存旧状态覆盖修复）。
+        crate::codex_session_chain::ensure_codex_clients_not_running()?;
+        let runtime = crate::codex_config::resolve_codex_runtime_context(None)?;
+        let sessions_root = codex_sessions_root(&runtime)
+            .ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
+        let backup_root = crate::codex_config::codex_session_repair_backup_root()?;
+        let result = crate::codex_session_chain::repair_thread_chain(
+            &sessions_root,
+            &request.thread_id,
+            &backup_root,
+        )?;
+        // 让下一次列表读取拿到修复后的数据。
+        if let Ok(mut cache) = CODEX_THREADS_CACHE.lock() {
+            *cache = None;
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|error| format!("CodeX 会话修复任务异常结束: {error}"))?
 }
 
 fn discover_codex_projects_from_session_meta(
@@ -856,7 +919,8 @@ fn codex_threads_from_rollout_index(
     index: &CodexRolloutIndex,
     max_count: u32,
 ) -> (Vec<CodexThreadSummary>, bool) {
-    let mut threads = Vec::new();
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut threads: Vec<CodexThreadSummary> = Vec::new();
     for indexed_record in &index.records {
         let Some(record) = load_codex_rollout_record(&indexed_record.path) else {
             continue;
@@ -875,7 +939,7 @@ fn codex_threads_from_rollout_index(
             .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.timestamp())
             .unwrap_or(0);
-        threads.push(CodexThreadSummary {
+        let summary = CodexThreadSummary {
             id: id.clone(),
             name: None,
             preview: read_cached_codex_rollout_preview(&record),
@@ -883,7 +947,32 @@ fn codex_threads_from_rollout_index(
             cwd: worktree,
             created_at,
             updated_at: record.updated_at,
-        });
+        };
+        // 分页会话的同一线程有多个 rollout 文件（每页一个），合并为一条：
+        // updated_at 取链尖（最大），created_at / cwd / preview 取根页（created_at 最小）。
+        match by_id.get(id) {
+            Some(&existing_index) => {
+                let existing = &mut threads[existing_index];
+                if summary.updated_at > existing.updated_at {
+                    existing.updated_at = summary.updated_at;
+                }
+                if summary.created_at < existing.created_at {
+                    existing.created_at = summary.created_at;
+                    existing.cwd = summary.cwd.clone();
+                    existing.model_provider = summary.model_provider.clone();
+                    if !summary.preview.is_empty() {
+                        existing.preview = summary.preview.clone();
+                    }
+                }
+                if existing.preview.is_empty() && !summary.preview.is_empty() {
+                    existing.preview = summary.preview.clone();
+                }
+            }
+            None => {
+                by_id.insert(id.clone(), threads.len());
+                threads.push(summary);
+            }
+        }
     }
     threads.sort_by(|left, right| {
         right
@@ -897,7 +986,7 @@ fn codex_threads_from_rollout_index(
     (threads, complete)
 }
 
-fn read_codex_rollout_preview(path: &Path) -> String {
+pub(crate) fn read_codex_rollout_preview(path: &Path) -> String {
     let Ok(file) = File::open(path) else {
         return String::new();
     };
