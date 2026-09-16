@@ -138,9 +138,12 @@
       <!-- Shared CLI workspace — keep mounted while on the config tab so
            xterm instances (scrollback, mouse modes) survive tab switches.
            dsh has no project workspace: it serves its own browser UI, which is
-           hosted in a child WebView instead of a PTY + ProjectPanel. -->
+           hosted in a child WebView instead of a PTY + ProjectPanel.
+           The mount condition must match the entry rule (src/utils/cliEntry.ts):
+           a discovered frontend needs its check to say `ready` first, dsh never
+           does — its runtime panel carries its own states. -->
       <div
-        v-if="mountedMainPanels.project && workspaceCliKind && workspaceCliStatus?.state === 'ready'"
+        v-if="mountedMainPanels.project && cliWorkspaceCanMount(workspaceCliKind, workspaceCliStatus?.state)"
         v-show="workspaceMode === 'project'"
         class="app-panel"
       >
@@ -454,6 +457,11 @@ import {
   shouldToggleTitleBarMaximize,
 } from './utils/windowTitleBar'
 import { beginStartupMeasure, markStartup, measureStartup } from './utils/startupMetrics'
+import {
+  cliAvailabilityGateApplies,
+  cliWorkspaceCanMount,
+  entryBlockedWhileChecking,
+} from './utils/cliEntry'
 import { scheduleIdleTask } from './utils/idleTask'
 import {
   CLI_DESCRIPTORS,
@@ -611,8 +619,12 @@ const activeClaudeViewLabel = computed(() => {
 })
 const cliWorkspacePreparing = computed(() => workspaceMode.value === 'project'
   && cliWorkspacePreparation.value?.kind === activeCliKind.value)
+// dsh is excluded on purpose: it mounts its runtime panel without waiting for the
+// check, and the gate reports that very check's verdict — leaving it in place over
+// the dsh tab is what made entering look like it did nothing.
 const cliGateVisible = computed(() => appReady.value
   && workspaceMode.value === 'project'
+  && cliAvailabilityGateApplies(workspaceCliKind.value)
   && (cliWorkspacePreparing.value || activeCliStatus.value?.state !== 'ready'))
 const cliGateChecking = computed(() => cliWorkspacePreparing.value
   || !activeCliStatus.value
@@ -1127,7 +1139,11 @@ function onWindowResize() {
 }
 
 async function openCliTab(kind: CliKind, forceCheck = false) {
-  if (!appReady.value || cliRuntimeStore.checking[kind]) return
+  // 检测在跑时，只有「需要按检测结论整理工作区」的前端才该丢弃这次点击。
+  // dsh 不属于这一类（见 src/utils/cliEntry.ts）：它的切页只读缓存结论，
+  // 把点击丢掉就是纯粹的无反应——点了「进入DeepSeek Harness」和顶栏 项目/dsh
+  // 都毫无动静，直到那次 npx 探测结束再点一次才生效。
+  if (!appReady.value || entryBlockedWhileChecking(kind, cliRuntimeStore.checking)) return
   if (workspaceMode.value === 'config') {
     if (kind === activeCliKind.value) {
       if (!(await configWorkspaceStore.confirmDiscardActiveChanges(`进入 ${CLI_DESCRIPTORS[kind].label} 项目`))) {
@@ -1145,34 +1161,21 @@ async function openCliTab(kind: CliKind, forceCheck = false) {
   // 这里必须绕开 prepareCliWorkspace，否则会掉进 OpenCode 兜底分支去发现
   // OpenCode 的项目与会话。服务未启动时只显示空态，不自动启动。
   //
+  // dsh 同样不吃「整理工作区」这道门禁：没有项目与会话要发现，运行面板（未启动
+  // 时的空态卡片、启动进度，或运行中的内嵌界面）挂上即到位。切页因此完全不依赖
+  // 检测结论——检测只在后台补齐缓存（它对 dsh 是一次 npx 解析，可能耗时数十秒），
+  // 结论回来后由 activeCliStatus 直接采用；可用性由运行面板自己的启动链路兜底。
+  // 让一次可能很慢的探测挡住切页，正是「点了没反应、过一会儿又能进」的由来。
+  //
   // 「进入项目」前的那段确认对话框（confirmDiscardActiveChanges / selectKind）
-  // 是原生窗口，focusout 会让界面感觉"卡了好几下"。dsh 因此不等检测结论：
-  // 切页与检测同步起步，运行面板（未启动时的空态卡片）立刻就位，检测结论
-  // 回来后被直接采用。dsh 可不可用这个门禁管不了（它经 npx 运行，可用性由
-  // 运行面板自己的启动链路兜底），为门禁等一次 npx 解析只是白白拖住切页。
+  // 是原生窗口，focusout 会让界面感觉"卡了好几下"，所以那之后要立刻切页。
   if (kind === 'dsh') {
-    const gateStartedAtDsh = performance.now()
     const finishDshMeasure = beginStartupMeasure('cli-workspace-dsh')
     mainTab.value = kind
     projectStore.setActiveCliKind(kind)
     cliInstallHelpVisible.value = false
-    cliWorkspacePreparation.value = { kind, requestId }
-    try {
-      // 后台补齐缓存里的 dsh 状态（不 await）：已有结论原样展示，检测结论
-      // 回来后会被直接采用；没有结论时它把状态摆成 checking，门禁表现与
-      // 改动前一致。卡住几秒 npx 解析的窗口被挪出了进入路径。检测挂在
-      // cliWorkspacePreparation 之外、失败也不打断切页。
-      void cliRuntimeStore.check(kind, forceCheck).catch(() => undefined)
-      const status = cliRuntimeStore.statuses[kind]
-      if (status?.state !== 'ready') return
-      const remaining = MIN_CLI_WORKSPACE_GATE_MS - (performance.now() - gateStartedAtDsh)
-      if (remaining > 0) await new Promise<void>((resolve) => setTimeout(resolve, remaining))
-    } finally {
-      if (cliWorkspacePreparation.value?.requestId === requestId) {
-        cliWorkspacePreparation.value = null
-      }
-      finishDshMeasure()
-    }
+    void cliRuntimeStore.check(kind, forceCheck).catch(() => undefined)
+    finishDshMeasure()
     return
   }
 
