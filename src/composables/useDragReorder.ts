@@ -8,9 +8,19 @@ export function useDragReorder<T>(
   onReorder: (newItems: T[]) => void,
   options: {
     startDelayMs?: number
+    /**
+     * Vertical pitch between two items, added to an item's height when working
+     * out the drag slots. It must match the list's own spacing (a CSS gap or a
+     * row margin) or the items sliding out of the way land a few pixels off the
+     * slot they are standing in.
+     */
+    gapPx?: number
     onDragStart?: (item: T, index: number) => void | Promise<void>
   } = {},
 ) {
+  const itemGap = typeof options.gapPx === 'number' && options.gapPx >= 0
+    ? options.gapPx
+    : ITEM_GAP
   const draggingIndex = ref<number | null>(null)
   const overIndex = ref<number | null>(null)
   // Stays true for a short window after a drag completes so click handlers can ignore it
@@ -50,7 +60,7 @@ export function useDragReorder<T>(
 
     itemElements = Array.from(container.querySelectorAll<HTMLElement>('[data-drag-item]'))
     const rect = item.getBoundingClientRect()
-    itemHeight = rect.height + ITEM_GAP
+    itemHeight = rect.height + itemGap
 
     startY = e.clientY
     cloneStartTop = rect.top
@@ -114,7 +124,7 @@ export function useDragReorder<T>(
         `left: ${rect.left}px`,
         `top: ${cloneStartTop}px`,
         `width: ${rect.width}px`,
-        `height: ${itemHeight - ITEM_GAP}px`,
+        `height: ${itemHeight - itemGap}px`,
         `margin: 0`,
         `z-index: 9999`,
         `pointer-events: none`,
@@ -138,7 +148,7 @@ export function useDragReorder<T>(
     // Swap threshold: 1/3 of the item height from the leading edge of the target.
     // Downward: swap when clone centre passes target's top + 1/3 of its height.
     // Upward:   swap when clone centre passes target's bottom - 1/3 of its height.
-    const cloneCentreY = cloneStartTop + deltaY + (itemHeight - ITEM_GAP) / 2
+    const cloneCentreY = cloneStartTop + deltaY + (itemHeight - itemGap) / 2
     let newOver = draggingIndex.value
 
     // Downward: find the furthest item below draggingIndex whose 1/3-from-top threshold the clone has passed
@@ -249,7 +259,7 @@ export function useDragReorder<T>(
       itemElements = Array.from(container.querySelectorAll<HTMLElement>('[data-drag-item]'))
     }
     const rect = originalItem.getBoundingClientRect()
-    itemHeight = rect.height + ITEM_GAP
+    itemHeight = rect.height + itemGap
     cloneStartTop = rect.top
   }
 

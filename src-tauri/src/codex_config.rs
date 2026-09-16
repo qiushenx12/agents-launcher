@@ -1355,6 +1355,22 @@ fn normalize_model_catalog(
             ));
         }
     }
+
+    // `priority` 是 Codex 真正的排序依据，数组顺序不是：`codex debug models`
+    // 只是照抄数组，而选择器读的 app-server `model/list` 会按 priority 升序返回，
+    // 并把排在首位的那条标成 `isDefault`（实测 Codex 0.154.0：数组 [p9, p1, p5]
+    // 返回 p1, p5, p9）。所以启动器里拖动出来的顺序必须投影到 priority 上，否则
+    // 配置文件长得像改了顺序，Codex 内外看到的两份顺序仍然是旧的那一份。
+    //
+    // 位置即名次，从 1 开始，与 DeepSeek 模板自身的取值方式一致。这同时修掉了
+    // 另一个隐患：自定义 slug 的模型都从模板兜底继承同一个 priority，排序结果
+    // 原本是不确定的；这里按数组位置统一重排，落盘的文件总是自洽的。
+    for (index, model) in catalog.models.iter_mut().enumerate() {
+        model
+            .extra
+            .insert("priority".to_string(), Value::Number(((index + 1) as u64).into()));
+    }
+
     Ok(catalog)
 }
 
@@ -5120,6 +5136,65 @@ mod tests {
         assert_eq!(document["models"][1]["slug"].as_str(), Some("deepseek-v4-pro"));
         assert_eq!(document["models"][1]["priority"].as_u64(), Some(2));
         assert_eq!(document["models"][1]["context_window"].as_u64(), Some(1_048_576));
+    }
+
+    /// 拖动排序必须落到 `priority` 上，而不只是数组顺序。
+    ///
+    /// Codex 按 `priority` 排序：`codex debug models` 只是照抄数组，而选择器读的
+    /// app-server `model/list` 按 priority 升序返回，并把首位标成 `isDefault`
+    /// （Codex 0.154.0 实测：数组 [p9, p1, p5] → 返回 p1, p5, p9）。所以这里故意
+    /// 把 priority 写成与数组位置相反的值，断言落盘时按数组位置重排成 1..n——
+    /// 只改数组顺序的话，Codex 内外看到的两份顺序仍然是旧的那一份。
+    #[test]
+    fn model_catalog_projects_model_order_onto_priority() {
+        let mut profile = custom_profile_with_catalog();
+        let base = profile
+            .model_catalog
+            .as_ref()
+            .expect("catalog")
+            .models[0]
+            .clone();
+        let ordered_model = |slug: &str, priority: u64| {
+            let mut model = base.clone();
+            model.slug = slug.to_string();
+            model.display_name = slug.to_string();
+            model
+                .extra
+                .insert("priority".to_string(), Value::Number(priority.into()));
+            model
+        };
+        profile.model_catalog.as_mut().expect("catalog").models = vec![
+            ordered_model("ordered-first", 9),
+            ordered_model("ordered-second", 1),
+            ordered_model("ordered-third", 5),
+        ];
+        // 默认模型由「默认」单选决定，与它在列表中的位置无关：这里选中间那个。
+        profile.model = "ordered-second".to_string();
+
+        let profile = normalize_profile(profile).expect("valid reordered profile");
+        assert_eq!(profile.model, "ordered-second");
+        let bytes = render_model_catalog(&profile).expect("render reordered models.json");
+        let document: Value = serde_json::from_slice(&bytes).expect("parse models.json");
+        let rendered: Vec<(String, u64)> = document["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .map(|model| {
+                (
+                    model["slug"].as_str().unwrap_or_default().to_string(),
+                    model["priority"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("ordered-first".to_string(), 1),
+                ("ordered-second".to_string(), 2),
+                ("ordered-third".to_string(), 3),
+            ],
+            "models.json 的 priority 必须按数组位置重排，Codex 才按这个顺序展示"
+        );
     }
 
     #[test]

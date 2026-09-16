@@ -376,6 +376,28 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     return true
   }
 
+  /**
+   * 重排模型目录（`models.json` 的 `models` 数组顺序）。
+   *
+   * 顺序不是纯粹的界面问题：`render_model_catalog` 按这个数组写 models.json，
+   * 并把数组位置投影到每条模型的 `priority` 上——Codex 排序看的是 `priority`
+   * 而不是数组（见 codex_config.rs 的 `normalize_model_catalog`）。所以这里
+   * 必须真的把数组换掉：只调界面渲染顺序的话，保存回配置文件时又会被改回去。
+   *
+   * `nextOrder` 由拖拽组件给出：它永远是当前这批模型对象的一个排列，因此
+   * 只接受「同一批对象」的提交，长度或成员对不上（拖动途中列表被增删）就
+   * 放弃这次排序，避免把数组搞成重复或丢失。
+   */
+  function reorderModels(nextOrder: CodexModelDefinition[]): boolean {
+    const models = editingProfile.value.modelCatalog?.models
+    if (!models || nextOrder.length !== models.length) return false
+    const current = new Set(models)
+    if (!nextOrder.every(model => current.has(model))) return false
+    if (nextOrder.every((model, index) => model === models[index])) return false
+    models.splice(0, models.length, ...nextOrder)
+    return true
+  }
+
   function setDefaultModel(slug: string): boolean {
     const models = editingProfile.value.modelCatalog?.models
     if (!models?.some(model => model.slug === slug)) return false
@@ -870,6 +892,7 @@ export const useCodexConfigStore = defineStore('codexConfig', () => {
     disableModelCatalog,
     addModel,
     removeModel,
+    reorderModels,
     setDefaultModel,
     apiKeyInput,
     storedApiKeyRevealed,

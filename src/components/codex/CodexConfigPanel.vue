@@ -272,6 +272,7 @@
             </div>
             <div v-else class="model-list">
               <div class="model-columns" aria-hidden="true">
+                <span />
                 <span>默认</span>
                 <span>显示名称</span>
                 <span>上下文长度</span>
@@ -280,11 +281,29 @@
                 <span>原图细节</span>
                 <span />
               </div>
+              <!--
+                拖动的是真实数据：顺序会写进 models.json 的 models 数组，并由后端
+                投影到每条模型的 priority 上（Codex 就按 priority 排序），所以这里
+                不能只改界面的渲染顺序。手柄只覆盖左侧那 14px，行内的输入框、下拉、
+                单选都不受拖动影响。
+              -->
               <div
                 v-for="(model, index) in catalogModels"
                 :key="index"
+                data-drag-item
                 class="model-row"
+                :class="{
+                  'model-row--dragging': modelDraggingIndex === index,
+                  'model-row--drag-over': modelDraggingIndex !== null
+                    && modelDraggingIndex !== index
+                    && modelOverIndex === index,
+                }"
               >
+                <span
+                  class="model-row__drag-handle"
+                  title="拖拽排序"
+                  @pointerdown="onModelDragPointerDown(index, $event)"
+                />
                 <label class="model-default-field">
                   <input
                     type="radio"
@@ -528,6 +547,22 @@ const defaultModelSlug = computed(() => {
     ? profile.value.model
     : models[0]?.slug ?? ''
 })
+/**
+ * 模型目录（models.json）的拖动排序，与左侧配置列表各用一个实例：两处列表
+ * 同时挂在这一个组件里，共用一套 draggingIndex/overIndex 会互相串台。
+ *
+ * 行距传 6px 而不是默认的 2px——`.model-row` 之间是 `margin-top: 6px`，
+ * 拖动时让位的行要正好落在自己的槽位上。
+ */
+const {
+  draggingIndex: modelDraggingIndex,
+  overIndex: modelOverIndex,
+  onPointerDown: onModelDragPointerDown,
+} = useDragReorder<CodexModelDefinition>(
+  () => catalogModels.value,
+  (newOrder: CodexModelDefinition[]) => store.reorderModels(newOrder),
+  { gapPx: 6 },
+)
 const fetchedModelOptions = computed(() => {
   const existingSlugs = new Set(
     catalogModels.value.map(model => model.slug.trim()).filter(Boolean),
@@ -1042,9 +1077,9 @@ watch(leftWidth, (width) => {
 .model-list { margin-left: 120px; overflow-x: auto; }
 .model-columns,
 .model-row {
-  min-width: 850px;
+  min-width: 870px;
   display: grid;
-  grid-template-columns: 46px minmax(180px, 1.1fr) minmax(130px, 0.9fr) minmax(100px, 0.7fr) 54px 74px 30px;
+  grid-template-columns: 14px 46px minmax(180px, 1.1fr) minmax(130px, 0.9fr) minmax(100px, 0.7fr) 54px 74px 30px;
   gap: 7px;
   align-items: center;
 }
@@ -1056,6 +1091,44 @@ watch(leftWidth, (width) => {
 .model-percent-field { min-width: 0; }
 .model-percent-field .input { min-width: 0; }
 .model-row .icon-button { justify-self: center; }
+
+/*
+  拖动排序手柄：与左侧配置列表同一个视觉（两行各三个点、悬停才显形），
+  让「可以拖」这件事在这个面板里只有一种表达。touch-action: none 是拖动
+  在触屏上能收到 pointermove 的前提。
+*/
+.model-row__drag-handle {
+  width: 14px;
+  height: 14px;
+  position: relative;
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  touch-action: none;
+}
+
+.model-row__drag-handle::before,
+.model-row__drag-handle::after {
+  content: '';
+  position: absolute;
+  left: 1px;
+  width: 2.5px;
+  height: 2.5px;
+  border-radius: 50%;
+  background-color: var(--text-secondary);
+  box-shadow: 5px 0 0 var(--text-secondary), 10px 0 0 var(--text-secondary);
+}
+
+.model-row__drag-handle::before { top: 1.5px; }
+.model-row__drag-handle::after { bottom: 1.5px; }
+.model-row__drag-handle:active { cursor: grabbing; }
+.model-row:hover .model-row__drag-handle { opacity: 1; }
+
+.model-row--dragging {
+  opacity: 0.3;
+  background: var(--tab-bg);
+  border-radius: var(--radius-sm);
+}
 
 .radio-group,
 .scope-row {
