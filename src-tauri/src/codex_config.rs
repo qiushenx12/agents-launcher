@@ -887,6 +887,60 @@ fn desktop_shared_migration_marker(profile_id: &str) -> Result<PathBuf, String> 
         .join(format!("{profile_id}.json")))
 }
 
+/// 「遗留 home → 共享 home」会话迁移的完成标记。
+///
+/// 遗留 home 是一份冻结的旧数据：现在只有迁移和 auth 探测会读它，没有任何
+/// 写入方。迁移本身又是一次性的——迁完之后再跑一遍只会把两边的目录树重新
+/// 遍历一次，什么都不会做。而它偏偏挂在 `prepare_profiles_for_load` 上，也就是
+/// 每次「加载 CodeX 页面 / 保存 / 应用」都会跑：实测 6 个 profile（三个遗留
+/// home 各有 2000 个左右的会话文件）要 2.2 秒，其中 1.1 秒是把与 profile 无关的
+/// `~/.codex/sessions` 重复扫了 12 遍、另 1.1 秒是重走已迁完的遗留 home。
+///
+/// 所以这里沿用旁边那份桌面状态迁移标记的做法：迁完一个 profile 就落一个标记，
+/// 之后的加载直接跳过它。标记只在整趟成功之后才写，中途失败不会把未完成的迁移
+/// 标成已完成。
+///
+/// 唯一的行为差异：共享端彻底删掉某个会话后，旧实现会在下次加载时从遗留 home
+/// 把它搬回来，现在不会——共享 home 是权威、不回灌，本就与 `migrate_rollout_tree`
+/// 里那套「已存在的线程不复活」的约定一致。
+fn rollout_shared_migration_marker(profile_id: &str) -> Result<PathBuf, String> {
+    Ok(codex_data_dir()?
+        .join("migrations")
+        .join("shared-home-v1")
+        .join(format!("{profile_id}.rollouts.json")))
+}
+
+/// 共享 home 里已有的线程 id（sessions + archived_sessions）。
+fn shared_rollout_thread_ids(shared_home: &Path) -> Result<HashSet<String>, String> {
+    let mut ids = collect_rollout_ids(&shared_home.join("sessions"))?;
+    ids.extend(collect_rollout_ids(&shared_home.join("archived_sessions"))?);
+    Ok(ids)
+}
+
+/// 迁移后校验：被迁移的线程必须真的出现在共享端。
+///
+/// 没有任何迁移时直接返回，不读目录——这条最常走，不能为它扫一遍共享 home。
+fn verify_migrated_rollouts(
+    shared_home: &Path,
+    migrated_ids: &HashSet<String>,
+) -> Result<(), String> {
+    if migrated_ids.is_empty() {
+        return Ok(());
+    }
+    let shared_ids = shared_rollout_thread_ids(shared_home)?;
+    let missing = migrated_ids
+        .difference(&shared_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "CodeX 共享会话迁移校验失败，{} 个会话未出现在共享目录",
+            missing.len()
+        ));
+    }
+    Ok(())
+}
+
 fn copy_file_if_missing(source: &Path, target: &Path) -> Result<(), String> {
     if target.exists() || !source.is_file() {
         return Ok(());
@@ -1114,7 +1168,15 @@ fn merge_jsonl(
     write_raw_atomic(target, &bytes, label)
 }
 
-fn prepare_shared_profile_storage(profile: &CodexProfile) -> Result<(), String> {
+/// 把遗留 home 的会话并进共享 home。
+///
+/// `shared_thread_ids` 是「共享端已有线程」的按需缓存，由调用方持有：它与 profile
+/// 无关，一次加载里所有 profile 共用一份。早先的实现为每个 profile 各扫两遍
+/// `~/.codex/sessions`（六个 profile 实测约 1.1 秒，全是重复劳动）。
+fn prepare_shared_profile_storage(
+    profile: &CodexProfile,
+    shared_thread_ids: &mut Option<HashSet<String>>,
+) -> Result<(), String> {
     let shared_home = codex_home()?;
     fs::create_dir_all(&shared_home)
         .map_err(|error| format!("无法创建 CodeX 共享目录：{error}"))?;
@@ -1142,25 +1204,60 @@ fn prepare_shared_profile_storage(profile: &CodexProfile) -> Result<(), String> 
         }
     }
 
-    let mut migrated_ids = HashSet::new();
-    let backup_root = codex_data_dir()?
-        .join("migration-backups")
-        .join("shared-home-v1")
-        .join(&profile.id);
+    migrate_legacy_home_rollouts(
+        &profile.id,
+        &isolated_home,
+        &shared_home,
+        &codex_data_dir()?
+            .join("migration-backups")
+            .join("shared-home-v1")
+            .join(&profile.id),
+        shared_thread_ids,
+        &rollout_shared_migration_marker(&profile.id)?,
+    )
+}
+
+/// 会话迁移本体（路径全部由调用方给出，便于按临时目录驱动测试）。
+///
+/// 已经迁完的 profile 在这里直接返回：遗留 home 此后不会再变，而重走一遍两个
+/// 目录树、再扫一遍共享端，正是加载/保存/应用变慢的主因。
+fn migrate_legacy_home_rollouts(
+    profile_id: &str,
+    isolated_home: &Path,
+    shared_home: &Path,
+    backup_root: &Path,
+    shared_thread_ids: &mut Option<HashSet<String>>,
+    rollout_marker: &Path,
+) -> Result<(), String> {
+    if rollout_marker.exists() {
+        return Ok(());
+    }
+
     // 共享端已存在的线程集合：迁移只补齐共享端完全没有的线程，
     // 已有线程的缺失文件（例如修复时被移除的分页）不得回灌。
-    let mut known_thread_ids = collect_rollout_ids(&shared_home.join("sessions"))?;
-    known_thread_ids.extend(collect_rollout_ids(&shared_home.join("archived_sessions"))?);
-    for directory in ["sessions", "archived_sessions"] {
-        migrate_rollout_tree(
-            &isolated_home.join(directory),
-            &shared_home.join(directory),
-            &profile.id,
-            &backup_root,
-            directory,
-            &mut migrated_ids,
-            &known_thread_ids,
-        )?;
+    if shared_thread_ids.is_none() {
+        *shared_thread_ids = Some(shared_rollout_thread_ids(shared_home)?);
+    }
+    let mut migrated_ids = HashSet::new();
+    {
+        let known_thread_ids = shared_thread_ids.as_ref().expect("filled above");
+        for directory in ["sessions", "archived_sessions"] {
+            migrate_rollout_tree(
+                &isolated_home.join(directory),
+                &shared_home.join(directory),
+                profile_id,
+                backup_root,
+                directory,
+                &mut migrated_ids,
+                known_thread_ids,
+            )?;
+        }
+    }
+    // 把刚迁进来的线程并回缓存，供同一轮加载里后面的 profile 使用：它们此刻
+    // 确实已经在共享端了，不并进去就等于让下一个 profile 看到一份过时的快照，
+    // 从而把本该「已存在、不回灌」的文件重新灌一遍。
+    if let Some(ids) = shared_thread_ids.as_mut() {
+        ids.extend(migrated_ids.iter().cloned());
     }
     merge_jsonl(
         &isolated_home.join("session_index.jsonl"),
@@ -1172,16 +1269,11 @@ fn prepare_shared_profile_storage(profile: &CodexProfile) -> Result<(), String> 
         &shared_home.join("history.jsonl"),
         "CodeX 共享提示历史",
     )?;
-    let mut shared_ids = collect_rollout_ids(&shared_home.join("sessions"))?;
-    shared_ids.extend(collect_rollout_ids(&shared_home.join("archived_sessions"))?);
-    let missing = migrated_ids.difference(&shared_ids).cloned().collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "CodeX 共享会话迁移校验失败，{} 个会话未出现在共享目录",
-            missing.len()
-        ));
-    }
-    Ok(())
+
+    // 先校验再落标记：标记意味着「这一个 profile 不会再迁了」，所以校验失败时
+    // 绝不能留下标记，否则这次失败再也不会被复查。
+    verify_migrated_rollouts(shared_home, &migrated_ids)?;
+    write_json_atomic(rollout_marker, br#"{"version":1}"#, "CodeX 共享会话迁移标记")
 }
 
 fn managed_model_catalog_path(profile_id: &str) -> Result<PathBuf, String> {
@@ -2986,6 +3078,8 @@ fn prepare_profiles_for_load(state: &mut CodexProfileState) -> Result<(), String
     } else {
         (None, None)
     };
+    // 共享端线程集合与 profile 无关，整轮只算一次（见 prepare_shared_profile_storage）。
+    let mut shared_thread_ids = None;
     for profile in &mut state.profiles {
         if let Some(ratio) = profile.model_auto_compact_ratio {
             if ratio.is_finite() && (0.0..=1.0).contains(&ratio) {
@@ -2996,7 +3090,7 @@ fn prepare_profiles_for_load(state: &mut CodexProfileState) -> Result<(), String
 
         profile.managed_profile_name = managed_profile_name(&profile.id);
         profile.has_stored_api_key = profile_secret_exists(&profile.id)?;
-        prepare_shared_profile_storage(profile)?;
+        prepare_shared_profile_storage(profile, &mut shared_thread_ids)?;
         let profile_path = managed_profile_path(&profile.id)?;
         let mut profile_auto_compact_token_limit = None;
         if profile_path.exists() {
@@ -3426,7 +3520,10 @@ pub fn save_codex_profile(
     request: SaveCodexProfileRequest,
 ) -> Result<CodexProfilesPayload, String> {
     let profile = normalize_profile(request.profile)?;
-    prepare_shared_profile_storage(&profile)?;
+    // 共享端线程集合的缓存只服务这一次调用，交给 `prepare_shared_profile_storage`
+    // 按需填充（该 profile 已迁完时它连目录都不会读）。
+    let mut shared_thread_ids = None;
+    prepare_shared_profile_storage(&profile, &mut shared_thread_ids)?;
     let metadata_path = profiles_path()?;
     let profile_path = managed_profile_path(&profile.id)?;
     let mut state = load_profile_state()?;
@@ -5530,6 +5627,128 @@ mod tests {
         assert!(migrated.get("thread-project-assignments").is_none());
         assert!(migrated.get("electron-persisted-atom-state").is_none());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    /// 写一个能被 `rollout_identity` 认出来的会话文件。
+    fn write_rollout(path: &std::path::Path, id: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create rollout dir");
+        }
+        fs::write(
+            path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"company\"}}}}
+"
+            ),
+        )
+        .expect("write rollout");
+    }
+
+    /// 遗留 home 的会话迁移只做一次。
+    ///
+    /// 它挂在 `prepare_profiles_for_load` 上，也就是每次加载/保存/应用都会跑；
+    /// 没有完成标记时，它每次都把两个目录树重走一遍（三个 2000 文件的遗留 home
+    /// 实测 1.1 秒，全是在做已经做过的事）。标记落地之后必须不再读遗留 home——
+    /// 这里往已迁完的遗留 home 里再塞一个会话，如果实现还在走目录树，它就会被
+    /// 搬进共享端。
+    #[test]
+    fn legacy_home_migration_runs_once_and_then_leaves_the_legacy_home_alone() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-rollout-marker-{}",
+            Uuid::new_v4()
+        ));
+        let isolated = directory.join("isolated");
+        let shared = directory.join("shared");
+        let marker = directory.join("migrations").join("profile-test.rollouts.json");
+        let backups = directory.join("backups").join("profile-test");
+        write_rollout(&isolated.join("sessions/2026/08/15/legacy-a.jsonl"), "legacy-a");
+        write_rollout(&shared.join("sessions/2026/08/15/shared-b.jsonl"), "shared-b");
+
+        let mut shared_thread_ids = None;
+        migrate_legacy_home_rollouts(
+            "profile-test",
+            &isolated,
+            &shared,
+            &backups,
+            &mut shared_thread_ids,
+            &marker,
+        )
+        .expect("first pass migrates");
+
+        assert!(shared.join("sessions/2026/08/15/legacy-a.jsonl").exists());
+        assert!(marker.exists(), "迁完必须落下完成标记");
+        assert_eq!(
+            shared_thread_ids,
+            Some(HashSet::from(["shared-b".to_string(), "legacy-a".to_string()])),
+            "共享端线程集合按需算一次，并把本趟迁进来的线程并回去"
+        );
+
+        // 第二个会话是在迁移「完成」之后才出现的：有了标记就不该再被搬走。
+        write_rollout(&isolated.join("sessions/2026/08/15/legacy-c.jsonl"), "legacy-c");
+        migrate_legacy_home_rollouts(
+            "profile-test",
+            &isolated,
+            &shared,
+            &backups,
+            &mut shared_thread_ids,
+            &marker,
+        )
+        .expect("second pass is a no-op");
+
+        assert!(
+            !shared.join("sessions/2026/08/15/legacy-c.jsonl").exists(),
+            "标记已存在时不应再遍历遗留 home"
+        );
+    }
+
+    /// 两个 profile 各持同一线程的遗留副本时，第二个不该把它重新灌回共享端。
+    ///
+    /// 共享端已有该线程（任意文件）而目标路径缺失时 `migrate_rollout_tree` 会跳过，
+    /// 依据是「共享端已存在的线程集合」。这份集合现在按需缓存一次、并把本趟迁进来的
+    /// 线程并回去——如果只缓存不合并，第二个 profile 会拿着过时的快照把文件灌回来。
+    #[test]
+    fn cached_shared_thread_ids_keep_the_second_profile_from_reinjecting() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-rollout-cache-{}",
+            Uuid::new_v4()
+        ));
+        let shared = directory.join("shared");
+        write_rollout(&shared.join("sessions/2026/08/15/seed.jsonl"), "seed");
+        let backups = directory.join("backups");
+
+        // profile-a 的遗留副本被迁进共享端，线程 id 变成「共享端已存在」。
+        let isolated_a = directory.join("isolated-a");
+        write_rollout(&isolated_a.join("sessions/2026/08/15/moved.jsonl"), "moved");
+        let mut shared_thread_ids = None;
+        migrate_legacy_home_rollouts(
+            "profile-a",
+            &isolated_a,
+            &shared,
+            &backups.join("profile-a"),
+            &mut shared_thread_ids,
+            &directory.join("migrations").join("profile-a.rollouts.json"),
+        )
+        .expect("profile-a migrates");
+        assert!(shared.join("sessions/2026/08/15/moved.jsonl").exists());
+
+        // profile-b 也留着同一线程的副本，但在另一个内部路径下：目标路径不存在，
+        // 而线程已在共享端——按规则不回灌。
+        let isolated_b = directory.join("isolated-b");
+        write_rollout(&isolated_b.join("sessions/2026/08/16/moved.jsonl"), "moved");
+        migrate_legacy_home_rollouts(
+            "profile-b",
+            &isolated_b,
+            &shared,
+            &backups.join("profile-b"),
+            &mut shared_thread_ids,
+            &directory.join("migrations").join("profile-b.rollouts.json"),
+        )
+        .expect("profile-b migrates");
+
+        assert!(
+            !shared.join("sessions/2026/08/16/moved.jsonl").exists(),
+            "共享端已有的线程不得从另一个 profile 的遗留 home 回灌"
+        );
     }
 
     #[test]
