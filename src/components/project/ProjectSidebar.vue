@@ -74,6 +74,13 @@
           'project-block--menu-open': openMenuProjectId === project.id,
         }"
       >
+        <!--
+          整行就是展开/折叠会话列表的开关：项目名之类的内容区都是它的点击面
+          （右侧的项目操作按钮用 @click.stop 让位）。这里原本还有一个 ▸/▾
+          指示箭头，按用户要求去掉了——它看着像唯一的开关，其实只是重复的
+          装饰。折叠功能本身没有变，`onProjectRowClick` 仍然走
+          `store.toggleProjectExpanded`。
+        -->
         <div
           class="project-row"
           :class="{
@@ -84,7 +91,6 @@
           @pointerdown="onProjectRowPointerDown(index, $event)"
           @click="onProjectRowClick(project.id)"
         >
-          <span class="project-row__toggle">{{ isExpanded(project.id) ? '▾' : '▸' }}</span>
           <span class="project-row__folder">
             <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
               <path d="M1.5 3C1.5 2.17157 2.17157 1.5 3 1.5H5.5L7 3.5H13C13.8284 3.5 14.5 4.17157 14.5 5V12C14.5 12.8284 13.8284 13.5 13 13.5H3C2.17157 13.5 1.5 12.8284 1.5 12V3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
@@ -937,7 +943,6 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   touch-action: none;
 }
 
-.project-row__toggle,
 .project-row__folder {
   flex: 0 0 16px;
   height: 16px;
