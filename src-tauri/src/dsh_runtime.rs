@@ -1347,40 +1347,25 @@ fn supervised_listens_on(port: u16) -> bool {
 fn npm_cache_dir() -> Option<PathBuf> {
     // Resolve npm the same way the dsh launch resolves npx — by full path via
     // `locate_executable`, which honours PATHEXT (`npm.cmd`). `Command::new("npm")`
-    // alone fails in a GUI process whose PATH does not resolve bare names, which
-    // is exactly the case that sent us down the fallback below.
+    // alone fails in a GUI process whose PATH does not resolve bare names.
     let npm = crate::platform_env::locate_executable("npm");
-    self_repair_log(&format!("npm_cache_dir: locate_executable(npm) = {npm:?}"));
-    let config_result = npm
-        .as_ref()
-        .map(|path| hidden_command(path).args(["config", "get", "cache"]).output());
-    match config_result {
-        Some(Ok(output)) if output.status.success() => {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() && path != "undefined" {
-                self_repair_log(&format!("npm_cache_dir: npm config 返回 {path}"));
-                return Some(PathBuf::from(path));
+    if let Some(path) = npm.as_ref() {
+        if let Ok(output) = hidden_command(path)
+            .args(["config", "get", "cache"])
+            .output()
+        {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() && path != "undefined" {
+                    return Some(PathBuf::from(path));
+                }
             }
-            self_repair_log(&format!("npm_cache_dir: npm config 输出无效 {path:?}，走兜底"));
         }
-        Some(Ok(output)) => self_repair_log(&format!(
-            "npm_cache_dir: npm config 退出码 {:?}，走兜底",
-            output.status.code()
-        )),
-        Some(Err(error)) => self_repair_log(&format!(
-            "npm_cache_dir: 无法执行 npm config（{error}），走兜底"
-        )),
-        None => self_repair_log("npm_cache_dir: 定位不到 npm 可执行文件，走兜底"),
     }
     // npm's default cache on Windows is %LOCALAPPDATA%\npm-cache — NOT `npm`.
     // Falling back to `…\npm` would silently watch a directory that never
     // exists, which is exactly how the corrupt `_npx` entries went unseen.
-    let fallback = dirs::cache_dir().map(|path| path.join("npm-cache"));
-    self_repair_log(&format!(
-        "npm_cache_dir: 兜底解析为 {:?}",
-        fallback.as_ref().map(|p| p.display().to_string())
-    ));
-    fallback
+    dirs::cache_dir().map(|path| path.join("npm-cache"))
 }
 
 fn directory_size(path: &Path) -> u64 {
@@ -1703,33 +1688,6 @@ fn spawn_and_wait(
                 detail,
                 terminate_managed_process(&mut child, DshAccess::Local, port),
             );
-            self_repair_log(&format!(
-                "ready_timeout 触发: fresh_download={fresh_download} snapshot={}",
-                match &snapshot {
-                    Some(s) => format!(
-                        "Some(grew={} bytes={} last_growth_age={:?})",
-                        s.grew,
-                        s.bytes,
-                        s.last_growth.elapsed()
-                    ),
-                    None => "None".to_string(),
-                }
-            ));
-            // Dump whatever the process actually said, so a stalled download is
-            // distinguishable from a stalled npx that never reached the network.
-            let stderr_lines = stderr_tail
-                .lock()
-                .map(|guard| guard.len())
-                .unwrap_or(0);
-            self_repair_log(&format!(
-                "  超时时刻 stderr 行数={stderr_lines} detail_len={}",
-                detail.as_deref().map(str::len).unwrap_or(0)
-            ));
-            if let Some(detail_text) = detail.as_deref() {
-                for line in detail_text.lines().take(STDERR_TAIL_LINES) {
-                    self_repair_log(&format!("  stderr> {line}"));
-                }
-            }
             // The message names the cause. A download still moving at the
             // ceiling, and one that never got going, are the two download
             // cases. A *cache hit* that never became ready is the corrupt
@@ -1910,7 +1868,6 @@ fn suspect_npx_cache_entries(cache_dir: &Path, window_start: Instant) -> Vec<Pat
     let mut suspects = Vec::new();
     let npx_root = cache_dir.join("_npx");
     let Ok(entries) = std::fs::read_dir(&npx_root) else {
-        self_repair_log(&format!("扫描失败：无法读取 {}", npx_root.display()));
         return suspects;
     };
     // Instants cannot be compared against filesystem mtimes directly; convert
@@ -1918,47 +1875,25 @@ fn suspect_npx_cache_entries(cache_dir: &Path, window_start: Instant) -> Vec<Pat
     let window_start_system = SystemTime::now()
         .checked_sub(window_start.elapsed())
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    self_repair_log(&format!(
-        "扫描 {}（window_start={:?} epoch_secs）",
-        npx_root.display(),
-        window_start_system
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    ));
     for entry in entries.flatten() {
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
         }
-        let mtime = latest_mtime(&dir, 1);
-        let touched = mtime.is_some_and(|mtime| mtime >= window_start_system);
-        let mtime_secs = mtime
-            .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
+        let touched = latest_mtime(&dir, 1).is_some_and(|mtime| mtime >= window_start_system);
         if !touched {
-            self_repair_log(&format!(
-                "  跳过 {}：mtime={mtime_secs:?} 早于窗口",
-                dir.display()
-            ));
             continue;
         }
-        let has_manifest = dir.join("package.json").exists();
-        let has_payload = dir
-            .join("node_modules")
-            .join("@deepseek-ai")
-            .join("dsh")
-            .is_dir();
-        let incomplete = !has_manifest || !has_payload;
-        self_repair_log(&format!(
-            "  候选 {}：mtime={mtime_secs:?} 在窗口内, manifest={has_manifest} payload={has_payload} -> 嫌疑={incomplete}",
-            dir.display()
-        ));
+        let incomplete = !dir.join("package.json").exists()
+            || !dir
+                .join("node_modules")
+                .join("@deepseek-ai")
+                .join("dsh")
+                .is_dir();
         if incomplete {
             suspects.push(dir);
         }
     }
-    self_repair_log(&format!("扫描结束，嫌疑条目数={}", suspects.len()));
     suspects
 }
 
@@ -1998,13 +1933,13 @@ fn purge_suspect_npx_cache_entries(cache_dir: &Path, window_start: Instant) -> b
         match purge_incomplete_npx_entry(&dir) {
             Ok(()) => {
                 purged = true;
-                self_repair_log(&format!(
+                eprintln!(
                     "dsh 启动超时，检测到疑似中断的 npx 缓存（{}），已自动清理。",
                     dir.display()
-                ));
+                );
             }
             Err(error) => {
-                self_repair_log(&format!("dsh 启动超时，自动清理 npx 缓存被拒绝：{error}"));
+                eprintln!("dsh 启动超时，自动清理 npx 缓存被拒绝：{error}");
             }
         }
     }
@@ -2046,48 +1981,6 @@ fn purge_incomplete_npx_entry(dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("清理不完整的 npx 缓存条目（{}）失败：{error}", dir.display()))
 }
 
-// ---------------------------------------------------------------------------
-// Temporary self-repair diagnostics (added to trace why the repair retry does
-// not fire in the field; remove once the root cause is confirmed)
-// ---------------------------------------------------------------------------
-
-/// Append one line to `terminal_logs/dsh-self-repair.log`, mirroring to stderr.
-/// Never fails the caller: a diagnostic that cannot be written is useless but
-/// must not take the repair down with it.
-fn self_repair_log(message: &str) {
-    let stamp = diagnostic_timestamp();
-    let line = format!("[{stamp}] {message}");
-    eprintln!("{line}");
-    if let Ok(dir) = app_data_dir().map(|d| d.join("terminal_logs")) {
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let path = dir.join("dsh-self-repair.log");
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
-            {
-                use std::io::Write;
-                let _ = writeln!(file, "{line}");
-            }
-        }
-    }
-}
-
-/// `HH:MM:SS.mmm` wall clock (local, UTC+8 for this audience) — precise enough
-/// to order the events of one start attempt without pulling in a date crate.
-fn diagnostic_timestamp() -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let local = now.as_secs() + 8 * 3600;
-    let secs_of_day = local % 86_400;
-    format!(
-        "{:02}:{:02}:{:02}.{:03}",
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60,
-        now.subsec_millis()
-    )
-}
-
-
 /// One spawn attempt plus a single self-heal retry for the corrupt-npx-cache
 /// failure. Clearing the broken entry and starting over is exactly what a user
 /// would do by hand; the retry gets exactly one chance so a persistent failure
@@ -2104,26 +1997,22 @@ fn spawn_with_cache_repair(
         Ok(outcome) => return Ok(outcome),
         Err(failure) => failure,
     };
-    self_repair_log(&format!(
-        "首次尝试失败: issue={} message={:?} detail_len={}",
-        first.0,
-        first.1,
-        first.2.as_deref().map(str::len).unwrap_or(0)
-    ));
 
     // Fast path, keyed off npm's own report: the entry is corrupt and npm said
     // exactly which one. Works for the early-exit failure shape.
     if let Some(cache_dir) = first.2.as_deref().and_then(corrupt_npx_cache_dir) {
-        self_repair_log(&format!("快速路径命中 ENOENT 条目: {}", cache_dir.display()));
         if let Err(error) = purge_corrupt_npx_cache(&cache_dir) {
-            self_repair_log(&format!("快速路径清理被拒绝: {error}"));
+            eprintln!("dsh 启动失败，且无法自动修复 npx 缓存：{error}");
             return Err((
                 first.0,
                 format!("{}（检测到 npx 缓存损坏，自动清理失败：{error}）", first.1),
                 first.2,
             ));
         }
-        self_repair_log(&format!("快速路径已清理，按首次下载重试: {}", cache_dir.display()));
+        eprintln!(
+            "检测到损坏的 npx 缓存（{}），已自动清理并重新尝试启动 dsh。",
+            cache_dir.display()
+        );
         // The entry was just deleted, so the retry downloads from scratch: it
         // must not inherit the cache-hit window that fired this timeout.
         return spawn_and_wait(app, npx, overlay, port, version, true).map_err(
@@ -2136,7 +2025,6 @@ fn spawn_with_cache_repair(
             },
         );
     }
-    self_repair_log("快速路径未命中（detail 中无 ENOENT package.json）");
 
     // Slow path: a readiness *timeout* produces no npm error to parse — the
     // cache-hit start just never became ready because its `_npx` entry came
@@ -2145,37 +2033,23 @@ fn spawn_with_cache_repair(
     // dsh payload. Only a timeout earns this scan; an early exit already had
     // its chance through the stderr above.
     if spawn_failure_issue(&first) == SpawnIssue::ReadyTimeout {
-        self_repair_log("进入慢速路径（ready_timeout）");
-        match npm_cache_dir() {
-            Some(cache_dir) => {
-                self_repair_log(&format!("npm_cache_dir 解析为: {}", cache_dir.display()));
-                let purged = purge_suspect_npx_cache_entries(&cache_dir, attempt_started_at);
-                self_repair_log(&format!("purge_suspect_npx_cache_entries 返回 purged={purged}"));
-                if purged {
-                    self_repair_log("慢速路径已清理，按首次下载重试");
-                    // Same reasoning as the fast path: the retry is a fresh
-                    // download, so give it the download window, not the
-                    // cache-hit window that just fired.
-                    return spawn_and_wait(app, npx, overlay, port, version, true).map_err(
-                        |(issue, message, detail)| {
-                            (
-                                issue,
-                                format!("{message}（已自动清理疑似中断的 npx 缓存并重试一次。）"),
-                                detail,
-                            )
-                        },
-                    );
-                }
+        if let Some(cache_dir) = npm_cache_dir() {
+            if purge_suspect_npx_cache_entries(&cache_dir, attempt_started_at) {
+                // Same reasoning as the fast path: the retry is a fresh
+                // download, so give it the download window, not the cache-hit
+                // window that just fired.
+                return spawn_and_wait(app, npx, overlay, port, version, true).map_err(
+                    |(issue, message, detail)| {
+                        (
+                            issue,
+                            format!("{message}（已自动清理疑似中断的 npx 缓存并重试一次。）"),
+                            detail,
+                        )
+                    },
+                );
             }
-            None => self_repair_log("npm_cache_dir() 返回 None，慢速路径无法扫描"),
         }
-    } else {
-        self_repair_log(&format!(
-            "非 ready_timeout（issue={}），不走慢速路径",
-            first.0
-        ));
     }
-    self_repair_log("自愈未触发任何重试，原样返回首次失败");
     Err(first)
 }
 
