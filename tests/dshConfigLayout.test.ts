@@ -698,9 +698,16 @@ test('reasoning effort is edited per model, with a wire value per level', () => 
   assert.match(modelCard[1], /store\.toggleReasoningLevel\(model, level\)/)
 
   // 每一档都能单独填「真正发给网关的值」——两者可以不同（max → ultra）。
+  // 但这组输入框默认**折叠**（2026-09-18 任务 202609182134580000：勾选档位后
+  // 铺开一整组输入框纯属复读，wire 默认就是档位名本身），由「自定义发送值」
+  // 折叠入口展开；已有非同名映射（wire ≠ 档位名）的模型默认展开，避免幽灵字段。
   assert.match(editor, /v-for="item in model\.reasoningEfforts"/)
   assert.match(editor, /store\.setReasoningWire\(item,/)
   assert.match(editor, /留空 = 不发送参数/)
+  assert.match(editor, /wires-toggle/)
+  assert.match(editor, /自定义发送值/)
+  assert.match(editor, /v-if="isWireExpanded\(model\)"/)
+  assert.match(editor, /hasCustomWire/)
 
   // 档位集合来自共享常量，不在组件里另抄一份。
   assert.match(editor, /import \{[^}]*DSH_THINKING_LEVELS[^}]*\} from '@\/types\/config'/)

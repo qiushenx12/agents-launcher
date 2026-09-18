@@ -217,8 +217,9 @@
             思考档位是**按模型**的能力，不是供应商级的：同一个供应商下的模型对
             档位的支持并不一致，放在供应商上必然会被其中一些模型拒绝。所以它跟
             着每个模型走。
-            左边勾选 dsh 提供哪几档，右边填这一档真正发给网关的值——两者可以不同，
-            例如把 max 映射成网关自己的 ultra。
+            勾选 dsh 提供哪几档即可——默认发给网关的值就是档位名本身。个别网关的
+            档位拼写不同时，展开「自定义发送值」再填（默认折叠，2026-09-18 任务
+            202609182134580000：铺开纯属复读）。
           -->
           <div class="model-reasoning">
             <div class="model-reasoning__levels">
@@ -237,17 +238,29 @@
             </div>
 
             <div v-if="hasLevelsToWire(model)" class="model-reasoning__wires">
-              <label v-for="item in model.reasoningEfforts" :key="item.level" class="wire-field">
-                <span>{{ item.level }}</span>
-                <input
-                  :value="item.wire ?? ''"
-                  class="input"
-                  type="text"
-                  :placeholder="item.level === 'off' ? '留空 = 不发送参数' : '发给网关的值'"
-                  spellcheck="false"
-                  @input="store.setReasoningWire(item, ($event.target as HTMLInputElement).value)"
-                >
-              </label>
+              <button
+                class="wires-toggle"
+                type="button"
+                :aria-expanded="isWireExpanded(model)"
+                @click="toggleWireExpanded(model)"
+              >
+                <span class="wires-toggle__chevron" :class="{ 'wires-toggle__chevron--open': isWireExpanded(model) }">▸</span>
+                自定义发送值
+                <span v-if="hasCustomWire(model)" class="wires-toggle__hint">（已自定义）</span>
+              </button>
+              <template v-if="isWireExpanded(model)">
+                <label v-for="item in model.reasoningEfforts" :key="item.level" class="wire-field">
+                  <span>{{ item.level }}</span>
+                  <input
+                    :value="item.wire ?? ''"
+                    class="input"
+                    type="text"
+                    :placeholder="item.level === 'off' ? '留空 = 不发送参数' : '发给网关的值'"
+                    spellcheck="false"
+                    @input="store.setReasoningWire(item, ($event.target as HTMLInputElement).value)"
+                  >
+                </label>
+              </template>
             </div>
 
             <p v-if="model.unmanagedFields.length" class="unmanaged-note unmanaged-note--model">
@@ -266,7 +279,7 @@
         :disabled="store.saving"
         @click="store.writeSelectedProvider()"
       >
-        {{ store.saving ? '处理中…' : provider.originalId ? '写入当前修改' : '写入 settings.yaml' }}
+        {{ store.saving ? '处理中…' : provider.originalId ? '保存' : '写入 settings.yaml' }}
       </button>
       <button
         class="btn btn-secondary danger-button"
@@ -286,7 +299,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { confirm } from '@tauri-apps/plugin-dialog'
 import {
   DSH_API_PROTOCOLS,
@@ -445,9 +458,31 @@ function hasLevel(model: DshModelProfile, level: DshThinkingLevel): boolean {
   return model.reasoningEfforts.some((item) => item.level === level)
 }
 
-/** 有需要填 wire 值的档位时才渲染那一行（只勾了 off 就不必了）。 */
+/**
+ * 「自定义发送值」折叠区的展开状态，按模型各存一份（2026-09-18 任务
+ * 202609182134580000）：勾选档位后下方不再整组铺开输入框——默认 wire 就是
+ * 档位名本身，铺开纯属复读。只有网关的档位拼写与 dsh 不一致时才需要展开填。
+ * 已有非同名映射的模型默认展开（否则会成幽灵字段）。
+ */
+const wireExpanded = reactive<Record<string, boolean>>({})
+
+/** 有需要填 wire 值的档位时才渲染折叠入口（只勾了 off 就不必了）。 */
 function hasLevelsToWire(model: DshModelProfile): boolean {
   return model.reasoningEfforts.some((item) => item.level !== 'off')
+}
+
+/** 该模型有没有「wire ≠ 档位名」的自定义映射。 */
+function hasCustomWire(model: DshModelProfile): boolean {
+  return model.reasoningEfforts.some((item) => item.wire !== null && item.wire !== item.level)
+}
+
+/** 折叠区是否展开：用户没点过时，有自定义映射的默认展开。 */
+function isWireExpanded(model: DshModelProfile): boolean {
+  return wireExpanded[model.id] ?? hasCustomWire(model)
+}
+
+function toggleWireExpanded(model: DshModelProfile) {
+  wireExpanded[model.id] = !isWireExpanded(model)
 }
 </script>
 
@@ -678,6 +713,36 @@ function hasLevelsToWire(model: DshModelProfile): boolean {
   flex-wrap: wrap;
   gap: 6px 12px;
   margin-top: 7px;
+}
+
+.wires-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: var(--font-size-small);
+}
+
+.wires-toggle:hover {
+  color: var(--text-primary);
+}
+
+.wires-toggle__chevron {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  font-size: 10px;
+}
+
+.wires-toggle__chevron--open {
+  transform: rotate(90deg);
+}
+
+.wires-toggle__hint {
+  color: var(--accent, #4c8dff);
 }
 
 .wire-field {
