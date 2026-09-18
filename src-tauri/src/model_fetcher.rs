@@ -181,6 +181,16 @@ pub async fn fetch_claude_models(
     fetch_provider_models(&base_url, &auth_token).await
 }
 
+/// dsh 配置页「获取模型」：与 Claude 同一条多协议探测链路（OpenAI / Anthropic /
+/// Gemini 候选端点），命令名按 CLI 分开只是让前端各页走各的入口。
+#[tauri::command]
+pub async fn fetch_dsh_models(
+    base_url: String,
+    auth_token: String,
+) -> Result<Vec<String>, String> {
+    fetch_provider_models(&base_url, &auth_token).await
+}
+
 pub(crate) async fn fetch_provider_models(
     base_url: &str,
     auth_token: &str,

@@ -54,13 +54,28 @@
 
     <div class="field-row">
       <label class="field-label">API 地址</label>
-      <input
-        v-model="provider.baseUrl"
-        class="input"
-        type="text"
-        placeholder="https://your-gateway.example/v1"
-        spellcheck="false"
-      >
+      <div class="field-inline">
+        <input
+          v-model="provider.baseUrl"
+          class="input"
+          type="text"
+          placeholder="https://your-gateway.example/v1"
+          spellcheck="false"
+        >
+        <!--
+          「获取模型」与 Claude Code 配置页同一个形状：按当前 API 地址（和「认证
+          令牌」栏的值）去网关拉模型清单，拉到的结果填进下方「添加模型」右侧的
+          下拉。清单只进内存，不写进 settings.yaml。
+        -->
+        <button
+          class="btn btn-secondary"
+          type="button"
+          :disabled="store.modelsFetchingId !== null"
+          @click="store.fetchModels(provider)"
+        >
+          {{ store.modelsFetchingId === provider.id ? '获取中…' : '获取模型' }}
+        </button>
+      </div>
     </div>
 
     <!--
@@ -68,30 +83,31 @@
       里只有引用名 `apiKeyEnv`。引用名不设输入框：文件里已有就沿用，没有就按 dsh
       的派生规则（路由键大写、连续非字母数字折叠成 `_`、后缀 `_API_KEY`，即
       `deriveKeyRef`）生成并自动补写一行——dsh 自己的模型页录入密钥时也是这么做的
-      （`schema.setPath(draft, ["apiKeyEnv"], keyRef)`）。保存空值 = 移除令牌。
+      （`schema.setPath(draft, ["apiKeyEnv"], keyRef)`）。
       dsh 每次请求按引用名现读现用，保存即生效，不需要重启。启动 dsh 的环境里若有
       同名变量，dsh 会优先用那个只读的值——界面里存的值要等那层清掉才会被看到。
+
+      保存路径（2026-09-18 起）：普通的令牌修改随「写入当前修改」一起保存，不再
+      有独立的保存按钮。这一行只在两种必须显式动作的情形出现：
+      - **清空已存令牌 = 移除**（破坏性动作，要确认对话框，不随写入自动执行）；
+      - **凭据读取失败**（值未知，写入按钮不会碰令牌，这里给出错误与重试入口）。
     -->
     <SecretField
       v-model="credentialDraft"
       label="认证令牌"
       placeholder="网关的 API Key，例如 sk-…"
     />
-    <div class="token-action-row">
+    <div v-if="showTokenActionRow" class="token-action-row">
       <button
-        class="btn btn-secondary"
+        v-if="isRemovingStoredToken"
+        class="btn btn-secondary danger-button"
         type="button"
-        :disabled="
-          !store.isCredentialDirty(provider)
-            || store.credentialSaving
-            || provider.originalId === null
-            || !!store.credentialErrorOf(provider)
-        "
-        @click="store.saveCredential(provider)"
+        :disabled="store.credentialSaving || provider.originalId === null"
+        @click="removeToken"
       >
-        {{ isRemovingStoredToken ? '移除令牌' : '保存令牌' }}
+        移除令牌
       </button>
-      <span v-if="provider.originalId === null">请先写入供应商，再保存令牌。</span>
+      <span v-if="provider.originalId === null">令牌随「写入 settings.yaml」一起保存。</span>
       <span v-else-if="store.credentialErrorOf(provider)">{{ store.credentialErrorOf(provider) }}</span>
     </div>
     <div class="field-row">
@@ -134,6 +150,20 @@
         <datalist id="dsh-known-models">
           <option v-for="id in store.knownModelIds" :key="id" :value="id" />
         </datalist>
+        <!--
+          获取到的网关模型清单，形状与 Claude Code 的 ModelField 一致（输入框 +
+          右侧下拉）。选中一项只是**填进输入框**，仍由「添加模型」确认后才进清单
+          ——下拉里一点就加，误触的代价（写文件前还得删回来）比多点一次按钮高。
+        -->
+        <select
+          class="select model-add-select"
+          :value="modelDraft"
+          :disabled="fetchedModels.length === 0"
+          @change="onFetchedModelPick"
+        >
+          <option value="" disabled>{{ fetchedModels.length ? '选择模型' : '未获取' }}</option>
+          <option v-for="id in fetchedModels" :key="id" :value="id">{{ id }}</option>
+        </select>
         <button class="btn btn-secondary" type="button" @click="addModel">添加模型</button>
       </div>
 
@@ -321,12 +351,44 @@ const credentialDraft = computed({
   },
 })
 
-/** 已存过令牌、现在把输入框清空 = 下一次保存是移除。按钮文案跟着这个状态走。 */
+/** 已存过令牌、现在把输入框清空 = 移除。这个动作不随「写入当前修改」自动执行。 */
 const isRemovingStoredToken = computed(() =>
   provider.value !== null
     && store.credentialStoredOf(provider.value) !== ''
     && store.credentialDraftOf(provider.value).trim() === '',
 )
+
+/**
+ * 令牌按钮行的可见性：普通修改随「写入当前修改」一起保存，不需要按钮；
+ * 只有「清空 = 移除」与「读取失败」两种情形需要显式动作或说明。
+ */
+const showTokenActionRow = computed(() =>
+  provider.value !== null
+    && (isRemovingStoredToken.value || !!store.credentialErrorOf(provider.value)),
+)
+
+/** 移除已存的令牌：破坏性动作，显式确认后才写凭据文件。 */
+async function removeToken() {
+  const target = store.selectedProvider
+  if (!target) return
+  const accepted = await confirm(
+    `将移除供应商「${target.id}」的认证令牌。\n\ndsh 之后对这个网关的请求将不再携带凭据。\n\n是否继续？`,
+    { title: '移除认证令牌', kind: 'warning' },
+  )
+  if (!accepted) return
+  await store.saveCredential(target)
+}
+
+/** 当前供应商「获取模型」拉到的清单；还没拉过时下拉禁用并显示「未获取」。 */
+const fetchedModels = computed(() =>
+  provider.value ? store.availableModelsOf(provider.value) : [],
+)
+
+/** 下拉选中只是填进输入框，添加与否仍由「添加模型」按钮（或回车）决定。 */
+function onFetchedModelPick(event: Event) {
+  const value = (event.target as HTMLSelectElement).value
+  if (value) modelDraft.value = value
+}
 
 function addModel() {
   const target = store.selectedProvider
@@ -504,6 +566,11 @@ function hasLevelsToWire(model: DshModelProfile): boolean {
 .model-add-row .input {
   min-width: 0;
   flex: 1;
+}
+
+.model-add-select {
+  width: 200px;
+  flex: 0 0 auto;
 }
 
 .model-empty,

@@ -297,6 +297,7 @@ pub fn run() {
             dsh_settings::dsh_delete_provider,
             dsh_settings::dsh_read_credential,
             dsh_settings::dsh_save_credential,
+            dsh_settings::dsh_rename_credential_ref,
             // DeepSeek Harness embedded browser surface (child WebView)
             dsh_embed::dsh_embed_show,
             dsh_embed::dsh_embed_hide,
@@ -313,6 +314,7 @@ pub fn run() {
             project_manager::save_text_file,
             // model_fetcher commands
             model_fetcher::fetch_claude_models,
+            model_fetcher::fetch_dsh_models,
             // session_manager commands
             session_manager::load_claude_sessions,
             session_manager::load_claude_recent_projects,

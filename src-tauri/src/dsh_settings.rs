@@ -1814,6 +1814,100 @@ pub fn dsh_save_credential(
     })
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshCredentialRenameRequest {
+    /// 凭据文件里现有的引用名。
+    pub old_ref: String,
+    /// 要换成的引用名。
+    pub new_ref: String,
+}
+
+/// 把凭据文件文本里一个引用名的键换成新名字，**值原样保留**。返回 (新文本, 是否
+/// 发生了换名)：旧名下没有值、或文件没有 refs 分节时返回原文本与 false——这两种
+/// 都意味着「没有可换的东西」，不算错误。
+///
+/// 与 `apply_credential_ref` 同一套纪律：按行最小手术、写完检查顶层分区一个不少。
+fn rename_credential_ref_in_text(
+    text: &str,
+    old_ref: &str,
+    new_ref: &str,
+) -> Result<(String, bool), String> {
+    let mut lines = text_lines(text);
+    let before_keys = top_level_keys(&lines);
+    let Some(block) = find_block(&lines, 0, lines.len(), 0, CREDENTIALS_REFS_KEY)? else {
+        return Ok((text.to_string(), false));
+    };
+    let items = field_items(&lines, block.content_start, block.end, block.child_indent)?;
+    if items.iter().any(|item| item.key == new_ref) {
+        return Err(format!(
+            "凭据文件的 refs 里已经有 `{new_ref}` 了；为避免覆盖它的值，本次换名已取消。\
+             请先手工处理凭据文件。"
+        ));
+    }
+    let Some(item) = items.iter().find(|item| item.key == old_ref) else {
+        return Ok((text.to_string(), false));
+    };
+    let pad = " ".repeat(block.child_indent);
+    let value = item.value.as_text().unwrap_or_default();
+    let end = item.content_end(&lines);
+    lines.splice(
+        item.start..end,
+        vec![format!("{pad}{new_ref}: {}", render_scalar(&value))],
+    );
+
+    let after_keys = top_level_keys(&lines);
+    for key in &before_keys {
+        if !after_keys.contains(key) {
+            return Err(format!(
+                "换名结果丢失了凭据文件的顶层分区 `{key}`，已中止（文件未被修改）。"
+            ));
+        }
+    }
+    Ok((join_lines(&lines), true))
+}
+
+/// 把凭据文件里一个引用名换成新名字，**值原样保留**。
+///
+/// 供「供应商改了路由键」使用（2026-09-18，任务：改 id 令牌消失）：settings.yaml
+/// 侧的引用名是派生的（没写 apiKeyEnv 行）时，改名后 dsh 会按新键派生新引用名，
+/// 旧名下的值就悬空了。这里把旧名那行的键换成新名，令牌跟着供应商走。
+/// settings.yaml 完全不动——它的 apiKeyEnv 行（如果有）与 id 无关，删块重建时
+/// 整行保留。
+#[tauri::command]
+pub fn dsh_rename_credential_ref(
+    request: DshCredentialRenameRequest,
+) -> Result<(), String> {
+    if !is_credential_ref_name(&request.old_ref) || !is_credential_ref_name(&request.new_ref)
+    {
+        return Err(format!(
+            "凭据引用名 `{}` / `{}` 不是合法的 POSIX 变量名。",
+            request.old_ref, request.new_ref
+        ));
+    }
+    if request.old_ref == request.new_ref {
+        return Ok(());
+    }
+    let path = dsh_credentials_path()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // 凭据文件还不存在 = 旧名下没有值，没有可换的东西，不算错误。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "无法读取 dsh 凭据文件 {}：{error}",
+                path.display()
+            ))
+        }
+    };
+    let (updated, changed) =
+        rename_credential_ref_in_text(&text, &request.old_ref, &request.new_ref)?;
+    if changed {
+        write_private_text_atomic(&path, updated.as_bytes(), "dsh 凭据文件")?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -2330,6 +2424,32 @@ refs:
         // 连续的非字母数字折叠成一个下划线（上游 replace(/[^A-Z0-9]+/g, "_")）。
         assert_eq!(derive_credential_ref("my--gw"), "MY_GW_API_KEY");
         assert_eq!(derive_credential_ref("openai-codex"), "OPENAI_CODEX_API_KEY");
+    }
+
+    #[test]
+    fn renaming_a_credential_ref_keeps_the_value_and_the_rest() {
+        let text = "version: 1\n\nrefs:\n  VLLM_API_KEY: sk-secret\n  OTHER_KEY: keep-me\n\n\
+                    records:\n  a/b:\n    kind: grant\n";
+        let (updated, changed) =
+            rename_credential_ref_in_text(text, "VLLM_API_KEY", "VLLM2_API_KEY")
+                .expect("rename");
+        assert!(changed);
+        // 值原样跟着新名走，其它条目与 records 分节逐字节保留。
+        assert!(updated.contains("VLLM2_API_KEY: sk-secret"));
+        assert!(!updated.contains("VLLM_API_KEY: sk-secret"));
+        assert!(updated.contains("OTHER_KEY: keep-me"));
+        assert!(updated.contains("records:\n  a/b:\n    kind: grant"));
+
+        // 旧名下没有值 = 无事发生，不算错误。
+        let (same, changed) =
+            rename_credential_ref_in_text(text, "NOPE_API_KEY", "X_API_KEY").expect("rename");
+        assert!(!changed);
+        assert_eq!(same, text);
+
+        // 新名已被占用时拒绝，免得覆盖别人的值。
+        assert!(
+            rename_credential_ref_in_text(text, "VLLM_API_KEY", "OTHER_KEY").is_err()
+        );
     }
 
     #[test]

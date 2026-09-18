@@ -31,7 +31,7 @@
                 data-drag-item
                 class="provider-list__item"
                 :class="{
-                  'provider-list__item--selected': pane === 'provider' && store.selectedId === item.id,
+                  'provider-list__item--selected': pane === 'provider' && store.selectedProvider === item,
                   'provider-list__item--dragging': draggingIndex === index,
                   'provider-list__item--drag-over': draggingIndex !== null
                     && draggingIndex !== index
@@ -91,8 +91,9 @@
 
     <main class="config-content">
       <!--
-        状态条放在两个面板**之外**：读取/写入失败必须始终可见。放进供应商面板里
-        的话，用户停在「启动设置」页时一次读盘失败会毫无提示。
+        状态条只留 warning / error（读取失败、写入失败、校验拦截……）：它们要用户
+        处理，必须常驻可见。成功/信息类的操作反馈走底部飘字（3 秒消失），不进横幅。
+        横幅放在两个面板**之外**：用户停在「启动设置」页时一次读盘失败也看得见。
       -->
       <ConfigStatusBanner
         v-if="store.status"
@@ -139,11 +140,22 @@
         </section>
       </template>
     </main>
+
+    <Transition name="dsh-draft-toast">
+      <div
+        v-if="visibleToast"
+        class="dsh-config-panel__toast"
+        role="status"
+        aria-live="polite"
+      >
+        {{ visibleToast }}
+      </div>
+    </Transition>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useDshModelsStore, type DshProviderDraft } from '@/stores/dshModels'
 import { useDshConfigStore } from '@/stores/dshConfig'
@@ -200,6 +212,28 @@ const emit = defineEmits<{
 type DshPane = 'startup' | 'provider'
 const pane = ref<DshPane>('startup')
 
+/**
+ * 飘字通道（2026-09-18 任务 202609181728080000）：成功/信息类的操作反馈
+ * （写入供应商、删除、令牌保存、获取模型、新增草稿……）都在这里，3 秒消失。
+ * 文案由 store 统一产生（setStatus 分流：success/info → toast，warning/error →
+ * 顶部横幅常驻）；面板 watch `toastSeq` 重置计时器，连发两条也各自计满 3 秒。
+ */
+const visibleToast = ref('')
+let toastTimer: number | null = null
+
+watch(
+  () => store.toastSeq,
+  () => {
+    if (!store.toast) return
+    visibleToast.value = store.toast
+    if (toastTimer !== null) window.clearTimeout(toastTimer)
+    toastTimer = window.setTimeout(() => {
+      visibleToast.value = ''
+      toastTimer = null
+    }, 3000)
+  },
+)
+
 const supportedVersionLabel = computed(() => store.supportedVersion || '0.1.5-rc.1')
 
 const { draggingIndex, overIndex, justDragged, onPointerDown } = useDragReorder(
@@ -222,13 +256,14 @@ const isDirty = (item: DshProviderDraft) => store.isProviderDirty(item)
 function onProviderClick(item: DshProviderDraft, index: number) {
   if (justDragged.value) return
   void index
-  store.selectProvider(item.id)
+  store.selectProvider(item)
   pane.value = 'provider'
 }
 
 function createProvider() {
-  store.addProvider()
+  const draft = store.addProvider()
   pane.value = 'provider'
+  store.setStatus('info', `已新增供应商草稿「${draft.id}」；填好字段后写入设置文件。`)
 }
 
 function selectStartup() {
@@ -262,6 +297,10 @@ onMounted(async () => {
     finish()
   }
 })
+
+onBeforeUnmount(() => {
+  if (toastTimer !== null) window.clearTimeout(toastTimer)
+})
 </script>
 
 <style scoped>
@@ -269,7 +308,37 @@ onMounted(async () => {
   height: 100%;
   min-height: 0;
   display: flex;
+  position: relative;
   background: transparent;
+}
+
+.dsh-config-panel__toast {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  z-index: 30;
+  max-width: min(520px, calc(100% - 48px));
+  padding: 8px 12px;
+  transform: translateX(-50%);
+  border-radius: var(--radius-sm);
+  color: #fff;
+  background: rgba(29, 29, 31, 0.92);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  font-size: var(--font-size-small);
+  line-height: 1.5;
+  text-align: center;
+  pointer-events: none;
+}
+
+.dsh-draft-toast-enter-active,
+.dsh-draft-toast-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.dsh-draft-toast-enter-from,
+.dsh-draft-toast-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(6px);
 }
 
 .dsh-config-panel__sidebar-shell {

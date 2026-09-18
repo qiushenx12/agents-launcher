@@ -224,6 +224,41 @@ test('the dsh sidebar lists providers and the editor edits one of them', () => {
 })
 
 /**
+ * 操作反馈是 3 秒飘字；要用户处理的消息才常驻横幅（任务 202609181728080000 及其
+ * 验收意见）。验收时的现象：「已写入供应商 … 已备份为 …」仍常驻顶部——当时只把
+ * 「新增草稿」一条挪进了外壳的局部 toast，其余 setStatus 全走 banner。定稿后的
+ * 分流在 store 的 setStatus 里：success / info → 飘字（3 秒消失），
+ * warning / error → 顶部横幅常驻。两个例外：
+ * - 「尚未创建 dsh 设置文件」是**空状态指引**，常驻（直接写 status，不过分流）；
+ * - 凭据读取失败显示在令牌按钮行（字段级），本来就不走状态条。
+ */
+test('operation feedback is a three-second toast while errors stay in the banner', () => {
+  const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
+  // 分流在 setStatus 里：success/info 进 toast 通道并清掉横幅，warning/error 留横幅。
+  assert.match(store, /const toast = ref<string \| null>\(null\)/)
+  assert.match(store, /const toastSeq = ref\(0\)/)
+  const setStatus = /function setStatus\(tone: DshModelsStatus\['tone'\], message: string\) \{([\s\S]*?)\n  \}/.exec(store)
+  assert.ok(setStatus, 'missing setStatus')
+  assert.match(setStatus[1], /tone === 'success' \|\| tone === 'info'/)
+  assert.match(setStatus[1], /status\.value = null/)
+  assert.match(setStatus[1], /showToast\(message\)/)
+  assert.match(setStatus[1], /status\.value = \{ tone, message \}/)
+  // 空文件指引常驻：直接写 status，不过分流。
+  assert.match(store, /status\.value = \{[\s\S]*?尚未创建 dsh 设置文件/)
+
+  const shell = readFileSync(resolve(repoRoot, SHELL), 'utf8')
+  assert.match(shell, /class="dsh-config-panel__toast"/)
+  // 面板 watch toastSeq 重置计时器：连发两条各自计满 3 秒。
+  assert.match(shell, /watch\([\s\S]*?store\.toastSeq/)
+  assert.match(shell, /window\.clearTimeout\(toastTimer\)/)
+  assert.match(shell, /window\.setTimeout\([\s\S]*?3000\)/)
+  // 新增草稿的反馈同样走飘字通道。
+  assert.match(shell, /setStatus\('info', `已新增供应商草稿「\$\{draft\.id\}」；填好字段后写入设置文件。`\)/)
+  // 横幅仍在，只显示 store.status（即 warning/error 与常驻空态）。
+  assert.match(shell, /<ConfigStatusBanner[\s\S]*?v-if="store\.status"/)
+})
+
+/**
  * 左侧清单只列**自定义**路由——与 dsh 自己设置页上那枚「自定义」标签同一个判据：
  * pi-ai 内置目录在该路由键下不提供任何内容（上游 `entry.declared === true`）。
  * 反过来，`kimi-coding` 这种「自带目录 + 一把密钥」的条目在这里没有可编辑的内容，
@@ -242,9 +277,10 @@ test('the dsh sidebar lists only custom routes', () => {
   assert.match(store, /const visibleProviders = computed\(\(\) => drafts\.filter\(\(draft\) => draft\.custom\)\)/)
   // 新草稿按自定义处理：它是用户自己声明的，没有目录可依赖。
   assert.match(store, /自定义路由：用户自己声明的，没有目录可依赖[\s\S]*?custom: true/)
-  // 选中项不能停在看不见的那一条上。
+  // 选中项不能停在看不见的那一条上；且选中按对象身份跟踪，不按可变的路由键字符串
+  // （2026-09-18 任务 202609181729240000：改 ID 撞名时 selectedId 找不到草稿）。
   assert.match(store, /function syncSelection/)
-  assert.match(store, /selectedId\.value = visibleProviders\.value\[0\]\?\.id \?\? null/)
+  assert.match(store, /selectedDraft\.value = visibleProviders\.value\[0\] \?\? null/)
   // 拖拽要按位置原地替换，不能只把可见项拼回列表（那会把目录路由挤掉）。
   assert.match(store, /function reorderVisible/)
   assert.match(store, /draft\.custom \? index : -1/)
@@ -265,6 +301,42 @@ test('the dsh sidebar lists only custom routes', () => {
   assert.match(rust, /@earendil-works/)
   assert.match(rust, /\.manifest\.json/)
   assert.match(rust, /routes\.contains\(id\)[\s\S]*?None => true/)
+})
+
+/**
+ * 回归（任务 202609181729240000）：修改供应商 ID 时「当前选择」不得丢失。
+ *
+ * 供应商的 id 就是 settings.yaml 里的路由键，用户随时能改，也可能与另一条
+ * 已存在的供应商撞车。曾经用字符串 `selectedId` 记选中，撞名时 `syncSelection`
+ * 会在列表里找到**另一条**同 id 的供应商、误以为选中还在，编辑器瞬间切走。
+ *
+ * 修法：用对象身份（`selectedDraft`）而不是 id 字符串来跟踪选中。id 会变、
+ * 会撞车，对象不会。`syncSelection` 按 `visibleProviders.includes(draft)` 判断，
+ * 找不到时才兜底到第一条。
+ */
+test('selection tracks the draft object, not its mutable route id', () => {
+  const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
+
+  // 选中状态是对象引用，不是字符串 id。
+  assert.match(store, /const selectedDraft = ref<DshProviderDraft \| null>\(null\)/)
+  assert.match(store, /const selectedProvider = computed\(\(\) => selectedDraft\.value\)/)
+
+  // syncSelection 按对象身份判断，不查 id 字符串。
+  assert.match(store, /visibleProviders\.value\.includes\(current\)/)
+  assert.match(store, /selectedDraft\.value = visibleProviders\.value\[0\] \?\? null/)
+
+  // 旧的字符串 id 写法不得再出现。
+  assert.doesNotMatch(store, /const selectedId = ref/)
+  assert.doesNotMatch(store, /drafts\.find\(\(item\) => item\.id === selectedId\.value\)/)
+
+  // 外壳与编辑器都按对象身份取选中项。
+  const shell = readFileSync(resolve(repoRoot, SHELL), 'utf8')
+  assert.match(shell, /store\.selectedProvider === item/)
+  assert.match(shell, /store\.selectProvider\(item\)/)
+  assert.doesNotMatch(shell, /store\.selectedId/)
+
+  const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
+  assert.match(editor, /const provider = computed\(\(\) => store\.selectedProvider\)/)
 })
 
 /**
@@ -394,27 +466,39 @@ test('fields with no user decision stay out of the UI but round-trip untouched',
 })
 
 /**
- * 认证令牌（2026-09-18 新增）：dsh 配置页里要有 Claude Code 同款的令牌管理——
- * 显示/隐藏/修改/保存。值的落点是 dsh 自己的凭据文件（`.credentials.yaml` 的
- * `refs` 分节），settings.yaml 里只补引用名 `apiKeyEnv`（沿用已有的，没有才按
- * `deriveDshCredentialRef` 派生）。这条把整条链路的两端都钉住：编辑器的字段与
- * 保存行、store 的读写命令、后端的命令与注册。
+ * 认证令牌（2026-09-18 新增；同日改为随「写入当前修改」一起保存）：
+ * dsh 配置页里要有 Claude Code 同款的令牌管理——显示/隐藏/修改/保存。值的落点是
+ * dsh 自己的凭据文件（`.credentials.yaml` 的 `refs` 分节），settings.yaml 里只补
+ * 引用名 `apiKeyEnv`（沿用已有的，没有才按 `deriveDshCredentialRef` 派生）。
+ *
+ * 保存路径：普通修改随供应商写入自动跟随保存（`writeSelectedProvider` 里
+ * `saveCredential(saved, true)`），不再有常驻的「保存令牌」按钮。独立按钮只留给
+ * 两种必须显式动作的情形：清空 = 移除（带确认对话框）与凭据读取失败。
+ * 这条把整条链路的两端都钉住：编辑器的字段与条件按钮行、store 的读写命令与
+ * 跟随保存、后端的命令与注册。
  */
 test('the dsh editor manages the auth token end to end', () => {
   const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
   // Claude Code 同款组件与语义：SecretField 自带显示/隐藏切换。
   assert.match(editor, /import SecretField from '@\/components\/config\/SecretField\.vue'/)
   assert.match(editor, /label="认证令牌"/)
-  // 保存走独立的按钮行（令牌不在 settings.yaml 里，不随供应商写入提交）；
-  // 清空已存令牌后按钮明确变成「移除」。
-  assert.match(editor, /保存令牌/)
+  // 独立按钮行只在「清空 = 移除」或读取失败时出现：移除是破坏性动作，
+  // 必须显式确认，不随「写入当前修改」自动执行。
+  assert.match(editor, /v-if="showTokenActionRow"/)
   assert.match(editor, /移除令牌/)
-  assert.match(editor, /请先写入供应商，再保存令牌。/)
+  assert.match(editor, /将移除供应商/)
+  assert.match(editor, /kind: 'warning'/)
 
   const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
   assert.match(store, /dsh_read_credential/)
   assert.match(store, /dsh_save_credential/)
   assert.match(store, /deriveDshCredentialRef/)
+  // 跟随保存：供应商写入成功后自动保存脏的令牌草稿（quiet 模式，状态条由
+  // 写入方组合）；空草稿（移除）与读取失败不自动保存。
+  assert.match(store, /await refreshCredentials\(\)/)
+  assert.match(store, /saveCredential\(saved, true\)/)
+  assert.match(store, /credentialDraftOf\(saved\)\.trim\(\) !== ''/)
+  assert.match(store, /!credentialErrorOf\(saved\)/)
 
   const rust = readFileSync(resolve(repoRoot, 'src-tauri/src/dsh_settings.rs'), 'utf8')
   assert.match(rust, /pub fn dsh_read_credential/)
@@ -426,6 +510,177 @@ test('the dsh editor manages the auth token end to end', () => {
   const lib = readFileSync(resolve(repoRoot, 'src-tauri/src/lib.rs'), 'utf8')
   assert.match(lib, /dsh_settings::dsh_read_credential/)
   assert.match(lib, /dsh_settings::dsh_save_credential/)
+})
+
+/**
+ * 回归（任务 202609181731590000）：令牌在「写入当前修改」时丢失、界面显示为空。
+ *
+ * 链路：writeSelectedProvider 成功后 `load(true)` 静默重读 → `refreshCredentials`
+ * 从凭据文件刷值。而凭据文件要等「保存令牌」才动，所以那时读到的是旧值——若
+ * 无条件覆盖 `credentialDrafts`，用户已输入但尚未保存的令牌就被静默吞了（凭据
+ * 文件里本来没值时，界面直接显示为空）。修法：刷新只覆盖**干净的**草稿
+ * （覆盖的是同一个值，无害），脏草稿（改过还没保存）保留。
+ *
+ * 第二道回归（2026-09-18「重启后看不到令牌」）：脏判定**必须先于** `credentialStored`
+ * 的更新。拿刚读到的新值去比，初始为空的草稿会永远被误判为脏，于是重启后
+ * 凭据文件里明明有值，输入框却永远填不上。这里钉死「先判定、后更新」的顺序。
+ */
+test('refreshing credentials never clobbers an unsaved token draft', () => {
+  const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
+
+  const refresh = /async function refreshCredentials\(\) \{([\s\S]*?)\n  \}/.exec(store)
+  assert.ok(refresh, 'missing refreshCredentials in the dsh models store')
+  // 两个分支（读成功 / 读失败）都必须：先以旧 stored 判定脏，再更新 stored，
+  // 最后只对干净草稿写值。判定写进局部变量，顺序由断言的位置关系保证。
+  // 「没读过的草稿不判脏」（undefined !== '' 不算脏）——否则 adopt 重建后新对象
+  // 永远被误判为脏，文件里的值填不进输入框（2026-09-18「写入配置后令牌变空」）。
+  const branches = refresh[1].match(/const dirty = draftValue !== undefined && draftValue !== credentialStored\.get\(draft\)/g)
+  assert.equal(branches?.length, 2, 'both branches must snapshot dirtiness before touching credentialStored')
+  const guardedWrites = refresh[1].match(/if \(!dirty\) credentialDrafts\.set\(draft,/g)
+  assert.equal(guardedWrites?.length, 2, 'both branches must guard the draft write with the pre-update dirtiness')
+  // 先判定后更新：dirty 的快照必须出现在 credentialStored 赋值之前。
+  for (const match of refresh[1].matchAll(/const dirty = [\s\S]*?(?=credentialStored\.set\(draft,)/g)) {
+    assert.ok(match[0].length > 0)
+  }
+  assert.ok(
+    refresh[1].indexOf('const dirty') < refresh[1].indexOf('credentialStored.set(draft, stored)'),
+    'the dirtiness snapshot must precede the credentialStored update in the success branch',
+  )
+})
+
+/**
+ * 回归（2026-09-18，任务：保存配置后令牌输入框钉死在空）：WeakMap 不是响应式的。
+ *
+ * 实测链路：「写入当前修改」成功 → load(true) → adopt 重建草稿（响应式数组变化，
+ * computed 重算，此刻 WeakMap 里新对象没值 → 输入框显示空）→ refreshCredentials
+ * 随后把值写进裸 WeakMap——这一步不触发任何响应式更新，computed 永不重算，输入框
+ * 钉死在空。重启后因为首次求值晚于 refresh 落地而"恢复正常"。（实测日志：refresh
+ * 全部成功读到值，store 数据完好，纯粹是界面没跟上。）
+ *
+ * 修法：credentialVersion ref 作为响应式版本号——读访问器依赖它、每次写入后自增，
+ * 界面才能跟着 refresh 落地重算。这条把它钉死。
+ */
+test('credential state writes bump a reactive version so the UI re-evaluates', () => {
+  const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
+
+  // 版本号存在且被三个读访问器依赖。
+  assert.match(store, /credentialVersion = ref\(0\)/)
+  for (const accessor of ['credentialDraftOf', 'credentialStoredOf', 'credentialErrorOf']) {
+    const body = new RegExp(`function ${accessor}\\(draft: DshProviderDraft\\): string \\{([\\s\\S]*?)\\n  \\}`).exec(store)
+    assert.ok(body, `missing ${accessor}`)
+    assert.match(body[1], /void credentialVersion\.value/, `${accessor} must depend on the reactive version`)
+  }
+
+  // 每个写入口都必须自增版本号：setCredentialDraft、refreshCredentials（尾部）、
+  // adopt（继承桥尾部）、saveCredential（stored 落盘后）、fetchModels（availableModels）。
+  const bumps = store.match(/credentialVersion\.value\+\+/g)
+  assert.ok(bumps && bumps.length >= 5, `expected at least 5 version bumps, got ${bumps?.length ?? 0}`)
+})
+
+/**
+ * 回归（2026-09-18，任务：改供应商 ID 令牌消失）：改路由键不该碰界面上的令牌，
+ * 真正动凭据的时机是「写入当前修改」——且只是把凭据文件里旧引用名的键换成新名，
+ * 值原样保留。
+ *
+ * 根因：凭据状态曾按供应商 id 字符串索引，改名的瞬间新 id 下什么都没有，输入框
+ * 立刻变空白；刷新又按新 id 派生的引用名去读，旧名下的值永远找不回来。修法分
+ * 两层，这条把它们钉死：
+ *
+ * 1. 界面态跟草稿对象走（WeakMap），不跟 id 字符串走——改名过程界面完全无感；
+ * 2. 写入时若「id 变了 + 引用名是派生的（没写 apiKeyEnv）+ 旧名下有值」，先调
+ *    `dsh_rename_credential_ref` 换名再写 settings.yaml。手写 apiKeyEnv 的供应商
+ *    引用名与 id 无关，settings 重建块时整行保留，凭据文件完全不用动。
+ */
+test('renaming a provider id keeps the token on screen and renames the stored ref on write', () => {
+  const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
+
+  // 1. 凭据三件套与模型清单都按草稿对象索引（WeakMap），不再按 id 字符串。
+  assert.match(store, /credentialDrafts = new WeakMap<DshProviderDraft, string>\(\)/)
+  assert.match(store, /credentialStored = new WeakMap<DshProviderDraft, string>\(\)/)
+  assert.match(store, /credentialErrors = new WeakMap<DshProviderDraft, string>\(\)/)
+  assert.match(store, /availableModels = new WeakMap<DshProviderDraft, string\[\]>\(\)/)
+  assert.doesNotMatch(store, /credentialDrafts\[draft\.id\]/)
+
+  // 1b. adopt 重建 drafts（对象全换）时必须把旧对象上**未保存的**凭据状态按
+  // 路由键继承到新对象——否则「写入当前修改」后 load(true) 一重建，输入框立刻
+  // 空白（2026-09-18「修改配置后 api key 变空」的根因）。干净的草稿不继承，
+  // 由 refreshCredentials 从凭据文件刷成最新。
+  const adopt = /function adopt\(next: DshSettingsDocument\) \{([\s\S]*?)\n  \}/.exec(store)
+  assert.ok(adopt, 'missing adopt in the dsh models store')
+  assert.match(adopt[1], /carried = new Map/)
+  assert.match(adopt[1], /credentialDrafts\.get\(old\)/)
+  assert.match(adopt[1], /credentialErrors\.get\(old\)/)
+  assert.match(adopt[1], /credentialDrafts\.set\(draft, state\.draft\)/)
+  assert.match(adopt[1], /credentialErrors\.set\(draft, state\.error\)/)
+
+  // 2. 写入路径：id 改名且引用名派生时，先换凭据引用名再写 settings.yaml。
+  const write = /async function writeSelectedProvider\(\) \{([\s\S]*?)\n  \}/.exec(store)
+  assert.ok(write, 'missing writeSelectedProvider in the dsh models store')
+  assert.match(write[1], /draft\.originalId !== draft\.id/)
+  assert.match(write[1], /!draft\.apiKeyEnv\?\.trim\(\)/)
+  assert.match(write[1], /deriveDshCredentialRef\(draft\.originalId\)/)
+  assert.match(write[1], /dsh_rename_credential_ref/)
+  // 换名必须在写 settings.yaml 之前（settings 侧重建块引用名不变，先换名才不断链）。
+  assert.ok(
+    write[1].indexOf('dsh_rename_credential_ref') < write[1].indexOf('dsh_write_provider'),
+    'the credential ref rename must happen before the settings write',
+  )
+
+  // 3. 后端：换名命令按行级手术实现（值原样保留），并注册进命令表。
+  const rust = readFileSync(resolve(repoRoot, 'src-tauri/src/dsh_settings.rs'), 'utf8')
+  assert.match(rust, /pub fn dsh_rename_credential_ref/)
+  assert.match(rust, /fn rename_credential_ref_in_text/)
+  const lib = readFileSync(resolve(repoRoot, 'src-tauri/src/lib.rs'), 'utf8')
+  assert.match(lib, /dsh_settings::dsh_rename_credential_ref/)
+})
+
+/**
+ * 「获取模型」（2026-09-18，任务 202609181708380000）：API 地址右侧的按钮按当前
+ * 地址与令牌去网关拉模型清单，结果填进「添加模型」输入框右侧的下拉——与 Claude
+ * Code 配置页同一个形状（ModelField 的输入框 + 下拉）。选中一项只是把 ID 填进
+ * 输入框，仍由「添加模型」确认：下拉里一点就加，误触的代价比多点一次按钮高。
+ * 清单只进内存，不写进 settings.yaml；后端与 Claude 共用同一条多协议探测链路。
+ */
+test('the dsh editor fetches gateway models into a picker next to the add-model input', () => {
+  const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
+
+  // 按钮在 API 地址那一行、输入框右侧；同一时间只允许一个获取在跑。
+  const apiRow = /<label class="field-label">API 地址<\/label>([\s\S]*?)<\/button>/.exec(editor)
+  assert.ok(apiRow, 'missing the 获取模型 button on the API 地址 row')
+  assert.match(apiRow[1], /v-model="provider\.baseUrl"/)
+  assert.match(apiRow[1], /@click="store\.fetchModels\(provider\)"/)
+  assert.match(apiRow[1], /获取中…' : '获取模型'/)
+  assert.match(apiRow[1], /:disabled="store\.modelsFetchingId !== null"/)
+
+  // 下拉在「添加模型」输入框与按钮之间，候选来自当前供应商的获取结果；
+  // 没获取过就禁用并直说「未获取」，选中只是填进输入框（change 进 modelDraft）。
+  const addRow = /<div class="model-add-row">([\s\S]*?)<\/div>\s*\n/.exec(editor)
+  assert.ok(addRow, 'missing the model add row')
+  assert.ok(
+    addRow[1].indexOf('v-model="modelDraft"') < addRow[1].indexOf('@change="onFetchedModelPick"')
+      && addRow[1].indexOf('@change="onFetchedModelPick"') < addRow[1].indexOf('@click="addModel"'),
+    'the picker must sit between the input and the 添加模型 button',
+  )
+  assert.match(addRow[1], /v-for="id in fetchedModels"/)
+  assert.match(addRow[1], /fetchedModels\.length \? '选择模型' : '未获取'/)
+  assert.match(addRow[1], /:disabled="fetchedModels\.length === 0"/)
+  assert.match(editor, /const fetchedModels = computed/)
+  assert.match(editor, /store\.availableModelsOf\(provider\.value\)/)
+  assert.match(editor, /function onFetchedModelPick[\s\S]*?modelDraft\.value = value/)
+
+  // store：令牌取「认证令牌」栏的当前值（未保存的修改也算数），结果按供应商存。
+  const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
+  assert.match(store, /async function fetchModels\(provider: DshProviderDraft\)/)
+  assert.match(store, /invoke<string\[\]>\('fetch_dsh_models'/)
+  assert.match(store, /authToken: credentialDraftOf\(provider\)\.trim\(\)/)
+  assert.match(store, /availableModels\.set\(provider, models\)/)
+  assert.match(store, /请先填写 API 地址，再获取模型。/)
+
+  // 后端：与 Claude 同一条多协议探测链路，命令按 CLI 分名并注册。
+  const rust = readFileSync(resolve(repoRoot, 'src-tauri/src/model_fetcher.rs'), 'utf8')
+  assert.match(rust, /pub async fn fetch_dsh_models[\s\S]*?fetch_provider_models\(&base_url, &auth_token\)/)
+  const lib = readFileSync(resolve(repoRoot, 'src-tauri/src/lib.rs'), 'utf8')
+  assert.match(lib, /model_fetcher::fetch_dsh_models/)
 })
 
 /**

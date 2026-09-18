@@ -40,8 +40,7 @@ export interface DshModelsStatus {
   message: string
 }
 
-function emptyModel(id: string): DshModelProfile {
-  return {
+function emptyModel(id: string): DshModelProfile {  return {
     id,
     name: null,
     contextWindow: null,
@@ -92,15 +91,38 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
   const loading = ref(false)
   const loaded = ref(false)
   const saving = ref(false)
-  const selectedId = ref<string | null>(null)
+  /**
+   * 当前选中的草稿**对象**，不是 id。
+   *
+   * 供应商的 `id` 就是 dsh 的路由键（settings.yaml 里的 `providers.<id>`），
+   * 用户随时能改它，也可能与另一条已存在的供应商撞车。用字符串 id 记选中时，
+   * `syncSelection` 会在撞车的情况下误判"选中没丢"（因为 id 还在列表里），
+   * 于是把编辑器切到同名的另一条上去。用对象身份引用，选中就跟人走，
+   * 不跟名字走（2026-09-18 任务 202609181729240000）。
+   */
+  const selectedDraft = ref<DshProviderDraft | null>(null)
   const status = ref<DshModelsStatus | null>(null)
 
   // 认证令牌：值在 dsh 的凭据文件里，按供应商各存一份「已存的值」与「输入框草稿」。
   // 明文只进内存（与 Claude 配置页同一条路），输入框默认打码、点「显示」才亮。
-  const credentialDrafts = reactive<Record<string, string>>({})
-  const credentialStored = reactive<Record<string, string>>({})
+  //
+  // 索引键是**草稿对象**而不是供应商 id（2026-09-18，任务：改 id 令牌消失）：
+  // 供应商 id 用户随时能改，用字符串索引时改名的瞬间新 id 下什么都没有，输入框
+  // 立刻变空白。WeakMap 跟对象走——改名只是改 draft.id 的值，凭据状态原地不动，
+  // 界面怎么改 id 都不受影响；真正动凭据引用名的时机是「写入当前修改」（见
+  //  writeSelectedProvider）。
+  const credentialDrafts = new WeakMap<DshProviderDraft, string>()
+  const credentialStored = new WeakMap<DshProviderDraft, string>()
   /** 读取失败的供应商记在这里：值未知时必须挡住保存，免得覆盖掉已有的令牌。 */
-  const credentialErrors = reactive<Record<string, string>>({})
+  const credentialErrors = new WeakMap<DshProviderDraft, string>()
+  /**
+   * 凭据状态的响应式版本号：WeakMap 本身不是响应式的，每次写入后自增它，
+   * 读访问器把它作为依赖，界面才能跟着 refreshCredentials 落地重算。
+   * （2026-09-18 实证：写入成功后 adopt 重建草稿 → computed 重算读到空；
+   * 随后 refresh 把值写进裸 WeakMap，不触发任何更新，输入框钉死在空，
+   * 重启后因为首次求值晚于 refresh 落地而"恢复正常"。）
+   */
+  const credentialVersion = ref(0)
   const credentialSaving = ref(false)
 
   const providers = computed(() => drafts)
@@ -112,9 +134,7 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
    * 什么。判定由后端按已安装的目录算好（`custom`），前端不自己猜。
    */
   const visibleProviders = computed(() => drafts.filter((draft) => draft.custom))
-  const selectedProvider = computed(
-    () => drafts.find((item) => item.id === selectedId.value) ?? null,
-  )
+  const selectedProvider = computed(() => selectedDraft.value)
   const settingsPath = computed(() => document.value?.path ?? '')
   const supportedVersion = computed(() => document.value?.supportedVersion ?? '')
 
@@ -154,7 +174,30 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     return [...ids]
   })
 
+  /**
+   * 操作反馈的飘字：success / info 走这里，3 秒消失（2026-09-18 任务
+   * 202609181728080000——「已写入供应商 …」这类提示不该常驻顶部）。`seq` 逐次
+   * 递增，面板 watch 它重置计时器；连发两条相同文案也会重新计满 3 秒。
+   *
+   * warning / error 仍走 `status` 的顶部横幅常驻——它们要用户处理（校验拦截、
+   * 读写失败、令牌保存失败但供应商已生效），不该 3 秒飘走。
+   */
+  const toast = ref<string | null>(null)
+  const toastSeq = ref(0)
+
+  function showToast(message: string) {
+    toast.value = message
+    toastSeq.value += 1
+  }
+
   function setStatus(tone: DshModelsStatus['tone'], message: string) {
+    if (tone === 'success' || tone === 'info') {
+      // 成功/信息进了飘字通道，横幅不再显示它们；若之前留着一条横幅（比如上一条
+      // 错误），新操作成功了就该把它撤掉。
+      status.value = null
+      showToast(message)
+      return
+    }
     status.value = { tone, message }
   }
 
@@ -164,22 +207,53 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
 
   /** 让选中项落在清单里看得见的那一条上（目录路由被过滤后，选中项可能不可见）。 */
   function syncSelection() {
-    if (selectedId.value && visibleProviders.value.some((item) => item.id === selectedId.value)) {
+    const current = selectedDraft.value
+    if (current && visibleProviders.value.includes(current)) {
       return
     }
-    selectedId.value = visibleProviders.value[0]?.id ?? null
+    // adopt 重建了 drafts：对象引用全换，按 originalId（或 id）找回同一条，选中不丢。
+    if (current) {
+      const key = current.originalId ?? current.id
+      selectedDraft.value = drafts.find((item) => item.originalId === key || item.id === key)
+        ?? visibleProviders.value[0]
+        ?? null
+      return
+    }
+    selectedDraft.value = visibleProviders.value[0] ?? null
   }
 
   function adopt(next: DshSettingsDocument) {
     document.value = next
+    // 重建前先把旧草稿上**未保存的**凭据状态按路由键抢出来：drafts 马上换成全新
+    // 对象，WeakMap 里旧对象上的值全部不可达。脏草稿（用户输入了还没保存的令牌）
+    // 与读取错误继承到新对象上；干净的草稿与 stored 不继承——refreshCredentials
+    // 紧跟着会把它们从凭据文件刷成最新（2026-09-18 修复：写入配置后令牌变空，
+    // 就是重建后新对象在 WeakMap 里什么都没有、refresh 又把空判成「脏」不覆盖）。
+    const carried = new Map<string, { draft?: string; error?: string }>()
+    for (const old of drafts) {
+      const key = old.originalId ?? old.id
+      const dirtyDraft = credentialDrafts.get(old)
+      if (dirtyDraft !== undefined && dirtyDraft !== credentialStored.get(old)) {
+        carried.set(key, { ...carried.get(key), draft: dirtyDraft })
+      }
+      const error = credentialErrors.get(old)
+      if (error !== undefined) {
+        carried.set(key, { ...carried.get(key), error })
+      }
+    }
     drafts.splice(0, drafts.length)
     const nextBaseline: Record<string, string> = {}
     for (const provider of next.providers) {
       const draft: DshProviderDraft = { ...clone(provider), originalId: provider.id }
+      const state = carried.get(provider.id)
+      if (state?.draft !== undefined) credentialDrafts.set(draft, state.draft)
+      if (state?.error !== undefined) credentialErrors.set(draft, state.error)
       drafts.push(draft)
       nextBaseline[provider.id] = fingerprint(draft)
     }
     baseline.value = nextBaseline
+    // 继承写入完成，通知凭据的读取方重算（WeakMap 写入本身非响应式）。
+    credentialVersion.value++
     syncSelection()
   }
 
@@ -193,9 +267,13 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
       void refreshCredentials()
       // 读取成功不再提示：进页面就是一次 load，常亮的「已读取 N 个供应商」只是
       // 噪音（2026-09-18 用户要求删掉）；出错仍走 catch。「文件还不存在」例外，
-      // 那是空状态指引——告诉用户写第一个供应商时会自动建文件。
+      // 那是空状态指引——告诉用户写第一个供应商时会自动建文件。空态要常驻，所以
+      // 直接写 status，不走 setStatus 的飘字分流。
       if (!silent && !next.exists) {
-        setStatus('success', '尚未创建 dsh 设置文件；写入第一个供应商时会自动创建。')
+        status.value = {
+          tone: 'success',
+          message: '尚未创建 dsh 设置文件；写入第一个供应商时会自动创建。',
+        }
       }
       return next
     } catch (error) {
@@ -206,8 +284,8 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     }
   }
 
-  function selectProvider(id: string) {
-    selectedId.value = id
+  function selectProvider(draft: DshProviderDraft) {
+    selectedDraft.value = draft
   }
 
   /**
@@ -232,8 +310,7 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
   function addProvider(): DshProviderDraft {
     const draft = emptyProvider(nextProviderId())
     drafts.push(draft)
-    selectedId.value = draft.id
-    setStatus('info', `已新增供应商草稿「${draft.id}」；填好字段后写入设置文件。`)
+    selectedDraft.value = draft
     return draft
   }
 
@@ -272,7 +349,20 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     }
   }
 
-  /** 把当前选中的供应商写入设置文件（新增或更新）。 */
+  /**
+   * 把当前选中的供应商写入设置文件（新增或更新）。
+   *
+   * 顺带保存令牌（2026-09-18，用户要求合并两个按钮）：写入成功后，若「认证令牌」
+   * 栏有脏草稿就自动跟一次 `dsh_save_credential`——供应商此时已存在于文件里，
+   * 引用名补写的顺序依赖天然满足。两个例外留在独立的「保存令牌」按钮上：
+   * **清空 = 移除**（破坏性动作要显式确认）与**读取失败**（值未知，不能拿草稿
+   * 盖掉可能存在的令牌）。令牌保存失败不回滚供应商写入——两个文件、两条命令，
+   * 状态条分开说明结果。
+   *
+   * 改了路由键的情形（2026-09-18，任务：改 id 令牌消失）：凭据的引用名在写入前
+   * 从旧键换到新键（见下面 try 块开头的注释），settings.yaml 侧不为此改任何
+   * 字节——id 不在 MANAGED_PROVIDER_KEYS 里，重建块时块内字段逐字节保留。
+   */
   async function writeSelectedProvider() {
     const draft = selectedProvider.value
     const current = document.value
@@ -298,6 +388,43 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
 
     saving.value = true
     try {
+      // 改了路由键时，先把凭据文件里的引用名从旧键换到新键（值原样保留）。
+      //
+      // 只在三个条件同时成立时才动：
+      //   1. 真的改了 id（originalId 与 id 不同）；
+      //   2. 引用名是派生的（settings.yaml 没写 apiKeyEnv）——手写引用名的供应商
+      //      引用名跟 id 无关，settings 侧重建块时整行保留，凭据文件完全不用动；
+      //   3. 旧引用名下确实存着值——没有值就没有可换的东西。
+      // settings.yaml 侧不用为这个改任何字节：id 不在 MANAGED_PROVIDER_KEYS 里，
+      // 删旧块重建新块时块内字段（含 apiKeyEnv）逐字节保留，是纯 id 改名时连
+      // settings 文件都内容不变。
+      if (
+        draft.originalId !== null
+        && draft.originalId !== draft.id
+        && !draft.apiKeyEnv?.trim()
+      ) {
+        const oldRef = deriveDshCredentialRef(draft.originalId)
+        const newRef = deriveDshCredentialRef(draft.id)
+        if (oldRef !== newRef) {
+          try {
+            const existing = await invoke<string | null>('dsh_read_credential', {
+              request: { refName: oldRef },
+            })
+            if (existing !== null && existing !== '') {
+              await invoke('dsh_rename_credential_ref', {
+                request: { oldRef, newRef },
+              })
+            }
+          } catch (error) {
+            setStatus(
+              'error',
+              `写入已取消：迁移认证令牌的引用名失败（${error}）。`
+                + '供应商与凭据文件均未改动，请重试；若持续失败请检查 dsh 凭据文件。',
+            )
+            return false
+          }
+        }
+      }
       const result = await invoke<DshSettingsWriteResult>('dsh_write_provider', {
         request: {
           baseRevision: current.revision,
@@ -306,11 +433,33 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
         },
       })
       document.value = { ...current, revision: result.revision }
+      // 先等凭据状态刷新到最新，再决定要不要跟随保存令牌——load 里 refreshCredentials
+      // 是异步的，直接读 credentialStored/credentialErrors 会拿到上一轮的陈旧值。
       await load(true)
-      setStatus(
-        'success',
-        `已写入供应商「${draft.id}」。写入前的内容已备份为 ${result.backupPath}。`,
+      await refreshCredentials()
+      const baseMessage = `已写入供应商「${draft.id}」。写入前的内容已备份为 ${result.backupPath}。`
+
+      // load 重建了 drafts，按 originalId 找回同一条草稿再判断令牌。
+      const saved = drafts.find(
+        (item) => item.originalId === (draft.originalId ?? draft.id),
       )
+      if (
+        saved
+        && isCredentialDirty(saved)
+        && credentialDraftOf(saved).trim() !== ''
+        && !credentialErrorOf(saved)
+      ) {
+        if (await saveCredential(saved, true)) {
+          setStatus('success', `${baseMessage}认证令牌也已保存。`)
+        } else {
+          setStatus(
+            'warning',
+            `${baseMessage}但认证令牌保存失败，供应商修改已生效；请重试「保存令牌」。`,
+          )
+        }
+      } else {
+        setStatus('success', baseMessage)
+      }
       return true
     } catch (error) {
       setStatus('error', `写入失败：${error}`)
@@ -328,45 +477,75 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
   }
 
   function credentialDraftOf(draft: DshProviderDraft): string {
-    return credentialDrafts[draft.id] ?? ''
+    // 依赖 credentialVersion：WeakMap 写入非响应式，靠版本号通知界面重算。
+    void credentialVersion.value
+    return credentialDrafts.get(draft) ?? ''
   }
 
   function setCredentialDraft(draft: DshProviderDraft, value: string) {
-    credentialDrafts[draft.id] = value
+    credentialDrafts.set(draft, value)
+    credentialVersion.value++
   }
 
   function credentialStoredOf(draft: DshProviderDraft): string {
-    return credentialStored[draft.id] ?? ''
+    void credentialVersion.value
+    return credentialStored.get(draft) ?? ''
   }
 
   function credentialErrorOf(draft: DshProviderDraft): string {
-    return credentialErrors[draft.id] ?? ''
+    void credentialVersion.value
+    return credentialErrors.get(draft) ?? ''
   }
 
   function isCredentialDirty(draft: DshProviderDraft): boolean {
     return credentialDraftOf(draft) !== credentialStoredOf(draft)
   }
 
-  /** 把每个可见供应商当前存的令牌读进来。输入框默认打码，明文只在内存里。 */
+  /**
+   * 把每个可见供应商当前存的令牌读进来。输入框默认打码，明文只在内存里。
+   *
+   * 已改但尚未保存的草稿**不刷新**：「写入当前修改」成功后这里会静默重读一次，
+   * 而凭据文件要等「保存令牌」才动——若在这时把草稿盖回文件里的旧值，用户刚输入
+   * 的令牌就被静默吞了（2026-09-18 任务 202609181731590000：令牌在写入时丢失）。
+   * 干净的草稿刷成文件值是无害的（覆盖的是同一个值），且能让外部改动及时出现。
+   *
+   * ⚠️ 脏判定必须先于 `credentialStored` 的更新：拿刚读到的新值去比，初始为空的
+   * 草稿会永远被误判为脏，于是重启后令牌永远填不进输入框（2026-09-18 实测
+   * 「重启后看不到令牌」的根因）。
+   */
   async function refreshCredentials() {
     await Promise.all(
       visibleProviders.value.map(async (draft) => {
         try {
+          const refName = credentialRefOf(draft)
           const value = await invoke<string | null>('dsh_read_credential', {
-            request: { refName: credentialRefOf(draft) },
+            request: { refName },
           })
-          credentialStored[draft.id] = value ?? ''
-          credentialDrafts[draft.id] = value ?? ''
-          delete credentialErrors[draft.id]
+          const stored = value ?? ''
+          // 「没读过的草稿不判脏」：WeakMap 里无记录（undefined）说明界面还没展示过
+          // 任何值，拿 undefined 与 '' 比会误判成脏、把文件里的值挡在输入框外
+          // （2026-09-18「写入配置后令牌变空」的第二道断点）。只有用户真的改过
+          // （有记录且与 stored 不同）才保留草稿。
+          const draftValue = credentialDrafts.get(draft)
+          const dirty = draftValue !== undefined && draftValue !== credentialStored.get(draft)
+          credentialStored.set(draft, stored)
+          if (!dirty) credentialDrafts.set(draft, stored)
+          credentialErrors.delete(draft)
         } catch (error) {
           // 读不出来就当没有，但保存必须挡住——一次失败的读取不该诱导用户
-          // 把已有的令牌覆盖掉。错误显示在令牌保存行上。
-          credentialStored[draft.id] = ''
-          credentialDrafts[draft.id] = ''
-          credentialErrors[draft.id] = String(error)
+          // 把已有的令牌覆盖掉。错误显示在令牌保存行上。同样的，脏草稿不清空：
+          // 值未知时把用户输入的草稿抹掉只会雪上加霜。
+          const draftValue = credentialDrafts.get(draft)
+          const dirty = draftValue !== undefined && draftValue !== credentialStored.get(draft)
+          credentialStored.set(draft, '')
+          if (!dirty) credentialDrafts.set(draft, '')
+          credentialErrors.set(draft, String(error))
         }
       }),
     )
+    // 凭据落盘后统一自增版本号：WeakMap 写入本身不触发响应式更新，界面靠
+    // 版本号重算（2026-09-18 实证「保存后令牌钉死在空」的根因）。
+    credentialVersion.value++
   }
 
   /**
@@ -376,8 +555,11 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
    * 只写引用名。引用名沿用文件里已有的 `apiKeyEnv`，没有时按 dsh 的派生规则生成
    * 并由后端补写——返回的 settingsRevision 用来同步修订号，免得下一次供应商写入
    * 撞上「文件被改过」的护栏。dsh 每次请求按引用名现读现用，保存即生效，无需重启。
+   *
+   * `quiet` 给「写入当前修改」的自动跟随保存用：状态条由调用方组合成一条消息，
+   * 这里不写，免得先闪一条「已保存令牌」又被盖掉。
    */
-  async function saveCredential(draft: DshProviderDraft): Promise<boolean> {
+  async function saveCredential(draft: DshProviderDraft, quiet = false): Promise<boolean> {
     if (draft.originalId === null) {
       setStatus('error', '请先把这个供应商写入 settings.yaml，再保存令牌。')
       return false
@@ -401,20 +583,69 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
         }
       }
       const removed = credentialDraftOf(draft).trim() === ''
-      credentialStored[draft.id] = credentialDraftOf(draft)
-      delete credentialErrors[draft.id]
-      setStatus(
-        'success',
-        removed
-          ? `已移除「${draft.id}」的认证令牌。`
-          : `已保存「${draft.id}」的认证令牌（引用名 ${result.refName}），dsh 下一次请求就会用上它。`,
-      )
+      credentialStored.set(draft, credentialDraftOf(draft))
+      credentialErrors.delete(draft)
+      credentialVersion.value++
+      if (!quiet) {
+        setStatus(
+          'success',
+          removed
+            ? `已移除「${draft.id}」的认证令牌。`
+            : `已保存「${draft.id}」的认证令牌（引用名 ${result.refName}），dsh 下一次请求就会用上它。`,
+        )
+      }
       return true
     } catch (error) {
-      setStatus('error', `保存令牌失败：${error}`)
+      if (!quiet) setStatus('error', `保存令牌失败：${error}`)
       return false
     } finally {
       credentialSaving.value = false
+    }
+  }
+
+  // -- 网关模型清单 -----------------------------------------------------------
+
+  /**
+   * 「获取模型」拉到的网关模型 ID，按供应商各存一份，只进内存——它是给「添加
+   * 模型」的下拉做候选的瞬时数据，不写进 settings.yaml，也不参与脏检查。
+   * 与凭据状态同理由按草稿对象索引：改 id 不该把已拉到的清单弄丢。版本号同理
+   * （WeakMap 写入非响应式），与凭据共用同一个 credentialVersion 通知读取方。
+   */
+  const availableModels = new WeakMap<DshProviderDraft, string[]>()
+  const modelsFetchingId = ref<string | null>(null)
+
+  function availableModelsOf(provider: DshProviderDraft): string[] {
+    void credentialVersion.value
+    return availableModels.get(provider) ?? []
+  }
+
+  /**
+   * 从供应商的 API 地址拉取可用模型清单，与 Claude 配置页同一条后端链路
+   * （OpenAI / Anthropic / Gemini 候选端点逐个试）。令牌用「认证令牌」栏当前
+   * 的值——那一栏已初始化为凭据文件里存的值，所以未保存的修改也能立刻生效。
+   */
+  async function fetchModels(provider: DshProviderDraft): Promise<boolean> {
+    if (modelsFetchingId.value) return false
+    const baseUrl = provider.baseUrl?.trim() ?? ''
+    if (!baseUrl) {
+      setStatus('error', '请先填写 API 地址，再获取模型。')
+      return false
+    }
+    modelsFetchingId.value = provider.id
+    try {
+      const models = await invoke<string[]>('fetch_dsh_models', {
+        baseUrl,
+        authToken: credentialDraftOf(provider).trim(),
+      })
+      availableModels.set(provider, models)
+      credentialVersion.value++
+      setStatus('success', `已从网关获取 ${models.length} 个模型；在「添加模型」右侧的下拉里选择。`)
+      return true
+    } catch (error) {
+      setStatus('error', `获取模型失败：${error}`)
+      return false
+    } finally {
+      modelsFetchingId.value = null
     }
   }
 
@@ -491,13 +722,14 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     providers,
     visibleProviders,
     selectedProvider,
-    selectedId,
     loading,
     loaded,
     saving,
     status,
     settingsPath,
     supportedVersion,
+    toast,
+    toastSeq,
     isSelectedDirty,
     isProviderDirty,
     dirtyCount,
@@ -516,6 +748,9 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     isCredentialDirty,
     credentialSaving,
     saveCredential,
+    availableModelsOf,
+    modelsFetchingId,
+    fetchModels,
     addModel,
     removeModel,
     toggleReasoningLevel,
