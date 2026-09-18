@@ -259,10 +259,16 @@ test('the configuration editor pane is recessed only in the dark theme', () => {
   assert.ok(recessRule, 'components.css has no recess rule')
   const cardRule = /\[data-theme="dark"\] #app :is\(([\s\S]*?)\)\s*\.card/.exec(components)
   assert.ok(cardRule, 'components.css has no card rule for the editor panes')
-  for (const hook of ['.codex-config-panel__content', '.claude-panel__content', '.config-content', '.dsh-config-panel']) {
+  for (const hook of ['.codex-config-panel__content', '.claude-panel__content', '.config-content']) {
     assert.ok(recessRule[1].includes(hook), `${hook} is missing from the recess rule`)
     assert.ok(cardRule[1].includes(hook), `${hook} is missing from the card rule`)
   }
+  // The dsh WRAPPER must stay out of both rules: it spans the provider sidebar
+  // column, and painting it `--editor-surface` turned the whole dsh workspace —
+  // sidebar included — into one dark mass. The sidebar is chrome, like the other
+  // three; dsh's panes and cards are covered via `.config-content`.
+  assert.ok(!recessRule[1].includes('.dsh-config-panel'), 'the dsh wrapper must not be painted; its sidebar would go dark with it')
+  assert.ok(!cardRule[1].includes('.dsh-config-panel'), 'the dsh wrapper is dead weight in the card rule')
   assert.match(components, /background:\s*var\(--editor-surface\)/)
   // Cards borrow the pane instead of painting their own grey on top of it.
   assert.match(components, /\.card\s*\{[\s\S]*?background-color:\s*transparent/)
@@ -277,6 +283,10 @@ test('the configuration sidebar shares the title bar surface', () => {
   const opencode = declarations(body(styleRules('src/components/opencode/OpenCodeConfigPanel.vue'), '.provider-sidebar'))
   assert.equal(opencode.get('background'), undefined, 'a sidebar without a background already inherits the app surface')
 
+  // dsh 从「没有侧边栏」变成了「有供应商侧边栏」，于是它和 opencode 归为同一类。
+  const dsh = declarations(body(styleRules('src/components/dsh/DshConfigPanel.vue'), '.provider-sidebar'))
+  assert.equal(dsh.get('background'), undefined, 'the dsh provider sidebar must inherit the app surface too')
+
   const app = styleRules('src/App.vue')
   assert.equal(declarations(body(app, '.title-bar')).get('background'), 'transparent')
 })
@@ -286,6 +296,7 @@ test('the sidebar split keeps its resize handle but drops the resting rule', () 
     ['src/components/codex/CodexConfigPanel.vue', '.codex-config-panel__divider', '.codex-config-panel__divider::after'],
     ['src/components/claude/ClaudePanel.vue', '.claude-panel__divider', '.claude-panel__divider::after'],
     ['src/components/opencode/OpenCodeConfigPanel.vue', '.opencode-config-panel__divider', '.opencode-config-panel__divider::after'],
+    ['src/components/dsh/DshConfigPanel.vue', '.dsh-config-panel__divider', '.dsh-config-panel__divider::after'],
   ]
 
   for (const [file, strip, rule] of dividers) {
@@ -317,9 +328,14 @@ test('the editor pane is rounded where it tucks under the chrome', () => {
   assert.doesNotMatch(radiusRule[2], /[^-]border-radius:/)
   assert.doesNotMatch(radiusRule[2], /top-right|bottom-left|bottom-right/)
 
-  // dsh has no sidebar, so its own pane carries the same corner.
+  // dsh 从这一版起有了供应商侧边栏，凹槽由那条栏提供，做法与 opencode 一致：
+  // 共用上面 components.css 里的同一条规则，自己不再覆盖圆角。
   const dsh = declarations(body(styleRules('src/components/dsh/DshConfigPanel.vue'), '.config-content'))
-  assert.equal(dsh.get('border-top-left-radius'), 'var(--radius-lg, 12px)')
+  assert.equal(
+    dsh.get('border-top-left-radius'),
+    undefined,
+    'dsh now has a sidebar; the shared rule must own the corner',
+  )
 })
 
 test('the editor pane starts below the title bar', () => {
@@ -341,10 +357,11 @@ test('the editor pane starts below the title bar', () => {
   assert.ok(paddingTop, 'components.css has no --editor-pane-padding-top token')
   assert.ok(Number(paddingTop[1]) >= Number(inset[1]), 'the pane padding would become negative')
 
-  // dsh supplies its own padding, so it only takes the margin.
+  // dsh 现在走侧边栏那条路：内缩与内部 padding 都由 components.css 的共享规则
+  // 给出，自己不再自带那条 28px 的假栏内缩。
   const dsh = declarations(body(styleRules('src/components/dsh/DshConfigPanel.vue'), '.config-content'))
-  assert.equal(dsh.get('margin-top'), 'var(--editor-pane-inset, 12px)')
-  assert.equal(dsh.get('padding'), '0 16px 12px 28px')
+  assert.equal(dsh.get('margin-top'), undefined, 'the shared rule owns the top inset now')
+  assert.equal(dsh.get('padding'), '12px 16px')
 })
 
 test('the project workspace uses the same chrome and recess as the configuration ones', () => {

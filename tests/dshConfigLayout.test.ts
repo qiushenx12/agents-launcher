@@ -6,6 +6,19 @@ import { fileURLToPath } from 'node:url'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
+/**
+ * dsh 配置面板从「一张卡片」变成了「左侧供应商栏 + 右侧内容」，于是这些断言要
+ * 分成两处看：
+ *
+ * - `SHELL`（DshConfigPanel.vue）—— 外壳：供应商清单、页脚的「启动设置 / 设置」、
+ *   以及右侧内容的切换。
+ * - `STARTUP`（DshStartupSettingsPane.vue）—— 原来的整张卡片：访问范围、端口、
+ *   版本、运行状态、端口清理、访问地址清单、进入 dsh 的跳转按钮。
+ */
+const SHELL = 'src/components/dsh/DshConfigPanel.vue'
+const STARTUP = 'src/components/dsh/DshStartupSettingsPane.vue'
+const EDITOR = 'src/components/dsh/DshProviderEditor.vue'
+
 function scopedStyle(relativePath: string): string {
   const source = readFileSync(resolve(repoRoot, relativePath), 'utf8')
   const styleBlock = /<style\s+scoped>([\s\S]*?)<\/style>/.exec(source)
@@ -28,7 +41,7 @@ function declarations(css: string, selector: string): Map<string, string> {
 }
 
 test('dsh access and port labels align to the left edge of their shared column', () => {
-  const css = scopedStyle('src/components/dsh/DshConfigPanel.vue')
+  const css = scopedStyle(STARTUP)
   const label = declarations(css, '.field-label')
 
   assert.equal(label.get('width'), '110px')
@@ -43,7 +56,7 @@ test('dsh access and port labels align to the left edge of their shared column',
  * the 一键清理占用 block.
  */
 test('the port row pairs a shortened input with the recheck button and drops the hint line', () => {
-  const markup = readFileSync(resolve(repoRoot, 'src/components/dsh/DshConfigPanel.vue'), 'utf8')
+  const markup = readFileSync(resolve(repoRoot, STARTUP), 'utf8')
   const row = /<div class="field-row">\s*<label class="field-label" for="dsh-port-input">端口<\/label>([\s\S]*?)<\/div>/.exec(markup)
   assert.ok(row, 'missing the port field row')
 
@@ -53,7 +66,7 @@ test('the port row pairs a shortened input with the recheck button and drops the
 
   // The input keeps a fixed small width instead of filling the row, and the
   // button is pinned to the row's right edge.
-  const css = scopedStyle('src/components/dsh/DshConfigPanel.vue')
+  const css = scopedStyle(STARTUP)
   const input = declarations(css, '.field-row > .input--port')
   assert.equal(input.get('flex'), '0 0 auto')
   assert.ok(input.get('width') !== undefined, 'the port input must be shortened to a fixed width')
@@ -64,7 +77,7 @@ test('the port row pairs a shortened input with the recheck button and drops the
 })
 
 test('the dsh action row holds only the service controls', () => {
-  const markup = readFileSync(resolve(repoRoot, 'src/components/dsh/DshConfigPanel.vue'), 'utf8')
+  const markup = readFileSync(resolve(repoRoot, STARTUP), 'utf8')
   const actions = /<div class="action-row">([\s\S]*?)<\/div>/.exec(markup)
   assert.ok(actions, 'missing dsh action row')
 
@@ -78,42 +91,405 @@ test('the dsh action row holds only the service controls', () => {
 })
 
 /**
- * dsh has no sidebar footer, so its settings entry lives at the left of the
- * bottom row (where the 进入DeepSeek Harness button first appeared), and the
- * jump button sits at the row's right edge. The settings entry must stay the
- * same one as the other front-ends' bottom-left one: the shared
- * `useSettingsPopover` popover, the `.settings-entry` class (App.vue's
- * click-outside closer recognises the trigger by that class), and the ⚙ 设置
- * label.
+ * 设置入口的位置变了：dsh 现在有自己的侧边栏，所以那个入口从卡片右下角搬到了
+ * 侧边栏页脚——与其它三个前端的左下角一致。页脚里「启动设置」在「设置」**上方**，
+ * 两个入口同属一层、同一尺寸；`.settings-entry` 的契约必须原样保留（App.vue 的
+ * 点击空白关闭靠这个类名识别触发按钮，外观也要与别处一致）。
+ *
+ * 页脚上方那句版本提示已删除：它既不是这两个入口的说明，也不是操作所必需的信息，
+ * 版本号改由右侧「写入说明」承载。
  */
-test('the dsh bottom row holds the settings entry on the left and the jump button on the right', () => {
-  const markup = readFileSync(resolve(repoRoot, 'src/components/dsh/DshConfigPanel.vue'), 'utf8')
-  const row = /<div class="runtime-entry">([\s\S]*?)<\/div>/.exec(markup)
-  assert.ok(row, 'missing the dsh bottom row')
+test('the dsh sidebar footer stacks 启动设置 above the shared settings entry', () => {
+  const markup = readFileSync(resolve(repoRoot, SHELL), 'utf8')
+  const footer = /<footer class="provider-sidebar__footer">([\s\S]*?)<\/footer>/.exec(markup)
+  assert.ok(footer, 'missing the dsh sidebar footer')
 
-  // Order inside the row: 设置 first (left), 进入DeepSeek Harness second (right).
-  assert.match(
-    row[1],
-    /@click="toggleSettings\(\$event\)"[\s\S]*?@click="emit\('open-runtime'\)"/,
+  // 顺序：启动设置 → 设置，页脚里没有别的行。
+  assert.ok(
+    footer[1].indexOf('class="sidebar-entry"') < footer[1].indexOf('class="settings-entry"'),
+    '启动设置 要在 设置 上方',
   )
-  // Same trigger contract as the sidebar footers: class + label + handler.
-  assert.match(row[1], /class="settings-entry runtime-entry__settings"/)
-  assert.match(row[1], /⚙ <span>设置<\/span>/)
+
+  // 两个入口的标记形状一致：前置字形 + `<span>` 包住的标签。字形本身不钉死（它只是
+  // 装饰），钉的是「两个入口同形」——「启动设置」早先只有光秃秃的文字，比同一层的
+  // 「设置」少一个图标。
+  assert.deepEqual(
+    (footer[1].match(/[^\s<]+ <span>[^<]+<\/span>/g) ?? []).map((html) => html.replace(/^[^\s<]+ /, '')),
+    ['<span>启动设置</span>', '<span>设置</span>'],
+  )
+  assert.match(footer[1], /@click="selectStartup"/)
+  assert.match(footer[1], /@click="toggleSettings\(\$event\)"/)
+  assert.doesNotMatch(footer[1], /version-note/, 'no leftover note above the 启动设置 entry')
+  assert.doesNotMatch(markup, /version-note/)
+
+  // 「启动设置」曾经只有 12px 字号，比同层的「设置」小一号——两个入口同属一层，
+  // 尺寸必须与全局 .settings-entry（13px / 7px 8px）一致；图标与标签的间距也用
+  // 同一个 flex + 8px gap，否则两个入口的字形落点会差几个像素。
+  const css = scopedStyle(SHELL)
+  const entry = declarations(css, '.sidebar-entry')
+  assert.equal(entry.get('font-size'), 'var(--font-size-base)')
+  assert.equal(entry.get('padding'), '7px 8px')
+  assert.equal(entry.get('display'), 'flex')
+  assert.equal(entry.get('gap'), '8px')
+  assert.equal(entry.get('align-items'), 'center')
+  assert.ok(!/version-note/.test(css), 'the version-note rule must be gone too')
+
+  // 同一个全局浮层、同一个触发契约。
   assert.match(markup, /import \{ useSettingsPopover \} from '@\/composables\/useSettingsPopover'/)
   assert.match(markup, /const \{ toggleSettings \} = useSettingsPopover\(\)/)
 
-  // The action row no longer carries the settings entry.
-  const actions = /<div class="action-row">([\s\S]*?)<\/div>/.exec(markup)
-  assert.ok(actions, 'missing dsh action row')
-  assert.doesNotMatch(actions[1], /toggleSettings/)
+  // 卡片里不再重复一个设置入口：那个位置现在只放跳转按钮。
+  const startup = readFileSync(resolve(repoRoot, STARTUP), 'utf8')
+  assert.doesNotMatch(startup, /toggleSettings/, 'the settings entry must live in the sidebar footer only')
+})
 
-  const css = scopedStyle('src/components/dsh/DshConfigPanel.vue')
-  // 两端分布是把「右侧」落成布局的那一行。
-  assert.equal(declarations(css, '.runtime-entry').get('justify-content'), 'space-between')
-  // The sidebar-footer style is width: 100%; the inline use must take it back.
-  const settings = declarations(css, '.runtime-entry__settings')
-  assert.equal(settings.get('width'), 'auto')
-  assert.equal(settings.get('flex'), '0 0 auto')
+/**
+ * 面板的说明文字收敛过一次：字段标题旁、按钮旁的散文一律删掉，只留「不写用户
+ * 就做不对」的那几句。这条断言把删掉的那几处钉住，避免它们慢慢长回来：
+ *
+ * - 启动设置：标题下那句「通过 npx 运行 dsh web…」、访问范围与版本行下方的
+ *   help 行（`accessHelp` / `versionHelp`）、地址清单那句两行长的令牌说明。
+ * - 供应商编辑器：头部的「该供应商已存在于 settings.yaml…」、模型标题下的
+ *   「手工声明的模型默认按纯文本对待…」、模型输入框下的「启动器不去联网查询…」、
+ *   操作行末尾的「只操作当前供应商…」。
+ *
+ * 「写入说明」也按同一把尺子重写过一遍：原文是「只改动 … 里当前这一个供应商块，
+ * 文件其余部分与注释原样保留」——没有主语、用「块」这种实现术语、还把「被改动的
+ * 字段会重排并丢掉注释」这个真正的代价藏了起来。现在每句一个主语、一件可执行的事。
+ * 标题也去掉了「写入」二字：这张卡片讲的已经不止写入（第一条就是左侧清单只列什么），
+ * 「说明」是它真正的范围。
+ *
+ * 保留的两句都是「不写就会做错」的：留空的条件、端口占用清理的后果。密钥那句
+ * 已删——令牌管理进了编辑器（认证令牌栏），说明卡不再给指路。
+ */
+test('the dsh config panels keep only the load-bearing help lines', () => {
+  const startup = readFileSync(resolve(repoRoot, STARTUP), 'utf8')
+  assert.doesNotMatch(startup, /accessHelp|versionHelp/)
+  assert.doesNotMatch(startup, /通过 npx 运行 dsh web/)
+  assert.doesNotMatch(startup, /class="field-help"/)
+
+  const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
+  // 只留「不写就会做错」的那半句：留空的含义已经由下拉框的第一个选项说了。
+  assert.match(editor, /手工声明的网关必须填。/)
+  assert.doesNotMatch(editor, /目录里已有的供应商可留空/)
+  assert.doesNotMatch(editor, /model-add-help|该供应商已存在于 settings\.yaml|只操作当前供应商/)
+
+  // 说明卡片：标题是「说明」（不再只是写入的事），第一条讲左侧只列什么，句子要有
+  // 主语（「写入只改…」），两件实事都要在——改的是哪一个、备份到哪。密钥的指路句
+  // 已删（令牌管理进了编辑器）；实现术语与「原样保留」这种没参照物的说法不许回来。
+  const shell = readFileSync(resolve(repoRoot, SHELL), 'utf8')
+  const note = /<section class="card source-note">([\s\S]*?)<\/section>/.exec(shell)
+  assert.ok(note, 'missing the dsh write note card')
+  assert.match(note[1], /<div class="card-title">说明<\/div>/)
+  assert.match(note[1], /<p>只显示自定义供应商。<\/p>/)
+  assert.match(note[1], /写入只改你正在编辑的这一个供应商/)
+  assert.match(note[1], /settings\.yaml\.bak/)
+  assert.match(note[1], /被改动的那个字段会按规范格式重排，它内部的注释不会保留/)
+  assert.doesNotMatch(note[1], /密钥不在这个文件里/, '令牌管理进了编辑器，说明卡不再指路')
+  assert.doesNotMatch(note[1], /设置 → 模型/)
+  assert.doesNotMatch(note[1], /供应商块/, '实现术语「块」不许回到界面')
+  assert.doesNotMatch(note[1], /密钥由 dsh 自己保管/, '密钥那句要给动作，不是给状态')
+})
+
+/**
+ * 新增的主体：左侧是供应商清单（可增删、可拖拽排序），右侧是选中项的配置。
+ * 清单项显示「显示名 / id · N 个模型」与写入状态，与 OpenCode 的模式一致。
+ *
+ * 清单列的是 `store.visibleProviders` 而不是全部供应商——另一条测试解释为什么。
+ */
+test('the dsh sidebar lists providers and the editor edits one of them', () => {
+  const markup = readFileSync(resolve(repoRoot, SHELL), 'utf8')
+
+  assert.match(markup, /v-for="\(item, index\) in store\.visibleProviders"/)
+  assert.match(markup, /\{\{ item\.displayName \|\| item\.id \}\}/)
+  assert.match(markup, /\{\{ item\.id \}\} · \{\{ item\.models\.length \}\} 个模型/)
+  assert.match(markup, /@click="createProvider"/)
+  assert.match(markup, /新建供应商/)
+  // 未写入 / 待更新 / 已写入 三态。
+  assert.match(markup, /'未写入'[\s\S]*?'待更新' : '已写入'/)
+
+  // 两个右侧面板：供应商编辑器与启动设置。
+  assert.match(markup, /<DshProviderEditor\s*\/>/)
+  assert.match(markup, /<DshStartupSettingsPane v-show="pane === 'startup'"/)
+
+  const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
+  // 模型增删。
+  assert.match(editor, /@click="addModel"/)
+  assert.match(editor, /添加模型/)
+  assert.match(editor, /@click="store\.removeModel\(provider, model\.id\)"/)
+  // 供应商增删：删除要弹确认，并且说明不会碰到凭据文件。
+  assert.match(editor, /await confirm\(/)
+  assert.match(editor, /@click="removeProvider"/)
+  assert.match(editor, /本次删除不会动它/)
+})
+
+/**
+ * 左侧清单只列**自定义**路由——与 dsh 自己设置页上那枚「自定义」标签同一个判据：
+ * pi-ai 内置目录在该路由键下不提供任何内容（上游 `entry.declared === true`）。
+ * 反过来，`kimi-coding` 这种「自带目录 + 一把密钥」的条目在这里没有可编辑的内容，
+ * 列出来只会让人以为漏了什么。
+ *
+ * 判据不在前端猜：后端读**已安装**的 pi-ai 目录清单（profile 的 node_modules）
+ * 算好 `custom` 一起送过来，所以两处对同一条路由的判断必然一致，也不会随 pi-ai
+ * 升级而漂移。清单读不到时按自定义处理——宁可多列，也不把用户自己声明的路由
+ * 藏起来（藏起来的东西在这个界面里既看不见也改不了）。
+ *
+ * 这条断言守三件事：过滤本身、过滤不会丢数据（拖拽排序按位置原地替换，目录路由
+ * 留在原位）、以及清单空着时界面必须解释一句。
+ */
+test('the dsh sidebar lists only custom routes', () => {
+  const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
+  assert.match(store, /const visibleProviders = computed\(\(\) => drafts\.filter\(\(draft\) => draft\.custom\)\)/)
+  // 新草稿按自定义处理：它是用户自己声明的，没有目录可依赖。
+  assert.match(store, /自定义路由：用户自己声明的，没有目录可依赖[\s\S]*?custom: true/)
+  // 选中项不能停在看不见的那一条上。
+  assert.match(store, /function syncSelection/)
+  assert.match(store, /selectedId\.value = visibleProviders\.value\[0\]\?\.id \?\? null/)
+  // 拖拽要按位置原地替换，不能只把可见项拼回列表（那会把目录路由挤掉）。
+  assert.match(store, /function reorderVisible/)
+  assert.match(store, /draft\.custom \? index : -1/)
+
+  const markup = readFileSync(resolve(repoRoot, SHELL), 'utf8')
+  assert.match(markup, /store\.visibleProviders\.map\(\(item\) => item\.id\)/)
+  assert.match(markup, /store\.reorderVisible\(newOrder\)/)
+  // 文件里有供应商、却一条自定义的都没有时，空状态要说清它们去哪了。
+  assert.match(markup, /本页只显示自定义供应商；settings\.yaml 里剩下的都是 dsh 自带的目录路由。/)
+
+  const types = readFileSync(resolve(repoRoot, 'src/types/config.ts'), 'utf8')
+  assert.match(types, /custom: boolean/)
+
+  const rust = readFileSync(resolve(repoRoot, 'src-tauri/src/dsh_settings.rs'), 'utf8')
+  assert.match(rust, /pub custom: bool/)
+  assert.match(rust, /fn installed_catalog_routes/)
+  assert.match(rust, /fn mark_custom_routes/)
+  assert.match(rust, /@earendil-works/)
+  assert.match(rust, /\.manifest\.json/)
+  assert.match(rust, /routes\.contains\(id\)[\s\S]*?None => true/)
+})
+
+/**
+ * 进入 dsh 配置页时落在**启动设置**上，不是供应商编辑器。
+ *
+ * dsh 与其它三个前端的形状不同：那三个只有一屏配置内容，进来落在编辑器上是对的；
+ * dsh 这一页进来第一件要做的事通常是把服务启起来，供应商是启完才用得上的东西。
+ * 所以首屏不按「有没有供应商」挑（那是曾经的写法），而是固定这一屏。
+ *
+ * 「首次」只指本次运行的第一次：面板是 v-show 常驻的（启动设置有跑着的计时器与
+ * 端口探测，不能随切走销毁），首屏之后切走再切回，显示的是用户上一次选的那一屏，
+ * 不再强制回位（2026-09-18 用户定稿——曾经的 activeKind watch 回位写法已删）。
+ */
+test('the dsh panel opens on the startup settings, not on the provider editor', () => {
+  const markup = readFileSync(resolve(repoRoot, SHELL), 'utf8')
+
+  assert.match(markup, /const pane = ref<DshPane>\('startup'\)/)
+  // 曾经的写法：有自定义供应商就先画编辑器。
+  assert.doesNotMatch(markup, /pane\.value = store\.visibleProviders\.length > 0/)
+  // 首屏之后不回位：切为当前 CLI 不得重置用户的选择。曾经是 watch(activeKind)
+  // 强制回「启动设置」，与「后续跟随当前选择」冲突，已删。
+  assert.doesNotMatch(
+    markup,
+    /watch\(\(\) => workspaceStore\.activeKind/,
+    '每次进入都强制回启动设置已废弃：首次之后跟随用户选择',
+  )
+
+  // 面板内部仍可自由切换：点供应商看编辑器、点页脚回启动设置。
+  assert.match(markup, /function onProviderClick[\s\S]*?pane\.value = 'provider'/)
+  assert.match(markup, /function createProvider[\s\S]*?pane\.value = 'provider'/)
+  assert.match(markup, /function selectStartup\(\) \{\s*pane\.value = 'startup'/)
+})
+
+/**
+ * wire 协议是 dsh schema 里写死的三值枚举（`api: z.union(supportedProtocols())`，
+ * 值落在集合外会被拒绝服务），所以界面上必须是**列全**的下拉框。
+ *
+ * 这条断言来自一个真实缺陷：原来用的是输入框 + `datalist`，而 datalist 会按输入框
+ * 当前值过滤候选——一条已经写着 `openai-completions` 的路由点开只看得到它自己，
+ * 看起来就像「dsh 只提供一种协议」。协议集合也在这里钉死：dsh 上游增删协议时，
+ * 这条会失败，提醒有人去核对 `@deepseek-ai/dsh-llm-pi-ai` 的 `PROTOCOLS` 表。
+ */
+test('the wire protocol field is a closed picker over dsh\'s full protocol set', () => {
+  const config = readFileSync(resolve(repoRoot, 'src/types/config.ts'), 'utf8')
+  const declared = /export const DSH_API_PROTOCOLS = \[([\s\S]*?)\] as const/.exec(config)
+  assert.ok(declared, 'missing DSH_API_PROTOCOLS')
+  assert.deepEqual(
+    declared[1].match(/'([^']+)'/g)?.map((literal) => literal.slice(1, -1)),
+    ['openai-completions', 'openai-responses', 'anthropic-messages'],
+  )
+
+  const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
+  // 模型 ID 用 datalist 是合理的（模型名是开放的）；协议这一栏不能再用它。
+  assert.doesNotMatch(editor, /<datalist id="dsh-api-protocols"/)
+  assert.doesNotMatch(editor, /list="dsh-api-protocols"/)
+
+  const picker = /<select v-model="apiChoice"[\s\S]*?<\/select>/.exec(editor)
+  assert.ok(picker, 'the wire protocol must be a select')
+  assert.match(picker[0], /v-for="protocol in DSH_API_PROTOCOLS"/)
+  // 留空是合法的第四种状态：目录里已有的供应商由目录决定协议。
+  assert.match(picker[0], /<option value="">/)
+  // 手写进 settings.yaml 的其它协议要有兜底项，否则下拉空白、一保存就被改掉。
+  assert.match(picker[0], /v-if="unlistedApi"/)
+  assert.match(editor, /const apiChoice = computed/)
+  assert.match(editor, /const unlistedApi = computed/)
+})
+
+/**
+ * 有三个字段**不该以输入框的形式出现在界面上**，理由同一个：留空就等于用 ID，用户
+ * 在这里没有要做出的决定。
+ *
+ * - `apiKeyEnv`（凭据引用名）：令牌的**值**有「认证令牌」栏（存在 dsh 的凭据文件里，
+ *   Claude 式的显示/隐藏/修改/保存），引用名沿用文件里已有的；没有时按 dsh 的派生
+ *   规则（`deriveDshCredentialRef`）生成并自动补写。用户不手写引用名。
+ * - `displayName`（供应商显示名称）：dsh 缺失时回落到路由键（`source.displayName ??
+ *   provider`），只是一个可选的美化名；编辑器标题固定为「配置编辑」（与 Claude Code
+ *   对齐），回落名显示在左侧清单的选中项上。
+ * - `name`（模型显示名称）：同一形状，dsh 缺失时回落到模型 ID（`entry.name ??
+ *   base?.name ?? entry.id`）。
+ *
+ * 反过来，三者都必须留在读写路径上——读进来多少写回去多少，否则启动器一次写入就会
+ * 抹掉 dsh 补的那一行（`apiKeyEnv` 还会让密钥从此找不到这条路由，症状是运行时的
+ * `MISSING_CREDENTIAL`，不是写入报错）。
+ */
+test('fields with no user decision stay out of the UI but round-trip untouched', () => {
+  const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
+  // 只扫实际渲染的标记：注释里当然会提到这些名字（那正是要留下的解释）。
+  const template = editor
+    .slice(0, editor.indexOf('<script setup'))
+    .replace(/<!--[\s\S]*?-->/g, '')
+
+  assert.doesNotMatch(template, /provider\.apiKeyEnv/, '这一栏没有要给用户的决定')
+  assert.doesNotMatch(template, /v-model="provider\.displayName"/, '留空就等于供应商 ID')
+  assert.doesNotMatch(template, /v-model="model\.name"/, '留空就等于模型 ID')
+  assert.doesNotMatch(template, /模型显示名称/)
+  // 编辑器标题与 Claude Code 对齐，固定「配置编辑」；displayName 不再渲染进编辑器，
+  // 它的「显示名，没有就用 ID」只留在左侧清单（DshConfigPanel 的 item.displayName）。
+  assert.match(template, /<div class="card-title">配置编辑<\/div>/)
+  assert.doesNotMatch(template, /provider\.displayName \|\| provider\.id/)
+  assert.doesNotMatch(template, /keyRefPlaceholder/)
+  // 删掉一列会让窄屏的 nth-child 版式错位，序号必须与子元素顺序对齐。
+  assert.match(editor, /\.model-row > :nth-child\(5\) \{ grid-column: 3; grid-row: 1; \}/)
+  // 但「为什么没有」要留在源码里，且要指得出出处。
+  assert.match(editor, /引用名不设输入框/)
+  assert.match(editor, /schema\.setPath\(draft, \["apiKeyEnv"\], keyRef\)/)
+  assert.match(editor, /source\.displayName \?\? provider/)
+  assert.match(editor, /entry\.name \?\? base\?\.name \?\? entry\.id/)
+
+  // 数据面必须完好：类型、草稿默认值、后端接管字段三处都在。
+  const types = readFileSync(resolve(repoRoot, 'src/types/config.ts'), 'utf8')
+  assert.match(types, /apiKeyEnv: string \| null/)
+  assert.match(types, /displayName: string \| null/)
+  assert.match(types, /name: string \| null/)
+  assert.match(types, /deriveKeyRef/, '派生规则仍要留在字段说明里')
+
+  const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
+  assert.match(store, /apiKeyEnv: null/)
+  assert.match(store, /displayName: null/)
+  assert.match(store, /name: null/)
+
+  const rust = readFileSync(resolve(repoRoot, 'src-tauri/src/dsh_settings.rs'), 'utf8')
+  assert.match(rust, /"apiKeyEnv",/)
+  assert.match(rust, /fn is_credential_ref_name/)
+  assert.match(rust, /if !is_credential_ref_name\(reference\)/)
+  // 模型条目的 name 仍要能读能写。
+  assert.match(rust, /"name" => model\.name = value\.as_text\(\)/)
+})
+
+/**
+ * 认证令牌（2026-09-18 新增）：dsh 配置页里要有 Claude Code 同款的令牌管理——
+ * 显示/隐藏/修改/保存。值的落点是 dsh 自己的凭据文件（`.credentials.yaml` 的
+ * `refs` 分节），settings.yaml 里只补引用名 `apiKeyEnv`（沿用已有的，没有才按
+ * `deriveDshCredentialRef` 派生）。这条把整条链路的两端都钉住：编辑器的字段与
+ * 保存行、store 的读写命令、后端的命令与注册。
+ */
+test('the dsh editor manages the auth token end to end', () => {
+  const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
+  // Claude Code 同款组件与语义：SecretField 自带显示/隐藏切换。
+  assert.match(editor, /import SecretField from '@\/components\/config\/SecretField\.vue'/)
+  assert.match(editor, /label="认证令牌"/)
+  // 保存走独立的按钮行（令牌不在 settings.yaml 里，不随供应商写入提交）；
+  // 清空已存令牌后按钮明确变成「移除」。
+  assert.match(editor, /保存令牌/)
+  assert.match(editor, /移除令牌/)
+  assert.match(editor, /请先写入供应商，再保存令牌。/)
+
+  const store = readFileSync(resolve(repoRoot, 'src/stores/dshModels.ts'), 'utf8')
+  assert.match(store, /dsh_read_credential/)
+  assert.match(store, /dsh_save_credential/)
+  assert.match(store, /deriveDshCredentialRef/)
+
+  const rust = readFileSync(resolve(repoRoot, 'src-tauri/src/dsh_settings.rs'), 'utf8')
+  assert.match(rust, /pub fn dsh_read_credential/)
+  assert.match(rust, /pub fn dsh_save_credential/)
+  assert.match(rust, /fn derive_credential_ref/)
+  // 凭据文件必须走私有写入（POSIX 0600），否则 dsh 拒绝加载。
+  assert.match(rust, /write_private_text_atomic/)
+
+  const lib = readFileSync(resolve(repoRoot, 'src-tauri/src/lib.rs'), 'utf8')
+  assert.match(lib, /dsh_settings::dsh_read_credential/)
+  assert.match(lib, /dsh_settings::dsh_save_credential/)
+})
+
+/**
+ * 思考档位是**按模型**的能力：同一个供应商下的模型对它并不一致，做成供应商级
+ * 开关只会「设成某个值、然后被一部分模型拒绝」。这条断言把 dsh 自己的设计结论
+ * （见 @deepseek-ai/dsh-client-ui-settings-models 的 ProviderEditor 注释）钉住。
+ */
+test('reasoning effort is edited per model, with a wire value per level', () => {
+  const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
+
+  // 档位编辑出现在模型卡片里，而不是供应商字段里。
+  const modelCard = /<div class="model-reasoning">([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/.exec(editor)
+  assert.ok(modelCard, 'missing the per-model reasoning block')
+  assert.match(modelCard[1], /v-for="level in DSH_THINKING_LEVELS"/)
+  assert.match(modelCard[1], /store\.toggleReasoningLevel\(model, level\)/)
+
+  // 每一档都能单独填「真正发给网关的值」——两者可以不同（max → ultra）。
+  assert.match(editor, /v-for="item in model\.reasoningEfforts"/)
+  assert.match(editor, /store\.setReasoningWire\(item,/)
+  assert.match(editor, /留空 = 不发送参数/)
+
+  // 档位集合来自共享常量，不在组件里另抄一份。
+  assert.match(editor, /import \{[^}]*DSH_THINKING_LEVELS[^}]*\} from '@\/types\/config'/)
+})
+
+/**
+ * 配置界面要写明「这套字段照哪一版 dsh 写的」。dsh 仍在迭代，用户和后来改这份
+ * 代码的人都得先看到版本号，才知道该去哪一版文档里核对。版本号本身留在界面上
+ * （右侧「写入说明」最后一行），而**去哪查**这类排查指引只留在源码注释里——
+ * 界面不再摊开文档路径。
+ */
+test('the dsh panel states the supported dsh version and where to look when it drifts', () => {
+  const shell = readFileSync(resolve(repoRoot, SHELL), 'utf8')
+  const editor = readFileSync(resolve(repoRoot, EDITOR), 'utf8')
+
+  // 版本号来自后端返回的 supportedVersion（单一真源在 dsh_settings.rs），
+  // 组件只负责显示，不自己写死一份。
+  assert.match(shell, /store\.supportedVersion \|\| '0\.1\.5-rc\.1'/)
+  assert.match(shell, /本页面的字段对应 dsh <strong>v\{\{ supportedVersionLabel \}\}<\/strong>/)
+
+  // 界面上只留「对应哪一版 + 开发者预览版」这一句；文档路径只在注释里，
+  // 不占界面。dsh 自己的英文说法（developer preview）留在注释里就够了。
+  const shellTemplate = shell.slice(0, shell.indexOf('<script setup'))
+  assert.match(shellTemplate, /开发者预览版/)
+  assert.doesNotMatch(shellTemplate, /developer preview/)
+  assert.doesNotMatch(shellTemplate, /deepseek-ai\/deepseek-harness/)
+  assert.doesNotMatch(shellTemplate, /config-catalog\.zh\.md/)
+
+  assert.match(shell, /官方称 developer preview/)
+  assert.match(shell, /deepseek-ai\/deepseek-harness/)
+  assert.match(shell, /docs\/config-catalog\.zh\.md/)
+  assert.match(shell, /docs\/user\/guide\/providers\.zh\.md/)
+
+  // 源码注释里也要有：dsh 仍在迭代、失效时去哪查。界面文案会被改掉，注释才是
+  // 后来维护的人真正会读到的地方——所以后端那份注释同样钉住。
+  assert.match(editor, /developer preview/)
+  assert.match(editor, /dsh_settings\.rs/)
+  assert.match(editor, /docs\/config-catalog\.zh\.md/)
+
+  const rust = readFileSync(resolve(repoRoot, 'src-tauri/src/dsh_settings.rs'), 'utf8')
+  assert.match(rust, /DSH_SETTINGS_SUPPORTED_VERSION: &str = "0\.1\.5-rc\.1"/)
+  assert.match(rust, /developer preview/)
+  assert.match(rust, /github\.com\/deepseek-ai\/deepseek-harness/)
+  assert.match(rust, /docs\/config-catalog\.zh\.md/)
 })
 
 /**
@@ -123,7 +499,7 @@ test('the dsh bottom row holds the settings entry on the left and the jump butto
  * list, and every action lives on the row it belongs to.
  */
 test('every address row carries 二维码 / 复制 / 打开网页, in that order', () => {
-  const markup = readFileSync(resolve(repoRoot, 'src/components/dsh/DshConfigPanel.vue'), 'utf8')
+  const markup = readFileSync(resolve(repoRoot, STARTUP), 'utf8')
   const start = markup.indexOf('<div class="address-list">')
   const end = markup.indexOf('<div class="runtime-entry">')
   assert.ok(start !== -1 && end > start, 'missing dsh access list')
@@ -160,7 +536,7 @@ test('every address row carries 二维码 / 复制 / 打开网页, in that order
  * explicitly not the primary blue, the success green, or a warning/danger hue.
  */
 test('the dsh panel replaces 启动前检测 with a distinctively coloured jump button', () => {
-  const markup = readFileSync(resolve(repoRoot, 'src/components/dsh/DshConfigPanel.vue'), 'utf8')
+  const markup = readFileSync(resolve(repoRoot, STARTUP), 'utf8')
 
   // The old entry is gone: no preflight button, no hint sentence.
   assert.doesNotMatch(markup, /preflight-entry|openPreflight|启动前检测/)
@@ -178,7 +554,7 @@ test('the dsh panel replaces 启动前检测 with a distinctively coloured jump 
   assert.match(app, /@open-runtime="openDshRuntimeTab"/)
   assert.match(app, /function openDshRuntimeTab\(\) \{[\s\S]*?openCliTab\('dsh'\)/)
 
-  const css = scopedStyle('src/components/dsh/DshConfigPanel.vue')
+  const css = scopedStyle(STARTUP)
   const button = declarations(css, '.runtime-entry__button')
   const background = button.get('background-color') ?? ''
   assert.ok(background, 'the jump button must carry its own colour')
@@ -189,4 +565,7 @@ test('the dsh panel replaces 启动前检测 with a distinctively coloured jump 
   const [r, g, b] = rgb.slice(1).map((hex) => Number.parseInt(hex, 16))
   assert.ok(b > r && r > g, `background ${background} must be a violet, not blue/amber/red`)
   assert.equal(button.get('color'), '#FFFFFF')
+
+  // 跳转按钮独占一行，靠右；设置入口已经搬到侧边栏页脚，这里不再有它。
+  assert.equal(declarations(css, '.runtime-entry').get('justify-content'), 'flex-end')
 })

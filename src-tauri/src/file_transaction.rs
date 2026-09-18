@@ -24,8 +24,68 @@ enum JsonFilePrivacy {
     CurrentUserOnly,
 }
 
+/// Content check run twice: once on the payload and once on what landed in the
+/// temporary file. A format this crate cannot parse gets [`accept_content`] and
+/// the caller owns the guarantee instead.
+type ContentCheck = fn(&[u8], &str) -> Result<(), String>;
+
+fn validate_json_content(content: &[u8], label: &str) -> Result<(), String> {
+    serde_json::from_slice::<Value>(content)
+        .map_err(|error| format!("{label} 写入内容不是有效 JSON：{error}"))?;
+    Ok(())
+}
+
+/// Accept a payload whose format has no parser here.
+///
+/// Used for YAML documents (`dsh` 的 `settings.yaml`): pulling in a YAML parser
+/// for a single file is a dependency this crate does not want, so the module
+/// that owns the document shape validates it and passes the checked text. The
+/// commit sequence — temp file, read-back, `.bak`, rename — is unchanged, so a
+/// crash or a failed rename still leaves the previous file recoverable.
+fn accept_content(_content: &[u8], _label: &str) -> Result<(), String> {
+    Ok(())
+}
+
 pub fn write_json_atomic(path: &Path, content: &[u8], label: &str) -> Result<(), String> {
-    write_json_atomic_with_privacy(path, content, label, JsonFilePrivacy::Preserve)
+    write_json_atomic_with_privacy(
+        path,
+        content,
+        label,
+        JsonFilePrivacy::Preserve,
+        validate_json_content,
+    )
+}
+
+/// Transactional writer for a text file whose format this crate cannot parse.
+///
+/// The caller must have validated `content` already: unlike
+/// [`write_json_atomic`], nothing here proves the payload is well formed, and a
+/// successful commit moves the previous file to `.bak`.
+pub fn write_text_atomic(path: &Path, content: &[u8], label: &str) -> Result<(), String> {
+    write_json_atomic_with_privacy(
+        path,
+        content,
+        label,
+        JsonFilePrivacy::Preserve,
+        accept_content,
+    )
+}
+
+/// Transactional writer for a text file that carries plaintext credentials.
+///
+/// Same sequence as [`write_text_atomic`], but on Unix the containing directory
+/// becomes `0700` and the current, temporary, and backup files are forced to
+/// `0600`: dsh refuses to load a credentials file that other users could read,
+/// and the default mode of a freshly created file would not satisfy that check.
+/// Windows keeps relying on its per-user ACLs.
+pub fn write_private_text_atomic(path: &Path, content: &[u8], label: &str) -> Result<(), String> {
+    write_json_atomic_with_privacy(
+        path,
+        content,
+        label,
+        JsonFilePrivacy::CurrentUserOnly,
+        accept_content,
+    )
 }
 
 /// Atomically write JSON that may contain a plaintext credential.
@@ -34,7 +94,13 @@ pub fn write_json_atomic(path: &Path, content: &[u8], label: &str) -> Result<(),
 /// temporary, and backup files at `0600`. Windows continues to rely on its
 /// ACLs and uses the same transactional sequence as ordinary JSON.
 pub fn write_private_json_atomic(path: &Path, content: &[u8], label: &str) -> Result<(), String> {
-    write_json_atomic_with_privacy(path, content, label, JsonFilePrivacy::CurrentUserOnly)
+    write_json_atomic_with_privacy(
+        path,
+        content,
+        label,
+        JsonFilePrivacy::CurrentUserOnly,
+        validate_json_content,
+    )
 }
 
 fn write_json_atomic_with_privacy(
@@ -42,9 +108,9 @@ fn write_json_atomic_with_privacy(
     content: &[u8],
     label: &str,
     privacy: JsonFilePrivacy,
+    check: ContentCheck,
 ) -> Result<(), String> {
-    serde_json::from_slice::<Value>(content)
-        .map_err(|error| format!("{label} 写入内容不是有效 JSON：{error}"))?;
+    check(content, label)?;
 
     let parent = path
         .parent()
@@ -74,7 +140,7 @@ fn write_json_atomic_with_privacy(
 
         let verification =
             fs::read(&temp_path).map_err(|error| format!("无法校验 {label} 临时文件：{error}"))?;
-        serde_json::from_slice::<Value>(&verification)
+        check(&verification, label)
             .map_err(|error| format!("{label} 临时文件校验失败：{error}"))?;
 
         if path.exists() {
@@ -163,7 +229,7 @@ fn restore_json_backup_if_missing_with_privacy(
         fs::read(&backup_path).map_err(|error| format!("无法读取 {label} 备份：{error}"))?;
     serde_json::from_slice::<Value>(&content)
         .map_err(|error| format!("{label} 备份不是有效 JSON：{error}"))?;
-    write_json_atomic_with_privacy(path, &content, label, privacy)?;
+    write_json_atomic_with_privacy(path, &content, label, privacy, validate_json_content)?;
     Ok(true)
 }
 

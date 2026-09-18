@@ -101,6 +101,7 @@ import { useClaudeStore } from '@/stores/claude'
 import { useCodexConfigStore } from '@/stores/codexConfig'
 import { useOpencodeConfigStore } from '@/stores/opencodeConfig'
 import { useDshConfigStore } from '@/stores/dshConfig'
+import { useDshModelsStore } from '@/stores/dshModels'
 import { useCliRuntimeStore } from '@/stores/cliRuntime'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
 import { redactConfigRecord } from '@/utils/configSecurity'
@@ -143,6 +144,7 @@ const claudeStore = useClaudeStore()
 const codexStore = useCodexConfigStore()
 const opencodeStore = useOpencodeConfigStore()
 const dshStore = useDshConfigStore()
+const dshModelsStore = useDshModelsStore()
 const { isMacOS } = usePlatform()
 let cancelIdlePreload: (() => void) | undefined
 const unregisterClaudeGuard = workspaceStore.registerDraftGuard('claude', {
@@ -158,8 +160,13 @@ const unregisterOpencodeGuard = workspaceStore.registerDraftGuard('opencode', {
   discard: () => opencodeStore.discardChanges(),
 })
 const unregisterDshGuard = workspaceStore.registerDraftGuard('dsh', {
-  isDirty: () => dshStore.isDirty,
-  discard: () => dshStore.discardChanges(),
+  // dsh 有两处草稿：启动设置（端口/访问范围）与 settings.yaml 里的供应方模型。
+  // 任一有未写入的改动都要拦一次，否则切换配置页会静默丢掉编辑。
+  isDirty: () => dshStore.isDirty || dshModelsStore.dirtyCount > 0,
+  discard: async () => {
+    dshStore.discardChanges()
+    await dshModelsStore.discardChanges()
+  },
 })
 const activeDescriptor = computed(() => CLI_DESCRIPTORS[workspaceStore.activeKind])
 const activeStatus = computed(() => runtimeStore.statuses[workspaceStore.activeKind])

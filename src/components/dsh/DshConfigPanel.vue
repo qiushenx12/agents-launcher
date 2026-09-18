@@ -1,1025 +1,536 @@
 <template>
   <div class="dsh-config-panel">
-    <main class="config-content">
-      <section class="card">
-        <header class="editor-header">
-          <div>
-            <div class="card-title">DeepSeek Harness</div>
-            <p>通过 npx 运行 dsh web，仅需设置访问范围与端口。</p>
-          </div>
-          <button
-            class="btn btn-secondary"
-            type="button"
-            :disabled="store.loading"
-            @click="refreshStatus()"
-          >
-            {{ store.statusChecking ? '刷新中…' : '刷新状态' }}
+    <Transition name="dsh-left-pane">
+      <div
+        v-if="!props.sidebarCollapsed"
+        class="dsh-config-panel__sidebar-shell"
+        :style="{ width: `${leftWidth + 9}px`, flexBasis: `${leftWidth + 9}px` }"
+      >
+        <aside class="provider-sidebar" :style="{ width: `${leftWidth}px`, flexBasis: `${leftWidth}px` }">
+          <button class="btn btn-primary provider-sidebar__new" type="button" @click="createProvider">
+            新建供应商
           </button>
-        </header>
 
-        <!-- 访问范围 -->
-        <div class="field-row">
-          <label class="field-label">访问范围</label>
-          <div class="segmented" role="radiogroup" aria-label="访问范围">
+          <div class="provider-sidebar__body">
+            <div v-if="store.loading && !store.loaded" class="provider-sidebar__empty">正在读取…</div>
+            <div v-else-if="store.providers.length === 0" class="provider-sidebar__empty">
+              settings.yaml 里还没有供应商。
+            </div>
+            <!--
+              文件里有供应商、但一条自定义的都没有：清单会空着。这里必须解释一句，
+              否则用户会以为自己的供应商丢了（它们还在文件里，只是由 dsh 自带目录
+              提供全部字段，本页没有可编辑的内容）。
+            -->
+            <div v-else-if="store.visibleProviders.length === 0" class="provider-sidebar__empty">
+              本页只显示自定义供应商；settings.yaml 里剩下的都是 dsh 自带的目录路由。
+            </div>
+            <div v-else class="provider-list">
+              <button
+                v-for="(item, index) in store.visibleProviders"
+                :key="item.id"
+                data-drag-item
+                class="provider-list__item"
+                :class="{
+                  'provider-list__item--selected': pane === 'provider' && store.selectedId === item.id,
+                  'provider-list__item--dragging': draggingIndex === index,
+                  'provider-list__item--drag-over': draggingIndex !== null
+                    && draggingIndex !== index
+                    && overIndex === index,
+                }"
+                type="button"
+                @click="onProviderClick(item, index)"
+              >
+                <span
+                  class="provider-list__drag-handle"
+                  title="拖拽排序（仅调整列表顺序，不改写文件）"
+                  @pointerdown="onPointerDown(index, $event)"
+                />
+                <span class="provider-list__content">
+                  <strong>{{ item.displayName || item.id }}</strong>
+                  <small>{{ item.id }} · {{ item.models.length }} 个模型</small>
+                </span>
+                <span
+                  class="provider-list__state"
+                  :class="{ 'provider-list__state--draft': isDirty(item) }"
+                >
+                  {{ item.originalId === null
+                    ? '未写入'
+                    : isDirty(item) ? '待更新' : '已写入' }}
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <!--
+            侧边栏页脚：「启动设置」在「设置」上方，两个入口同属一层，尺寸也一致。
+            `.settings-entry` 这个类名不能改——App.vue 的「点击空白关闭浮层」靠它
+            识别触发按钮，而且外观要与其它 CLI 左下角的设置入口一致。
+          -->
+          <footer class="provider-sidebar__footer">
             <button
-              v-for="option in accessOptions"
-              :key="option.value"
-              class="segmented__item"
-              :class="{ 'segmented__item--active': store.access === option.value }"
+              class="sidebar-entry"
+              :class="{ 'sidebar-entry--selected': pane === 'startup' }"
               type="button"
-              role="radio"
-              :aria-checked="store.access === option.value"
-              @click="store.access = option.value"
+              @click="selectStartup"
             >
-              {{ option.label }}
+              ▶ <span>启动设置</span>
             </button>
-          </div>
-        </div>
-        <p class="field-help">{{ accessHelp }}</p>
+            <button class="settings-entry" type="button" @click="toggleSettings($event)">
+              ⚙ <span>设置</span>
+            </button>
+          </footer>
+        </aside>
 
-        <!--
-          端口：输入框收窄，「重新检测端口」在同一行最右侧。不再单独输出一行
-          提示文字——占用/非法端口仍由下方 banner 与「一键清理占用」区呈现。
-        -->
-        <div class="field-row">
-          <label class="field-label" for="dsh-port-input">端口</label>
-          <input
-            id="dsh-port-input"
-            v-model.number="store.port"
-            class="input input--port"
-            type="number"
-            :min="DSH_PORT_MIN"
-            :max="DSH_PORT_MAX"
-            step="1"
-            inputmode="numeric"
-          >
-          <button
-            class="btn btn-secondary field-row__port-action"
-            type="button"
-            :disabled="store.portChecking || store.releasing"
-            @click="recheckPort"
-          >
-            {{ store.portChecking ? '检测中…' : '重新检测端口' }}
-          </button>
-        </div>
+        <div
+          class="dsh-config-panel__divider"
+          :class="{ 'dsh-config-panel__divider--dragging': isDragging }"
+          @mousedown="onMouseDown"
+        />
+      </div>
+    </Transition>
 
-        <!--
-          固定版本：每次启动成功后后端会记录当时实际运行的版本，下次启动用
-          npx 按该版本启动（命中本地缓存，不再每次解析 latest）。「检查更新」
-          是唯一会重新解析 latest 的入口：先只读查询，发现新版本时弹窗确认，
-          确认后才固定；运行中的服务不会被隐式重启，只标注重启后生效。
-        -->
-        <div class="field-row">
-          <label class="field-label">版本</label>
-          <div class="version-row">
-            <span class="version-row__value">{{ pinnedVersionLabel }}</span>
+    <main class="config-content">
+      <!--
+        状态条放在两个面板**之外**：读取/写入失败必须始终可见。放进供应商面板里
+        的话，用户停在「启动设置」页时一次读盘失败会毫无提示。
+      -->
+      <ConfigStatusBanner
+        v-if="store.status"
+        :message="store.status.message"
+        :tone="store.status.tone"
+      />
+
+      <!--
+        启动设置用 v-show 而不是 v-if：它内部有每秒推进的「已运行 …」计时器和
+        端口探测，切走再切回不该把它们重置。
+      -->
+      <DshStartupSettingsPane v-show="pane === 'startup'" @open-runtime="emit('open-runtime')" />
+
+      <template v-if="pane === 'provider'">
+        <DshProviderEditor />
+
+        <section class="card source-note">
+          <div class="card-title">说明</div>
+          <p>只显示自定义供应商。</p>
+          <p>
+            写入只改你正在编辑的这一个供应商，settings.yaml 里的其他内容（其他供应商、
+            未列出的字段）原样保留。
+          </p>
+          <p>
+            写入前会把原文件备份为同目录的 <code>settings.yaml.bak</code>；
+            被改动的那个字段会按规范格式重排，它内部的注释不会保留。
+          </p>
+          <p class="source-note__version">
+            本页面的字段对应 dsh <strong>v{{ supportedVersionLabel }}</strong>（开发者预览版，字段可能随版本变动）
+          </p>
+          <div class="config-path-row">
+            <button class="btn btn-secondary" type="button" @click="openSettingsDirectory">
+              打开设置目录
+            </button>
             <button
               class="btn btn-secondary"
               type="button"
-              :disabled="store.updatingVersion || store.isBusy"
-              @click="checkForUpdate"
+              :disabled="store.loading"
+              @click="store.load()"
             >
-              {{ store.updatingVersion ? '正在检查更新…' : '检查更新' }}
+              {{ store.loading ? '读取中…' : '重新读取' }}
             </button>
           </div>
-        </div>
-        <p class="field-help">{{ versionHelp }}</p>
-
-        <ConfigStatusBanner
-          v-if="store.isRemote"
-          message="远程模式会让同一网络内的其他设备访问该服务。dsh 不提供 TLS，任何拿到启动 URL（含 token）的人都能以你的身份操作这台机器上的 agent 与 shell。仅在可信网络中使用。"
-          tone="warning"
-        />
-        <ConfigStatusBanner v-if="store.portError" :message="store.portError" tone="error" />
-        <ConfigStatusBanner v-if="store.actionError" :message="store.actionError" tone="error" />
-        <ConfigStatusBanner
-          v-if="store.pendingRestart"
-          :message="pendingRestartText"
-          tone="warning"
-        />
-        <ConfigStatusBanner v-if="store.actionNotice" :message="store.actionNotice" tone="success" />
-
-        <!--
-          端口被占用时的唯一一键清理入口。
-          这里只负责确认，不做「杀掉安不安全」的判断——后端会拒绝结束启动器自身
-          及其父进程，并把结果如实回报（released / selfProtected）。
-        -->
-        <div v-if="showPortCleanup" class="port-cleanup">
-          <button
-            class="btn btn-primary"
-            type="button"
-            :disabled="store.releasing"
-            @click="cleanUpPort"
-          >
-            {{ store.releasing ? '清理中…' : '一键清理占用' }}
-          </button>
-          <span>{{ cleanupHint }}</span>
-        </div>
-
-        <!-- 运行状态 -->
-        <div class="status-block">
-          <div class="status-block__head">
-            <span class="status-dot" :class="`status-dot--${statusTone}`" />
-            <strong>{{ statusLabel }}</strong>
-            <span v-if="store.status?.version" class="status-block__version">v{{ store.status.version }}</span>
-          </div>
-          <p v-if="statusMessage" class="status-block__message">{{ statusMessage }}</p>
-          <pre v-if="store.status?.detail" class="status-block__detail">{{ store.status.detail }}</pre>
-          <div v-if="store.isBusy && store.progress" class="status-block__progress">
-            {{ progressText }}
-          </div>
-        </div>
-
-        <div class="action-row">
-          <button
-            class="btn btn-primary"
-            type="button"
-            :disabled="store.saving || !store.isDirty"
-            @click="store.save()"
-          >
-            {{ store.saving ? '保存中…' : store.isDirty ? '保存设置' : '设置已保存' }}
-          </button>
-          <button
-            v-if="!store.isRunning"
-            class="btn btn-primary"
-            type="button"
-            :disabled="store.isBusy || !!store.portError || !store.loaded"
-            @click="store.start()"
-          >
-            {{ store.isBusy ? '启动中…' : '启动' }}
-          </button>
-          <template v-else>
-            <button class="btn btn-secondary" type="button" :disabled="store.isBusy" @click="store.restart()">
-              重启
-            </button>
-            <button class="btn btn-secondary" type="button" :disabled="store.isBusy" @click="store.stop()">
-              {{ store.stopping ? '关闭中…' : '关闭' }}
-            </button>
-          </template>
-        </div>
-
-        <!--
-          访问地址清单：同一台机器可能同时有局域网地址和 Tailscale 地址，而 dsh 只
-          上报其中一个（装了 Tailscale 的机器上常常正是 100.x，别的设备反而打不开）。
-          所以这里把本机 / 局域网 / Tailscale 全部列出来，每行自带
-          「二维码 / 复制 / 打开网页」，三个动作都作用于这一行的地址。
-          「默认」标出最可能想用的那一个（局域网优先，其次 Tailscale）。
-        -->
-        <div class="address-list">
-          <div class="address-list__head">
-            <span class="address-list__title">访问地址</span>
-            <span v-if="rows.length" class="address-list__note">
-              复制的内容包含访问令牌，拿到它的人可以操作这台机器上的 agent 与 shell。
-            </span>
-          </div>
-          <ul v-if="rows.length" class="address-list__items">
-            <li v-for="row in rows" :key="row.url" class="address-list__item">
-              <span class="address-list__kind" :class="`address-list__kind--${row.kind}`">
-                {{ row.label }}
-              </span>
-              <code class="address-list__address">{{ row.display }}</code>
-              <span v-if="row.interface" class="address-list__interface">{{ row.interface }}</span>
-              <span v-if="row.preferred" class="address-list__badge">默认</span>
-              <!--
-                二维码只给别的设备能打开的地址：回环地址手机扫了也进不去，所以那里
-                不出现这个按钮。
-              -->
-              <button
-                v-if="needsQr(row)"
-                class="btn btn-secondary address-list__action"
-                type="button"
-                title="用二维码分享这个地址（含访问令牌）"
-                @click="openQr(row)"
-              >
-                二维码
-              </button>
-              <button
-                class="btn btn-secondary address-list__action"
-                type="button"
-                :title="describeCopyTarget(row)"
-                @click="copyRowLink(row)"
-              >
-                {{ copiedKey === row.url ? '已复制' : '复制' }}
-              </button>
-              <button
-                class="btn btn-secondary address-list__action"
-                type="button"
-                :title="`在默认浏览器中打开 ${row.display}（链接中已包含访问令牌）`"
-                @click="openRowLink(row)"
-              >
-                打开网页
-              </button>
-            </li>
-          </ul>
-          <p v-else class="address-list__empty">{{ addressHint }}</p>
-        </div>
-
-        <!--
-          底部行：左侧是设置入口——与其它前端左下角的一致，同一个全局浮层
-          （useSettingsPopover）、同一个 .settings-entry 外观。App.vue 的
-          「点击空白关闭」靠这个类名识别触发按钮，不能换成别的类。dsh 没有
-          侧边栏页脚，设置入口就放在这里。右侧是跳转 dsh 标签页的入口，
-          紫色在配置页里一眼可辨：它不是常规的主/次操作，也不是警告——
-          只是把用户带去 dsh 自己的界面。
-        -->
-        <div class="runtime-entry">
-          <button class="settings-entry runtime-entry__settings" type="button" @click="toggleSettings($event)">
-            ⚙ <span>设置</span>
-          </button>
-          <button class="btn runtime-entry__button" type="button" @click="emit('open-runtime')">
-            进入DeepSeek Harness
-          </button>
-        </div>
-      </section>
-
-      <!-- 局域网二维码：Teleport 浮层覆盖全窗，Rust 侧会先隐藏子 WebView -->
-      <Teleport to="body">
-        <div
-          v-if="store.qrVisible"
-          class="dsh-qr-overlay"
-          role="presentation"
-          @click.self="store.closeQr()"
-        >
-          <section class="dsh-qr-card" role="dialog" aria-modal="true" aria-labelledby="dsh-qr-title">
-            <header class="dsh-qr-card__header">
-              <h2 id="dsh-qr-title">扫码打开{{ qrKindSuffix }}</h2>
-              <button
-                class="dsh-qr-card__close"
-                type="button"
-                title="关闭"
-                aria-label="关闭二维码"
-                @click="store.closeQr()"
-              >
-                ×
-              </button>
-            </header>
-            <img v-if="qrDataUrl" :src="qrDataUrl" alt="访问地址二维码" width="220" height="220">
-            <p v-else class="dsh-qr-card__pending">正在生成二维码…</p>
-            <code class="dsh-qr-card__url">{{ qrTarget?.display }}</code>
-            <p class="dsh-qr-card__warning">
-              二维码与链接都包含访问令牌，任何拿到它的人都能以你的身份操作这台机器上的 agent 与 shell。
-              请仅在可信网络中分享。
-            </p>
-          </section>
-        </div>
-      </Teleport>
+        </section>
+      </template>
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { confirm } from '@tauri-apps/plugin-dialog'
-import { open } from '@tauri-apps/plugin-shell'
-import {
-  DSH_PORT_MAX,
-  DSH_PORT_MIN,
-  useDshConfigStore,
-  type DshAccess,
-} from '@/stores/dshConfig'
-import { describeCopyTarget, describeInstallProgress, formatUptimeZh, type DshAddressRow } from '@/utils/dshRuntime'
-import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
+import { computed, onMounted, ref, watch } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import { useDshModelsStore, type DshProviderDraft } from '@/stores/dshModels'
+import { useDshConfigStore } from '@/stores/dshConfig'
 import { useSettingsPopover } from '@/composables/useSettingsPopover'
+import { useDragReorder } from '@/composables/useDragReorder'
+import { useSharedLeftSidebarWidth } from '@/composables/useSharedLeftSidebarWidth'
+import { beginStartupMeasure } from '@/utils/startupMetrics'
 import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
-import { useDshLink } from './useDshLink'
-import { describePortCleanupHint, shouldOfferPortCleanup } from './portCleanup'
+import DshProviderEditor from './DshProviderEditor.vue'
+import DshStartupSettingsPane from './DshStartupSettingsPane.vue'
 
-const store = useDshConfigStore()
-const workspaceStore = useConfigWorkspaceStore()
+/**
+ * dsh 配置工作台的外壳。
+ *
+ * 布局与其它三个 CLI 对齐：左边一列清单、右边是选中项的内容。dsh 的清单是
+ * **供应商**（settings.yaml 的 `llm-pi-ai.providers`），页脚两个入口——
+ * 「启动设置」（原来的整张卡片）在「设置」上方。
+ *
+ * 供应商与模型的读写全部交给 Rust（`src-tauri/src/dsh_settings.rs`）：前端只拿
+ * 结构化的供应商列表、也只回写结构化数据，YAML 的解析与最小化改写都在后端。
+ * 之所以不让前端拼 YAML，是因为要保证「只重写启动器负责的字段、其余逐字节保留」，
+ * 而这件事只能由掌握原始行号的一侧来做。
+ *
+ * ⚠️ dsh 仍在快速迭代（官方称 developer preview）。这里的字段对齐
+ * v0.1.5-rc.1。一旦失效，按下面这条路径去核对官方文档：仓库
+ * `deepseek-ai/deepseek-harness` 的 `docs/user/guide/providers.zh.md` 与
+ * `docs/config-catalog.zh.md`（逐字段真源，不随 npm 包发布），以及包内
+ * `@deepseek-ai/dsh-llm-pi-ai/README.zh.md`；改的时候两处要同步：
+ * `src-tauri/src/dsh_settings.rs` 与 `src/types/config.ts`。
+ *
+ * 这份排查指引只留在注释里——界面上只写「对齐哪一版」，不再展开文档路径。
+ */
+const store = useDshModelsStore()
+const runtimeStore = useDshConfigStore()
 const { toggleSettings } = useSettingsPopover()
 
+const props = defineProps<{
+  sidebarCollapsed?: boolean
+}>()
 const emit = defineEmits<{
-  /** 「进入DeepSeek Harness」：由 App.vue 走与顶栏 CLI 标签相同的路径跳转。 */
+  (event: 'left-width-change', width: number): void
   (event: 'open-runtime'): void
 }>()
 
 /**
- * 访问地址清单：后端列出服务实际监听的每个地址（本机 / 局域网 / Tailscale），
- * 每行自带「二维码 / 复制 / 打开网页」，三个动作都作用于这一行的地址。
+ * 右侧当前显示哪个面板。
  *
- * 不再有全局的复制/打开按钮：同一台机器上「想复制哪一个」本来就取决于接收方
- * 在哪张网里，让用户对着地址选比让按钮猜更可靠。
+ * 本次运行的**首次**进入停在「启动设置」，不是供应商编辑器：dsh 与其它三个前端的
+ * 形状不同，那三个只有一屏配置内容，进来落在编辑器上是对的；dsh 这一页进来第一件
+ * 要做的事通常是把服务启起来（访问范围、端口、状态都在「启动设置」里）。之后不再
+ * 强制回位——面板是 v-show 常驻的（计时器与端口探测不能随切走销毁），切走再切回
+ * 显示的就是用户上一次选的那一屏（2026-09-18 用户定稿）。
  */
-const { copiedKey, copyAddress, loadUrls, resolveAddress, rows } = useDshLink({
-  running: computed(() => store.isRunning),
-  onError: (message) => { store.setActionError(message) },
-})
+type DshPane = 'startup' | 'provider'
+const pane = ref<DshPane>('startup')
 
-/** 地址清单为空时的说明：服务没起来时它只是还没内容，不是出错了。 */
-const addressHint = computed(() => (store.isRunning
-  ? '正在读取访问地址…'
-  : '服务运行后，这里会列出本机、局域网与 Tailscale 地址，每个地址都能单独复制。'))
+const supportedVersionLabel = computed(() => store.supportedVersion || '0.1.5-rc.1')
 
-function copyRowLink(row: DshAddressRow) {
-  void copyAddress(row)
-}
-
-/** 行内的「打开网页」：打开这一行的地址，本机地址就是用本机浏览器打开。 */
-async function openRowLink(row: DshAddressRow) {
-  store.clearActionError()
-  // 服务重启会换令牌，所以先把地址重新解析一次再打开，避免打开一个 401 页面。
-  const value = await resolveAddress(row)
-  if (!value) return
-  try {
-    await open(value)
-  } catch {
-    // Some platform errors echo the full target. Keep the token-bearing URL out
-    // of UI errors and diagnostics even when the system browser cannot open it.
-    store.setActionError('打开网页失败，请检查系统默认浏览器设置。')
-  }
-}
-
-/**
- * 二维码按行打开：只有别的设备能打开的地址（局域网 / Tailscale）才需要它——回环
- * 地址手机扫了也进不去，所以那里不显示按钮。
- */
-const qrTarget = ref<DshAddressRow | null>(null)
-const qrDataUrl = ref('')
-
-function needsQr(row: DshAddressRow): boolean {
-  return row.kind === 'lan' || row.kind === 'tailscale'
-}
-
-/** 「局域网」用引号包住，Tailscale 是拉丁产品名、需要前后空格。 */
-const qrKindSuffix = computed(() => {
-  const row = qrTarget.value
-  if (!row) return '地址'
-  return row.kind === 'tailscale' ? ` ${row.label} 地址` : `「${row.label}」地址`
-})
-
-function openQr(row: DshAddressRow) {
-  qrTarget.value = row
-  store.openQr()
-}
-
-async function renderQr() {
-  const url = qrTarget.value?.url
-  if (!store.qrVisible || !url) {
-    qrDataUrl.value = ''
-    return
-  }
-  const { toDataURL } = await import('qrcode')
-  qrDataUrl.value = await toDataURL(url, { margin: 1, width: 220 })
-}
-
-watch([() => store.qrVisible, qrTarget], () => {
-  void renderQr().catch(() => { qrDataUrl.value = '' })
-})
-
-// 浮层关掉后立刻丢掉二维码指向的地址：它是带令牌的，没有理由留在组件状态里。
-watch(() => store.qrVisible, (visible) => {
-  if (!visible) qrTarget.value = null
-})
-
-// 切回「本地」模式后二维码没有意义，别把它留在屏幕上。
-watch(() => store.isRemote, (remote) => {
-  if (!remote) store.closeQr()
-})
-
-/**
- * 「一键清理占用」的显示条件。
- *
- * 不要求端口是草稿状态：把端口改成一个被占用的值、或当前端口被别人抢走，同样
- * 需要这个入口（提示文案会同时建议改用其它端口）。唯一排除的情况是启动器托管的
- * 服务正在运行——那时占用者就是它自己，该点「关闭」。
- *
- * 判定逻辑在 `portCleanup.ts` 里，便于直接单测——历史上正是这个条件把按钮整块
- * 藏掉了。
- */
-const showPortCleanup = computed(() => shouldOfferPortCleanup({
-  portStatus: store.portStatus,
-  isRunning: store.isRunning,
-  releasing: store.releasing,
-}))
-
-const cleanupHint = computed(() => describePortCleanupHint({
-  occupantIsDsh: !!store.portStatus?.occupantIsDsh,
-  occupantIsSupervised: !!store.portStatus?.occupantIsSupervised,
-}))
-
-/**
- * 破坏性操作必须先确认，并且把「要杀谁」和「会有什么后果」写清楚。
- * 文案与其它入口一致：先给「当前占用进程为 xxx」，再给后果。占用者是 dsh 时
- * 额外加重提示：很可能正是用户此刻正在对话的实例；由启动器自己拉起、只是状态
- * 没跟踪到时也要说明，否则用户会以为那是别人的进程。
- */
-async function cleanUpPort() {
-  const occupant = store.portStatus?.occupant ?? `端口 ${store.port} 上的进程`
-  const isSupervised = !!store.portStatus?.occupantIsSupervised
-  const isDsh = !!store.portStatus?.occupantIsDsh
-  const warning = isSupervised
-    ? '⚠ 注意：该进程由启动器启动，只是当前状态没有跟踪到它。\n\n'
-    : isDsh
-      ? '⚠ 注意：这是一个 dsh web 服务，可能就是你当前正在使用的那个。'
-        + '清理它会立即中断该会话。\n\n'
-      : ''
-  const accepted = await confirm(
-    `${warning}当前占用进程为 ${occupant}。\n\n`
-    + `将强制结束该进程（含其子进程）以释放端口 ${store.port}。`
-    + '该进程里未保存的内容会丢失。是否继续？',
-    { title: '清理端口占用', kind: 'warning' },
-  )
-  if (!accepted) return
-  await store.releasePort()
-}
-
-const accessOptions: Array<{ value: DshAccess; label: string }> = [
-  { value: 'local', label: '本地' },
-  { value: 'remote', label: '远程' },
-]
-
-const accessHelp = computed(() => (
-  store.isRemote
-    ? '监听 0.0.0.0，同一局域网内的其它设备可以访问。'
-    : '仅监听 127.0.0.1，只有这台电脑可以访问。'
-))
-
-const statusTone = computed(() => {
-  switch (store.status?.phase) {
-    case 'running': return 'running'
-    case 'failed': return 'failed'
-    case 'preparing':
-    case 'starting': return 'pending'
-    default: return 'stopped'
-  }
-})
-
-const statusLabel = computed(() => {
-  switch (store.status?.phase) {
-    case 'running': return '运行中'
-    case 'failed': return store.status?.issue === 'stop_failed' ? '关闭失败' : '启动失败'
-    case 'preparing': return '准备中'
-    case 'starting': return '启动中'
-    default: return '未启动'
-  }
-})
-
-// 「已运行 …」实时刷新：后端只随状态给 uptimeSecs 快照（与 statusFetchedAt
-// 配对），停在本界面时由这里每秒推进本地时钟，时长会一直走。显示格式随量级
-// 扩展：5秒 → 1分05秒 → 1小时02分03秒 → 1天02小时03分04秒。
-const uptimeTick = ref(Date.now())
-let uptimeTimer: ReturnType<typeof setInterval> | null = null
-
-const uptimeActive = computed(() => (
-  store.status?.phase === 'running' && store.status.uptimeSecs != null
-))
-
-const liveUptimeText = computed(() => {
-  const status = store.status
-  if (!status || !uptimeActive.value) return ''
-  const extra = Math.max(0, Math.floor((uptimeTick.value - store.statusFetchedAt) / 1000))
-  return formatUptimeZh((status.uptimeSecs ?? 0) + extra)
-})
-
-/**
- * 状态消息行。后端的 message 是完整句（带句号）；运行中把实时「已运行 …」
- * 插到句号前，保持「DeepSeek Harness 正在运行（已运行 1分05秒）。」的读法。
- */
-const statusMessage = computed(() => {
-  const status = store.status
-  if (!status?.message) return ''
-  const uptime = liveUptimeText.value
-  if (!uptime) return status.message
-  const base = status.message.endsWith('。') ? status.message.slice(0, -1) : status.message
-  return `${base}（已运行 ${uptime}）。`
-})
-
-watch(uptimeActive, (active) => {
-  if (uptimeTimer !== null) {
-    clearInterval(uptimeTimer)
-    uptimeTimer = null
-  }
-  if (active) {
-    uptimeTick.value = Date.now()
-    uptimeTimer = setInterval(() => { uptimeTick.value = Date.now() }, 1000)
-  }
-}, { immediate: true })
-
-onBeforeUnmount(() => {
-  if (uptimeTimer !== null) {
-    clearInterval(uptimeTimer)
-    uptimeTimer = null
-  }
-})
-
-const runningDescription = computed(() => {
-  const status = store.status
-  if (!status) return '未知'
-  return `${status.access === 'remote' ? '远程' : '本地'} · 端口 ${status.port}`
-})
-
-/**
- * 版本行的显示值。固定版本来自持久化配置（不是运行状态）：服务停止时也要
- * 能看到下次启动会用哪个版本；运行中的实际版本仍由下方状态块展示。
- */
-const pinnedVersionLabel = computed(() => (
-  store.saved.pinnedVersion ? `v${store.saved.pinnedVersion}（固定）` : '未记录'
-))
-
-const versionHelp = computed(() => {
-  if (store.updatingVersion) return '正在向 npm 注册表查询最新版本…'
-  return store.saved.pinnedVersion
-    ? '启动时使用记录的固定版本（命中本地缓存，不再每次拉取最新版）。'
-    : '尚未记录版本：首次启动会解析最新版并在启动成功后记录下来。'
-})
-
-const runningVersionDescription = computed(() => (
-  store.status?.version ? `v${store.status.version}` : '旧版本'
-))
-
-/**
- * 重启提示按原因区分：配置改动沿用原文案；版本更新则指出正在运行的还是旧
- * 版本（status.version 是本次启动时记录的版本，正是要换掉的那个）。
- */
-const pendingRestartText = computed(() => (
-  store.pendingRestartReason === 'version'
-    ? `新版本 v${store.saved.pinnedVersion} 已记录，重启服务后生效（当前运行 ${runningVersionDescription.value}）。`
-    : `端口或访问范围已保存，重启服务后生效（当前 ${runningDescription.value}）。`
-))
-
-/**
- * 「检查更新」的完整流程：先只读查询注册表，已是最新时只提示不弹窗；发现
- * 新版本时弹窗确认（写清会从哪个版本换到哪个版本、运行中的服务不受影响、
- * 重启后生效），确认后才固定。弹窗里展示的就是即将固定的版本，后端按确认
- * 值写入，不会在确认与写入之间重新解析 latest。
- */
-async function checkForUpdate() {
-  const report = await store.checkUpdate()
-  if (!report || !report.updateAvailable) return
-  const pinned = report.pinned ? `v${report.pinned}` : '未固定'
-  const accepted = await confirm(
-    `npm 注册表最新版本为 v${report.latest}，当前固定版本为 ${pinned}。\n\n`
-    + (store.isRunning
-      ? '确认后将固定到新版本；正在运行的服务不受影响，重启 dsh 服务后生效。'
-      : '确认后将固定到新版本，下次启动时使用。')
-    + '是否更新？',
-    { title: '更新 dsh 版本', kind: 'info' },
-  )
-  if (!accepted) return
-  await store.applyVersion(report.latest)
-}
-
-/**
- * 冷缓存与缓存命中的文案必须分开：命中时字节几乎不增长，显示 0 MB/s 会误导。
- * 采样到的是 tarball 落盘量，所以不承诺"精确网速"。
- */
-const progressText = computed(() => describeInstallProgress(store.progress))
-
-onMounted(() => {
-  // 挂载时必须主动探测一次：否则 portStatus 保持 null，占用提示与「一键清理占用」
-  // 都不会渲染，而这正是用户进配置页要找的东西。
-  void store.load()
-    .then(() => store.refreshStatus())
-    .then(() => store.checkPort())
-})
-
-/**
- * 端口占用探测的触发点。
- *
- * 这里必须覆盖"刚进入配置页"和"服务状态变化"两个时机：只在草稿端口变化时探测
- * 会让 portStatus 保持 null，于是占用提示与「一键清理占用」整块都不渲染——
- * 而那正是用户最需要它的时候。
- *
- * 只在 dsh 配置页可见时探测，避免在别的 CLI 面板背后白跑。
- */
-watch(
-  [
-    () => workspaceStore.activeKind,
-    () => store.port,
-    () => store.access,
-    () => store.status?.phase,
-  ],
-  () => {
-    if (workspaceStore.activeKind !== 'dsh') return
-    void store.checkPort()
-    // 地址清单同样要跟着这两个时机刷新：接口随时可能增减（插网线、连 Wi-Fi、
-    // Tailscale 上线/下线），停在旧地址上会让用户复制到一个已经不可达的链接。
-    // 服务没在跑时 loadUrls 自己会清空，不需要在这里判断。
-    void loadUrls()
-  },
-  { immediate: true },
+const { draggingIndex, overIndex, justDragged, onPointerDown } = useDragReorder(
+  () => store.visibleProviders.map((item) => item.id),
+  // 清单里只有自定义路由，交给 store 按位置原地替换——目录路由留在原位。拖拽只改
+  // 视图顺序，不触发任何写入。
+  (newOrder: string[]) => store.reorderVisible(newOrder),
+  { gapPx: 2 },
 )
 
-// 手动重新检测：探测失败或端口刚被别的程序释放时不必切页重进。
-function recheckPort() {
-  void store.checkPort()
+const { leftWidth, isDragging, onMouseDown, loadWidth } = useSharedLeftSidebarWidth()
+
+watch(leftWidth, (width) => {
+  emit('left-width-change', width)
+}, { immediate: true })
+
+/** 与 store 的脏检查同一套口径：新草稿一律算未写入。 */
+const isDirty = (item: DshProviderDraft) => store.isProviderDirty(item)
+
+function onProviderClick(item: DshProviderDraft, index: number) {
+  if (justDragged.value) return
+  void index
+  store.selectProvider(item.id)
+  pane.value = 'provider'
 }
 
-/** 「刷新状态」：状态与地址清单一起重取，两者都是"当前现实"。 */
-function refreshStatus() {
-  void store.refreshStatus()
-  void loadUrls()
+function createProvider() {
+  store.addProvider()
+  pane.value = 'provider'
 }
+
+function selectStartup() {
+  pane.value = 'startup'
+}
+
+/** 打开 settings.yaml 所在目录，方便用户直接手改（dsh 也支持热重载这份文件）。 */
+async function openSettingsDirectory() {
+  const path = store.settingsPath
+  const separator = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'))
+  if (!path || separator < 0) {
+    store.setStatus('error', '尚未定位到 dsh 设置目录。')
+    return
+  }
+  try {
+    await invoke('open_directory', { path: path.slice(0, separator) })
+  } catch (error) {
+    store.setStatus('error', `打开设置目录失败：${error}`)
+  }
+}
+
+onMounted(async () => {
+  const finish = beginStartupMeasure('dsh-config-panel')
+  try {
+    await Promise.all([
+      loadWidth().catch(() => {}),
+      runtimeStore.load().catch(() => {}),
+      store.load().catch(() => {}),
+    ])
+  } finally {
+    finish()
+  }
+})
 </script>
 
 <style scoped>
 .dsh-config-panel {
   height: 100%;
+  min-height: 0;
   display: flex;
+  background: transparent;
 }
 
-/* dsh has no profile sidebar, so the recessed editor pane supplies that band
-   itself: the 28px inset in the app background on the left stands in for the
-   light rail the other configuration workspaces get from their sidebar list.
-   The 12px top margin keeps the chrome above the recess, and the interior top
-   padding is trimmed by the same amount so the first row keeps its offset. */
-.config-content {
-  min-width: 0;
-  flex: 1;
-  height: 100%;
-  margin-top: var(--editor-pane-inset, 12px);
-  padding: 0 16px 12px 28px;
-  overflow-y: auto;
-  border-top-left-radius: var(--radius-lg, 12px);
-}
-
-.card {
-  max-width: 760px;
-  margin: 0 auto 12px;
-}
-
-.editor-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 10px;
-}
-
-.editor-header p {
-  margin: 4px 0 0;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-}
-
-.field-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 5px 0;
-}
-
-.field-label {
-  width: 110px;
+.dsh-config-panel__sidebar-shell {
   flex: 0 0 auto;
-  color: var(--text-secondary);
-  text-align: left;
-}
-
-.field-row > .input {
   min-width: 0;
-  flex: 1;
-}
-
-/* 端口行：输入框收窄，「重新检测端口」放同一行最右侧（margin-left: auto
-   吃掉中间的剩余空间），提示文字不再单独占一行。 */
-.field-row > .input--port {
-  flex: 0 0 auto;
-  width: 110px;
-}
-
-.field-row__port-action {
-  margin-left: auto;
-  padding: 2px 8px;
-  font-size: var(--font-size-small);
-}
-
-.field-help {
-  margin: 2px 0 8px 120px;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-}
-
-/* 版本行：当前固定版本 + 「更新版本」按钮，与端口行的操作位对齐。 */
-.version-row {
-  min-width: 0;
-  flex: 1;
+  min-height: 0;
   display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.version-row__value {
-  min-width: 0;
-  flex: 1;
-  color: var(--text-primary);
-  font-size: var(--font-size-small);
-}
-
-.version-row .btn {
-  flex: 0 0 auto;
-  padding: 2px 8px;
-  font-size: var(--font-size-small);
-}
-
-.segmented {
-  display: inline-flex;
-  border: 1px solid var(--separator);
-  border-radius: var(--radius-sm);
   overflow: hidden;
 }
 
-.segmented__item {
-  padding: 5px 14px;
+.dsh-left-pane-enter-active,
+.dsh-left-pane-leave-active {
+  transition: width 0.22s ease, flex-basis 0.22s ease, opacity 0.16s ease;
+}
+
+.dsh-left-pane-enter-from,
+.dsh-left-pane-leave-to {
+  width: 0 !important;
+  flex-basis: 0 !important;
+  opacity: 0;
+}
+
+.provider-sidebar {
+  width: 280px;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.dsh-config-panel__divider {
+  width: 9px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dsh-config-panel__divider::after {
+  content: '';
+  width: 1px;
+  height: 100%;
+  /* Grab strip only: the sidebar and the editor pane are different surfaces, so
+     the colour step already marks the boundary. Hover/drag still highlights. */
+  background-color: transparent;
+  transition: background-color 0.2s ease, width 0.2s ease, box-shadow 0.2s ease;
+}
+
+.dsh-config-panel__divider:hover::after,
+.dsh-config-panel__divider--dragging::after {
+  width: 2px;
+  background-color: var(--primary);
+}
+
+[data-theme="dark"] .dsh-config-panel__divider:hover::after,
+[data-theme="dark"] .dsh-config-panel__divider--dragging::after {
+  box-shadow: 0 0 6px 1px rgba(10, 132, 255, 0.5);
+}
+
+.provider-sidebar__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.provider-sidebar__footer {
+  flex-shrink: 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--separator);
+}
+
+.provider-sidebar__new {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.provider-sidebar__empty {
+  padding: 18px 8px;
+  color: var(--text-secondary);
+  text-align: center;
+  font-size: var(--font-size-small);
+  line-height: 1.5;
+}
+
+.provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.provider-list__item {
+  width: 100%;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   border: 0;
+  border-radius: var(--radius-sm);
   color: var(--text-primary);
   background: transparent;
   cursor: pointer;
-  font-size: var(--font-size-small);
+  text-align: left;
+  transition: background-color 0.12s ease, transform 0.18s ease;
+  user-select: none;
+  position: relative;
+  will-change: transform;
 }
 
-.segmented__item + .segmented__item {
-  border-left: 1px solid var(--separator);
+.provider-list__item:hover { background: var(--tab-bg); }
+.provider-list__item--selected { color: #fff; background: var(--primary); }
+.provider-list__item--selected:hover { background: var(--primary-hover); }
+.provider-list__item--dragging { opacity: 0.3; background: var(--tab-bg); }
+
+.provider-list__drag-handle {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  position: relative;
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  touch-action: none;
 }
 
-.segmented__item--active {
-  color: #fff;
-  background: var(--primary);
-}
-
-.status-block {
-  margin: 4px 0 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--separator);
-  border-radius: var(--radius-md);
-  background: var(--tab-bg);
-}
-
-.status-block__head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.status-block__version {
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-}
-
-.status-block__message {
-  margin: 6px 0 0;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-  line-height: 1.5;
-}
-
-.status-block__detail {
-  max-height: 160px;
-  margin: 8px 0 0;
-  padding: 8px;
-  overflow: auto;
-  border-radius: var(--radius-sm);
-  background: rgba(0, 0, 0, 0.16);
-  font-size: var(--font-size-small);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.status-block__progress {
-  margin-top: 8px;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-}
-
-.status-dot {
-  width: 8px;
-  height: 8px;
-  flex: 0 0 auto;
+.provider-list__drag-handle::before,
+.provider-list__drag-handle::after {
+  content: '';
+  position: absolute;
+  left: 1px;
+  width: 2.5px;
+  height: 2.5px;
   border-radius: 50%;
-  background: var(--text-secondary);
+  background-color: var(--text-secondary);
+  box-shadow: 5px 0 0 var(--text-secondary), 10px 0 0 var(--text-secondary);
 }
 
-.status-dot--running { background: var(--success, #22c55e); }
-.status-dot--failed { background: var(--danger, #d96c6c); }
-.status-dot--pending { background: var(--warning, #d49a45); }
+.provider-list__drag-handle::before { top: 1.5px; }
+.provider-list__drag-handle::after { bottom: 1.5px; }
+.provider-list__drag-handle:active { cursor: grabbing; }
+.provider-list__item:hover .provider-list__drag-handle { opacity: 1; }
 
-.action-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 6px;
-  padding-top: 10px;
-  border-top: 1px solid var(--separator);
+.provider-list__item--selected .provider-list__drag-handle::before,
+.provider-list__item--selected .provider-list__drag-handle::after {
+  background-color: rgba(255, 255, 255, 0.72);
+  box-shadow: 5px 0 0 rgba(255, 255, 255, 0.72), 10px 0 0 rgba(255, 255, 255, 0.72);
 }
 
-.runtime-entry {
-  margin-top: 10px;
-  display: flex;
-  align-items: center;
-  /* 设置入口靠左，「进入DeepSeek Harness」靠右。 */
-  justify-content: space-between;
-  gap: 10px;
-}
-
-/* 设置入口沿用侧边栏页脚的 .settings-entry 外观；行内用法收回整行宽度。 */
-.runtime-entry__settings {
-  width: auto;
-  flex: 0 0 auto;
-}
-
-/* 与主色蓝、成功绿、警告/危险都拉开距离的紫色：它是跳转入口而非操作。 */
-.runtime-entry__button {
-  background-color: #6B5CE7;
-  color: #FFFFFF;
-}
-
-.runtime-entry__button:hover:not(:disabled),
-.runtime-entry__button:active:not(:disabled) {
-  background-color: #5848C9;
-}
-
-/* 端口占用时的清理行：按钮 + 后果说明。 */
-.port-cleanup {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0 0 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--warning, #b26a00);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--warning, #b26a00) 8%, transparent);
-}
-
-.port-cleanup .btn {
-  flex: 0 0 auto;
-}
-
-.port-cleanup span {
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-  line-height: 1.45;
-}
-
-/*
-  访问地址清单：一个地址一行，复制按钮固定在这一行末尾，所以「复制哪一个」永远
-  是行内唯一按钮，不需要先选中再复制。
-*/
-.address-list {
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--separator);
-  border-radius: var(--radius-md);
-  background: var(--tab-bg);
-}
-
-.address-list__head {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 4px 8px;
-  margin-bottom: 4px;
-}
-
-.address-list__title {
-  color: var(--text-primary);
-  font-size: var(--font-size-small);
-}
-
-.address-list__note,
-.address-list__empty {
-  margin: 0;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-  line-height: 1.5;
-}
-
-.address-list__items {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.address-list__item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 0;
-}
-
-.address-list__item + .address-list__item {
-  border-top: 1px solid var(--separator);
-}
-
-/* 分组标签：本机 / 局域网 / Tailscale / 其它网络。 */
-.address-list__kind {
-  flex: 0 0 auto;
-  width: 68px;
-  padding: 1px 6px;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  background: color-mix(in srgb, var(--text-secondary) 18%, transparent);
-  font-size: var(--font-size-small);
-  text-align: center;
-}
-
-.address-list__kind--lan {
-  color: var(--success, #22c55e);
-  background: color-mix(in srgb, var(--success, #22c55e) 16%, transparent);
-}
-
-.address-list__kind--tailscale {
-  color: var(--primary);
-  background: color-mix(in srgb, var(--primary) 16%, transparent);
-}
-
-.address-list__address {
-  flex: 1;
+.provider-list__content {
   min-width: 0;
-  overflow-wrap: anywhere;
-  color: var(--text-primary);
-  font-size: var(--font-size-small);
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
-.address-list__interface {
-  flex: 0 1 auto;
-  max-width: 140px;
+.provider-list__content strong,
+.provider-list__content small {
   overflow: hidden;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.address-list__badge {
-  flex: 0 0 auto;
-  color: var(--text-secondary);
+.provider-list__content small {
+  opacity: 0.72;
   font-size: var(--font-size-small);
 }
 
-.address-list__action {
+.provider-list__state {
   flex: 0 0 auto;
-  padding: 2px 10px;
-  font-size: var(--font-size-small);
+  padding: 2px 5px;
+  border-radius: 4px;
+  color: var(--success, #22c55e);
+  background: color-mix(in srgb, var(--success, #22c55e) 12%, transparent);
+  font-size: 10px;
 }
 
-/* 二维码浮层：Teleport 到 body 覆盖全屏（含标题栏）。 */
-.dsh-qr-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 1200;
+.provider-list__state--draft {
+  color: var(--warning, #d49a45);
+  background: color-mix(in srgb, var(--warning, #d49a45) 13%, transparent);
+}
+
+.provider-list__item--selected .provider-list__state {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* 「启动设置」入口。刻意与 .settings-entry 同款外观（同一字号、同一内边距），
+   但排在上面、并且能显示选中态——它切换的是右侧内容，而「设置」打开的是一个
+   浮层。 */
+.sidebar-entry {
+  width: 100%;
   display: flex;
+  gap: 8px;
   align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.45);
-}
-
-.dsh-qr-card {
-  width: min(420px, calc(100vw - 40px));
-  padding: 16px 18px 18px;
-  border: 1px solid var(--separator);
-  border-radius: var(--radius-md);
-  background: var(--card-bg, var(--tab-bg));
-  text-align: center;
-}
-
-.dsh-qr-card__header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.dsh-qr-card__header h2 {
-  margin: 0;
-  font-size: 1rem;
-}
-
-.dsh-qr-card__close {
+  padding: 7px 8px;
+  margin-bottom: 2px;
   border: 0;
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
   background: transparent;
   cursor: pointer;
-  font-size: 20px;
-  line-height: 1;
-}
-
-.dsh-qr-card img {
-  width: 220px;
-  height: 220px;
-  border-radius: var(--radius-sm);
-  background: #fff;
-}
-
-.dsh-qr-card__pending {
-  margin: 0;
-  padding: 90px 0;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-}
-
-.dsh-qr-card__url {
-  display: block;
-  margin-top: 12px;
-  overflow-wrap: anywhere;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-}
-
-.dsh-qr-card__warning {
-  margin: 12px 0 0;
-  color: var(--warning, #b26a00);
-  font-size: var(--font-size-small);
-  line-height: 1.5;
   text-align: left;
+  font-family: var(--font-base);
+  font-size: var(--font-size-base);
+}
+
+.sidebar-entry:hover {
+  color: var(--text-primary);
+  background: var(--tab-bg);
+}
+
+.sidebar-entry--selected {
+  color: #fff;
+  background: var(--primary);
+}
+
+.sidebar-entry--selected:hover { background: var(--primary-hover); }
+
+.config-content {
+  min-width: 0;
+  flex: 1;
+  height: 100%;
+  padding: 12px 16px;
+  overflow-y: auto;
+}
+
+.source-note {
+  max-width: 980px;
+  margin: 0 auto 12px;
+}
+
+.source-note p {
+  margin: 6px 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-small);
+  line-height: 1.55;
+}
+
+.source-note code {
+  overflow-wrap: anywhere;
+}
+
+.source-note__version {
+  padding-top: 6px;
+  border-top: 1px solid var(--separator);
+}
+
+.config-path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+@media (max-width: 900px) {
+  .provider-sidebar { width: 230px; }
 }
 </style>

@@ -304,13 +304,16 @@
    settles specificity against the scoped `.class[data-v-…]` declarations the
    panels carry, whatever order the bundler emits them in. */
 /* The recessed pane itself. `.config-content` is shared by the OpenCode and dsh
-   workspaces — naming it here is what makes OpenCode match the other three; the
-   `.dsh-config-panel` entry is its wrapper. */
+   workspaces — naming it here is what makes OpenCode match the other three, and
+   it covers dsh as well: both dsh panes (startup settings and the provider
+   editor) render inside it. The dsh wrapper `.dsh-config-panel` must stay OUT
+   of this list: since dsh grew its own provider sidebar, the wrapper spans the
+   sidebar column too, and painting it dragged that column below the chrome with
+   the pane — the sidebar is chrome, exactly like OpenCode's. */
 [data-theme="dark"] #app :is(
   .codex-config-panel__content,
   .claude-panel__content,
-  .config-content,
-  .dsh-config-panel
+  .config-content
 ) {
   background: var(--editor-surface);
 }
@@ -356,11 +359,11 @@
   background: var(--project-surface);
 }
 
+/* dsh 的卡片经 `.config-content` 覆盖，外壳不再单列——理由同上面的凹槽规则。 */
 [data-theme="dark"] #app :is(
   .codex-config-panel__content,
   .claude-panel__content,
-  .config-content,
-  .dsh-config-panel
+  .config-content
 ) .card {
   background-color: transparent;
   box-shadow: none;
