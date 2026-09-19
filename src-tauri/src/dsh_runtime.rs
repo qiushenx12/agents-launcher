@@ -1362,10 +1362,19 @@ fn npm_cache_dir() -> Option<PathBuf> {
             }
         }
     }
-    // npm's default cache on Windows is %LOCALAPPDATA%\npm-cache — NOT `npm`.
-    // Falling back to `…\npm` would silently watch a directory that never
-    // exists, which is exactly how the corrupt `_npx` entries went unseen.
-    dirs::cache_dir().map(|path| path.join("npm-cache"))
+    // The default cache location differs by platform. On Windows it is
+    // `%LOCALAPPDATA%\npm-cache`; on Unix it is `~/.npm`. Falling back to a
+    // directory that never exists would silently disable the corrupt-`_npx`
+    // scan — the exact failure the Windows side of this fallback exists to
+    // prevent — so each platform must name its own default.
+    #[cfg(windows)]
+    {
+        dirs::cache_dir().map(|path| path.join("npm-cache"))
+    }
+    #[cfg(not(windows))]
+    {
+        dirs::home_dir().map(|path| path.join(".npm"))
+    }
 }
 
 fn directory_size(path: &Path) -> u64 {
