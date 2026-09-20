@@ -605,13 +605,20 @@ test('renaming a provider id keeps the token on screen and renames the stored re
   // 路由键继承到新对象——否则「写入当前修改」后 load(true) 一重建，输入框立刻
   // 空白（2026-09-18「修改配置后 api key 变空」的根因）。干净的草稿不继承，
   // 由 refreshCredentials 从凭据文件刷成最新。
+  //
+  // 继承写入的键必须是**数组里的那个对象**（2026-09-20「保存后 api key 被清空」
+  // 的根因）：drafts 是 reactive 数组，push 进去的元素界面拿到的是 Vue 的响应式
+  // 代理，WeakMap 按引用区分——在 push 之前的原始对象上 set，代理上 get 永远读
+  // 不到，脏草稿被 refresh 判成「没读过」用文件旧值覆盖。行为级回归见
+  // tests/dshSaveTokenFlow.test.ts。
   const adopt = /function adopt\(next: DshSettingsDocument\) \{([\s\S]*?)\n  \}/.exec(store)
   assert.ok(adopt, 'missing adopt in the dsh models store')
   assert.match(adopt[1], /carried = new Map/)
   assert.match(adopt[1], /credentialDrafts\.get\(old\)/)
   assert.match(adopt[1], /credentialErrors\.get\(old\)/)
-  assert.match(adopt[1], /credentialDrafts\.set\(draft, state\.draft\)/)
-  assert.match(adopt[1], /credentialErrors\.set\(draft, state\.error\)/)
+  assert.match(adopt[1], /const storedDraft = drafts\[drafts\.length - 1\]/)
+  assert.match(adopt[1], /credentialDrafts\.set\(storedDraft, state\.draft\)/)
+  assert.match(adopt[1], /credentialErrors\.set\(storedDraft, state\.error\)/)
 
   // 2. 写入路径：id 改名且引用名派生时，先换凭据引用名再写 settings.yaml。
   const write = /async function writeSelectedProvider\(\) \{([\s\S]*?)\n  \}/.exec(store)

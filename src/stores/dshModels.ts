@@ -211,10 +211,17 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     if (current && visibleProviders.value.includes(current)) {
       return
     }
-    // adopt 重建了 drafts：对象引用全换，按 originalId（或 id）找回同一条，选中不丢。
+    // adopt 重建了 drafts：对象引用全换，按路由键找回同一条，选中不丢。
+    // 候选键有两个：**写入文件的路由键**（current.id——改名时新文档挂在新键下）
+    // 与**写入前的路由键**（current.originalId——改过名但没写入就重读时，文件恢复
+    // 的还是旧键）。只按旧键找，改名写入后会落空，选中跳到另一条供应商上，编辑器
+    // 里显示的令牌就成了别人的（或空白）。
     if (current) {
-      const key = current.originalId ?? current.id
-      selectedDraft.value = drafts.find((item) => item.originalId === key || item.id === key)
+      const candidates = new Set<string>([current.id])
+      if (current.originalId !== null) candidates.add(current.originalId)
+      selectedDraft.value = drafts.find(
+        (item) => item.originalId !== null && candidates.has(item.originalId),
+      )
         ?? visibleProviders.value[0]
         ?? null
       return
@@ -231,7 +238,10 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     // 就是重建后新对象在 WeakMap 里什么都没有、refresh 又把空判成「脏」不覆盖）。
     const carried = new Map<string, { draft?: string; error?: string }>()
     for (const old of drafts) {
-      const key = old.originalId ?? old.id
+      // 键必须是**写进文件的路由键**（old.id）：改名的草稿 originalId 还是旧键，
+      // 而重建后的文档里那条供应商挂在**新键**下——按旧键继承会把未保存的凭据
+      // 状态挂到一个不存在的键上，重建后原地蒸发（改名 + 改令牌一起保存时令牌丢失）。
+      const key = old.id
       const dirtyDraft = credentialDrafts.get(old)
       if (dirtyDraft !== undefined && dirtyDraft !== credentialStored.get(old)) {
         carried.set(key, { ...carried.get(key), draft: dirtyDraft })
@@ -245,11 +255,18 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     const nextBaseline: Record<string, string> = {}
     for (const provider of next.providers) {
       const draft: DshProviderDraft = { ...clone(provider), originalId: provider.id }
-      const state = carried.get(provider.id)
-      if (state?.draft !== undefined) credentialDrafts.set(draft, state.draft)
-      if (state?.error !== undefined) credentialErrors.set(draft, state.error)
       drafts.push(draft)
       nextBaseline[provider.id] = fingerprint(draft)
+      const state = carried.get(provider.id)
+      // **WeakMap 的键必须是数组里的那个对象**：drafts 是 reactive 数组，push 进去
+      // 的元素会被 Vue 包成响应式代理，界面与 refreshCredentials 拿到的都是代理，
+      // 而 WeakMap 按对象引用区分——在 push 之前的原始对象上 set，代理上 get 永远
+      // 读不到。结果就是「写入后 load 重建」把未保存的令牌草稿挂丢，随后的
+      // refresh 把它判成「没读过」，用文件旧值覆盖，用户刚输入的 api key 被静默
+      // 丢弃、跟随保存也不触发（2026-09-20「保存后 api key 被清空」的根因）。
+      const storedDraft = drafts[drafts.length - 1]
+      if (state?.draft !== undefined) credentialDrafts.set(storedDraft, state.draft)
+      if (state?.error !== undefined) credentialErrors.set(storedDraft, state.error)
     }
     baseline.value = nextBaseline
     // 继承写入完成，通知凭据的读取方重算（WeakMap 写入本身非响应式）。
@@ -439,10 +456,11 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
       await refreshCredentials()
       const baseMessage = `已写入供应商「${draft.id}」。写入前的内容已备份为 ${result.backupPath}。`
 
-      // load 重建了 drafts，按 originalId 找回同一条草稿再判断令牌。
-      const saved = drafts.find(
-        (item) => item.originalId === (draft.originalId ?? draft.id),
-      )
+      // load 重建了 drafts，找回同一条草稿再判断令牌。按**写入文件的路由键**
+      // （draft.id）匹配：这次写入就是按它落盘的，新草稿的 originalId 即它。
+      // 不能按 draft.originalId 找——改名时那是旧键，新文档里没有挂旧键的草稿，
+      // 会找到 undefined 导致令牌跟随保存被整个跳过（改名 + 改令牌一起保存时丢令牌）。
+      const saved = drafts.find((item) => item.originalId === draft.id)
       if (
         saved
         && isCredentialDirty(saved)
