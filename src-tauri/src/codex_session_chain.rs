@@ -21,6 +21,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,6 +68,8 @@ pub struct CodexSessionRepairResult {
     pub merged_bytes: u64,
     pub kept_records: u64,
     pub skipped_records: u64,
+    /// 同步状态库 rollout_path 的结果说明（None = 状态库不存在/无此行/未改动）。
+    pub rollout_path_note: Option<String>,
     pub message: String,
 }
 
@@ -611,6 +614,7 @@ pub fn repair_thread_chain(
     sessions_root: &Path,
     thread_id: &str,
     backup_root: &Path,
+    codex_home: Option<&Path>,
 ) -> Result<CodexSessionRepairResult, String> {
     let pages = collect_pages(sessions_root);
     let thread_pages: Vec<&PageEntry> = pages
@@ -766,6 +770,29 @@ pub fn repair_thread_chain(
 
     let page_count = chain.len() as u32;
     let merged_bytes = output.len() as u64;
+
+    // 5) 同步 codex 状态库 threads.rollout_path：合并后只剩根页单文件，但状态库
+    // 仍指着已被移走的链尖分页，resume 会 resolve 不到文件而报"恢复对话失败"。
+    // 这是 best-effort：状态库不存在 / 无此行 / 已正确时静默跳过，不影响合并结果。
+    let rollout_path_note = codex_home.and_then(|home| {
+        match sync_state_rollout_path(home, thread_id, &root.path) {
+            Ok(note) => note,
+            Err(error) => {
+                eprintln!("[codex_session_chain] 同步状态库 rollout_path 失败: {error}");
+                Some(format!("状态库 rollout_path 同步失败（不影响会话内容）: {error}"))
+            }
+        }
+    });
+
+    let mut message = format!(
+        "已把 {page_count} 个分页文件合并为单文件（{merged_bytes} 字节，保留 {kept_records} 条后续记录，丢弃 {skipped_records} 条分叉重录）。原始文件已备份到 {}。",
+        backup_dir.display()
+    );
+    if let Some(note) = &rollout_path_note {
+        message.push(' ');
+        message.push_str(note);
+    }
+
     Ok(CodexSessionRepairResult {
         thread_id: thread_id.to_string(),
         strategy: "consolidate".to_string(),
@@ -774,11 +801,199 @@ pub fn repair_thread_chain(
         merged_bytes,
         kept_records,
         skipped_records,
-        message: format!(
-            "已把 {page_count} 个分页文件合并为单文件（{merged_bytes} 字节，保留 {kept_records} 条后续记录，丢弃 {skipped_records} 条分叉重录）。原始文件已备份到 {}。",
-            backup_dir.display()
-        ),
+        rollout_path_note,
+        message,
     })
+}
+
+/// 把 threads 表里该线程的 rollout_path 更新为合并后的根页路径。
+/// 返回 Ok(Some(说明)) 表示发生/确认了改动，Ok(None) 表示状态库或行不存在、或已正确。
+fn sync_state_rollout_path(
+    codex_home: &Path,
+    thread_id: &str,
+    root_path: &Path,
+) -> Result<Option<String>, String> {
+    // 兼容 codex 状态库的多版本文件名（state_N.sqlite，取最高版本号）。
+    let db_path = latest_state_db_path(codex_home).ok_or_else(|| {
+        format!(
+            "未在 {} 找到 codex 状态库（state_N.sqlite）",
+            codex_home.display()
+        )
+    })?;
+
+    // codex 在 Windows 上给 rollout_path 加扩展长路径前缀（\\?\）；写入值要
+    // 跟现有格式一致，否则读取端按字符串原样 resolve。按 codex 的约定补前缀：
+    // 已是 \\?\ 或相对/其它形式不强行改，仅对普通绝对盘符路径补前缀。
+    let root_text = root_path.to_string_lossy().to_string();
+    let canonical = canonical_rollout_path_for_state(&root_text);
+
+    let connection = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .map_err(|error| format!("无法打开 codex 状态库 {}: {error}", db_path.display()))?;
+    connection
+        .busy_timeout(Duration::from_millis(1500))
+        .map_err(|error| format!("无法配置 codex 状态库: {error}"))?;
+
+    let current: Option<String> = connection
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(current) = current else {
+        // 状态库里没有这一行（例如新线程还没入库），无需同步。
+        return Ok(None);
+    };
+    if paths_refer_to_same_file(&current, &canonical) {
+        return Ok(None);
+    }
+
+    let changed = connection
+        .execute(
+            "UPDATE threads SET rollout_path = ?1 WHERE id = ?2",
+            rusqlite::params![canonical, thread_id],
+        )
+        .map_err(|error| format!("无法更新 codex 状态库 rollout_path: {error}"))?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "已同步状态库 rollout_path → {}",
+        root_path.display()
+    )))
+}
+
+/// 读状态库里该线程的 rollout_path（无此行/无库时返回 None）。
+fn read_state_rollout_path(codex_home: &Path, thread_id: &str) -> Option<String> {
+    let db_path = latest_state_db_path(codex_home)?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    connection
+        .busy_timeout(Duration::from_millis(500))
+        .ok()?;
+    connection
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+/// 状态库 rollout_path 指向的文件是否真实存在（忽略 \\?\ 前缀差异）。
+fn state_rollout_target_exists(rollout_path: &str) -> bool {
+    let normalized = rollout_path.trim_start_matches(r"\\?\");
+    Path::new(normalized).is_file()
+}
+
+/// 切换配置预检时的轻量校正（区别于 repair_thread_chain 的合并重手术）：
+/// 对每个磁盘上仍有存活页的线程，若状态库 rollout_path 指向已不存在的文件
+/// （典型：之前合并把链尖分页移走，但状态库指针没跟上；或客户端翻页后又指向了
+/// 新分页），直接把状态库校正到该线程的存活链尖。**不删/合并任何会话文件，
+/// 也不要求退出 Codex 客户端**——WAL 模式下写入与客户端读不冲突，客户端下次
+/// resume 即读到正确路径。
+///
+/// 返回 (校正的线程数, 无法校正的线程 id 列表——这些仍需走合并修复)。
+pub fn reconcile_state_rollout_paths(
+    sessions_root: &Path,
+    codex_home: &Path,
+) -> (u32, Vec<String>) {
+    let pages = collect_pages(sessions_root);
+    // 按线程分组，取每个线程的存活链尖（文件名时间戳最新的页）。
+    let mut tip_by_thread: HashMap<String, &PageEntry> = HashMap::new();
+    for page in &pages {
+        let Some(thread_id) = page.meta.thread_id.clone() else {
+            continue;
+        };
+        let replace = match tip_by_thread.get(&thread_id) {
+            Some(existing) => page.name > existing.name,
+            None => true,
+        };
+        if replace {
+            tip_by_thread.insert(thread_id, page);
+        }
+    }
+
+    let mut corrected = 0_u32;
+    let mut unrecoverable = Vec::new();
+    for (thread_id, tip) in &tip_by_thread {
+        let Some(current) = read_state_rollout_path(codex_home, thread_id) else {
+            continue; // 状态库无此行，无需处理
+        };
+        if state_rollout_target_exists(&current) {
+            continue; // 状态库指向的文件仍在，正常
+        }
+        // 状态库指向已丢失的文件：校正到磁盘上的存活链尖。
+        match sync_state_rollout_path(codex_home, thread_id, &tip.path) {
+            Ok(Some(_)) => corrected = corrected.saturating_add(1),
+            Ok(None) => {}
+            Err(_) => unrecoverable.push(thread_id.clone()),
+        }
+    }
+    (corrected, unrecoverable)
+}
+
+/// 取 codex_home 下版本号最高的 state_N.sqlite。
+fn latest_state_db_path(codex_home: &Path) -> Option<PathBuf> {
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in fs::read_dir(codex_home).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_prefix("state_") else { continue };
+        let Some(version) = stem.strip_suffix(".sqlite") else { continue };
+        let Ok(version) = version.parse::<u64>() else { continue };
+        let path = entry.path();
+        let better = match &best {
+            Some((best_version, _)) => version > *best_version,
+            None => true,
+        };
+        if better {
+            best = Some((version, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// 按 codex 在 Windows 上的存储约定给绝对路径补 \\?\ 前缀（其它平台原样返回）。
+fn canonical_rollout_path_for_state(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        let already_prefixed = path.starts_with(r"\\?\");
+        let is_absolute = {
+            let bytes = path.as_bytes();
+            bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes[2] == b'\\' || bytes[2] == b'/')
+        };
+        if !already_prefixed && is_absolute {
+            return format!(r"\\?\{}", path.replace('/', "\\"));
+        }
+    }
+    path.to_string()
+}
+
+/// 判断两个 rollout_path 字符串是否指向同一文件（忽略 \\?\ 前缀与斜杠差异）。
+fn paths_refer_to_same_file(left: &str, right: &str) -> bool {
+    normalize_rollout_path(left) == normalize_rollout_path(right)
+}
+
+#[cfg(windows)]
+fn normalize_rollout_path(path: &str) -> String {
+    let trimmed = path.trim_start_matches(r"\\?\");
+    trimmed.replace('/', "\\").to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn normalize_rollout_path(path: &str) -> String {
+    path.trim_start_matches(r"\\?\").to_string()
 }
 
 fn rename_or_copy(source: &Path, target: &Path) -> Result<(), String> {
@@ -962,7 +1177,7 @@ mod tests {
         let backup_root = directory.join("backups");
         let (thread_id, page1_path) = build_forked_fixture(&sessions);
 
-        let result = repair_thread_chain(&sessions, &thread_id, &backup_root)
+        let result = repair_thread_chain(&sessions, &thread_id, &backup_root, None)
             .expect("repair forked chain");
         assert_eq!(result.page_count, 3);
         // 保留：根页头部(ordinal 0..1) + 第二页正文(3..8) = 2 + 6 = 8 行；
@@ -998,6 +1213,195 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
+    /// 状态库同步：threads 表里指着链尖分页的 rollout_path 必须改指合并后的根页，
+    /// 否则 resume 时报"恢复对话失败: file does not exist"。
+    #[test]
+    fn repair_syncs_state_db_rollout_path() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-chain-state-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions = directory.join("sessions");
+        let backup_root = directory.join("backups");
+        let codex_home = directory.join("codex-home");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        let (thread_id, page1_path) = build_forked_fixture(&sessions);
+
+        // 状态库 threads 表指向会被移走的链尖分页（第三页）。
+        let page3_name = concat!(
+            "rollout-2026-09-16T20-03-31-11111111-2222-3333-4444-555555555555_",
+            "bbbbbbbb-1111-2222-3333-444444444444.jsonl"
+        );
+        let stale_path = sessions
+            .join("2026/09/16")
+            .join(page3_name)
+            .to_string_lossy()
+            .to_string();
+        let db_path = codex_home.join("state_5.sqlite");
+        {
+            let connection = rusqlite::Connection::open(&db_path).expect("open state db");
+            connection
+                .execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                    [],
+                )
+                .expect("create threads table");
+            connection
+                .execute(
+                    "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                    rusqlite::params![thread_id, stale_path],
+                )
+                .expect("insert stale rollout_path");
+        }
+
+        let result = repair_thread_chain(
+            &sessions,
+            &thread_id,
+            &backup_root,
+            Some(&codex_home),
+        )
+        .expect("repair with state db");
+
+        let connection = rusqlite::Connection::open(&db_path).expect("reopen state db");
+        let stored: String = connection
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id = ?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .expect("read rollout_path");
+        let expected =
+            canonical_rollout_path_for_state(&page1_path.to_string_lossy().to_string());
+        assert_eq!(
+            stored, expected,
+            "rollout_path 应指向合并后的根页"
+        );
+        assert!(result.rollout_path_note.is_some(), "应记录同步说明");
+        assert!(std::path::Path::new(&stored).exists() || cfg!(windows));
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// 切换预检的轻量校正：状态库指向已丢失的分页，但磁盘上有存活页时，
+    /// 只把 rollout_path 改指存活链尖，不动任何会话文件。
+    #[test]
+    fn reconcile_fixes_stale_state_pointer_without_touching_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-chain-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions = directory.join("sessions");
+        let codex_home = directory.join("codex-home");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        let (thread_id, page1_path) = build_forked_fixture(&sessions);
+
+        // 状态库指向一个已被移走的分页（磁盘上不存在）。
+        let stale_path = sessions
+            .join("2026/09/20")
+            .join("rollout-2026-09-20T18-40-50-11111111-2222-3333-4444-555555555555_bbbbbbbb-1111-2222-3333-444444444444.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let db_path = codex_home.join("state_5.sqlite");
+        {
+            let connection = rusqlite::Connection::open(&db_path).expect("open state db");
+            connection
+                .execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                    [],
+                )
+                .expect("create threads table");
+            connection
+                .execute(
+                    "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                    rusqlite::params![thread_id, stale_path],
+                )
+                .expect("insert stale rollout_path");
+        }
+
+        // 记录修复前会话目录的文件集合与根页字节，用于验证"不动会话文件"。
+        let root_bytes_before = fs::read(&page1_path).expect("read root before");
+        let files_before = collect_rollout_files_under(&sessions);
+
+        let (corrected, unrecoverable) = reconcile_state_rollout_paths(&sessions, &codex_home);
+
+        assert_eq!(corrected, 1, "应校正该线程的状态库指针");
+        assert!(unrecoverable.is_empty());
+        // 会话文件未被改动。
+        let root_bytes_after = fs::read(&page1_path).expect("read root after");
+        assert_eq!(root_bytes_before, root_bytes_after, "根页内容不得变化");
+        assert_eq!(files_before, collect_rollout_files_under(&sessions), "会话文件集合不得变化");
+        // 状态库已指向存活链尖（链上最新的第三页）。
+        let connection = rusqlite::Connection::open(&db_path).expect("reopen state db");
+        let stored: String = connection
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id = ?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .expect("read rollout_path");
+        assert!(
+            state_rollout_target_exists(&stored),
+            "校正后的 rollout_path 必须指向真实存在的文件: {stored}"
+        );
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// 状态库指向的文件仍存在时，轻量校正不应改动任何指针。
+    #[test]
+    fn reconcile_leaves_valid_state_pointer_alone() {
+        let directory = std::env::temp_dir().join(format!(
+            "agents-launcher-chain-reconcile-ok-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions = directory.join("sessions");
+        let codex_home = directory.join("codex-home");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        let (thread_id, page1_path) = build_forked_fixture(&sessions);
+
+        // 状态库已指向真实存在的根页。
+        let valid_path = page1_path.to_string_lossy().to_string();
+        let db_path = codex_home.join("state_5.sqlite");
+        {
+            let connection = rusqlite::Connection::open(&db_path).expect("open state db");
+            connection
+                .execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                    [],
+                )
+                .expect("create threads table");
+            connection
+                .execute(
+                    "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                    rusqlite::params![thread_id, valid_path],
+                )
+                .expect("insert valid rollout_path");
+        }
+
+        let (corrected, unrecoverable) = reconcile_state_rollout_paths(&sessions, &codex_home);
+        assert_eq!(corrected, 0, "指针已有效时不应校正");
+        assert!(unrecoverable.is_empty());
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// 递归收集目录下所有 rollout 文件的相对路径，用于断言"会话文件未被改动"。
+    fn collect_rollout_files_under(root: &Path) -> Vec<String> {
+        let mut files = Vec::new();
+        collect_rollout_files(root, &mut files);
+        let mut names: Vec<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn repair_rejects_dangling_root() {
         let directory = std::env::temp_dir().join(format!(
@@ -1021,7 +1425,7 @@ mod tests {
             )),
             &page_lines,
         );
-        let error = repair_thread_chain(&sessions, thread_id, &directory.join("backups"))
+        let error = repair_thread_chain(&sessions, thread_id, &directory.join("backups"), None)
             .expect_err("dangling root must fail");
         assert!(error.contains("父页") || error.contains("链"), "{error}");
         let _ = fs::remove_dir_all(directory);

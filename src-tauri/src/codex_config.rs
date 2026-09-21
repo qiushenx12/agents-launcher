@@ -3743,13 +3743,21 @@ pub fn apply_codex_profile(
         .find(|profile| profile.id == request.profile_id)
         .cloned()
         .ok_or_else(|| format!("CodeX 配置方案 '{}' 不存在", request.profile_id))?;
-    // 切换配置预检：会话分页断链不会丢失数据，但重启 Codex 桌面端后读取端
-    // 只能看到断链前的内容。切换前扫描出来，引导用户先修复，避免"切换后
-    // 会话内容看起来丢失"。
+    // 切换配置预检：先做状态库 rollout_path 轻量校正（不改会话文件、无需退出
+    // 客户端），把指向已丢失分页的指针改回磁盘上的存活链尖——这正是"切换后
+    // resume 报恢复对话失败"的根因。校正后再扫描：只有真正需要合并的断链
+    // （孤立段）才弹窗引导重手术修复。
     if !request.allow_session_issues {
         if let Ok(home) = codex_home() {
             let sessions_root = home.join("sessions");
             if sessions_root.is_dir() {
+                let (corrected, _) = crate::codex_session_chain::reconcile_state_rollout_paths(
+                    &sessions_root,
+                    &home,
+                );
+                if corrected > 0 {
+                    eprintln!("[codex_config] 切换预检：已轻量校正 {corrected} 个线程的状态库 rollout_path");
+                }
                 let local_cli_version = crate::codex_session_chain::local_codex_cli_version();
                 let issues: Vec<_> = crate::codex_session_chain::scan_sessions_integrity(
                     &sessions_root,

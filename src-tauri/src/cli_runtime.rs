@@ -600,10 +600,12 @@ pub async fn repair_codex_session_chain(
         let sessions_root = codex_sessions_root(&runtime)
             .ok_or_else(|| "无法确定 CodeX 数据目录。".to_string())?;
         let backup_root = crate::codex_config::codex_session_repair_backup_root()?;
+        let codex_home = sessions_root.parent().map(|path| path.to_path_buf());
         let result = crate::codex_session_chain::repair_thread_chain(
             &sessions_root,
             &request.thread_id,
             &backup_root,
+            codex_home.as_deref(),
         )?;
         // 让下一次列表读取拿到修复后的数据。
         if let Ok(mut cache) = CODEX_THREADS_CACHE.lock() {
