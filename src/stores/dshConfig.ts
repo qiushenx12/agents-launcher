@@ -84,6 +84,16 @@ export interface DshRuntimeConfig {
   pinnedVersion?: string | null
 }
 
+/** Outcome of the version picker's read-only listing (`dsh_list_versions`). */
+export interface DshVersionList {
+  /** Every published version, newest first. */
+  versions: string[]
+  /** The pin future starts use, when one has been recorded. */
+  pinned: string | null
+  /** The registry's `latest` dist-tag; null when it could not be read. */
+  latest: string | null
+}
+
 /** Read-only outcome of 「检查更新」 (`dsh_check_update`): nothing is written. */
 export interface DshVersionCheck {
   /** The registry's current `latest`. */
@@ -151,6 +161,17 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
   const pendingRestartReason = ref<'config' | 'version' | null>(null)
   /** True while 「检查更新」/「更新版本」 is talking to the registry or writing. */
   const updatingVersion = ref(false)
+  /** The version picker dialog's visibility. */
+  const versionPickerVisible = ref(false)
+  /**
+   * The picker's loaded data. `null` while loading and after a failed load;
+   * `versionPickerError` carries the failure so the dialog can show it instead
+   * of an empty list.
+   */
+  const versionPickerList = ref<DshVersionList | null>(null)
+  /** Draft selection inside the picker; committed only on 确定. */
+  const versionPickerChoice = ref<string | null>(null)
+  const versionPickerError = ref('')
   /** The address QR dialog lives in the configuration panel. */
   const qrVisible = ref(false)
   let loadPromise: Promise<void> | null = null
@@ -374,6 +395,57 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
   }
 
   /**
+   * 「检查更新」: open the version picker and load the available versions.
+   *
+   * The dialog opens first and the listing fills in, so a slow registry reads
+   * as "loading" rather than as an unresponsive button. The current pin is
+   * preselected, which makes 确定 a no-op until the user actually picks
+   * something else.
+   */
+  async function openVersionPicker() {
+    versionPickerVisible.value = true
+    versionPickerList.value = null
+    versionPickerError.value = ''
+    versionPickerChoice.value = null
+    updatingVersion.value = true
+    actionError.value = ''
+    actionNotice.value = ''
+    try {
+      const list = await invoke<DshVersionList>('dsh_list_versions')
+      versionPickerList.value = list
+      versionPickerChoice.value = list.pinned
+    } catch (error) {
+      versionPickerError.value = `获取 dsh 版本列表失败：${String(error)}`
+    } finally {
+      updatingVersion.value = false
+    }
+  }
+
+  function closeVersionPicker() {
+    versionPickerVisible.value = false
+    versionPickerList.value = null
+    versionPickerChoice.value = null
+    versionPickerError.value = ''
+  }
+
+  /** Select a row in the picker. A second click on the same row clears it. */
+  function chooseVersion(version: string) {
+    versionPickerChoice.value = versionPickerChoice.value === version ? null : version
+  }
+
+  /**
+   * 确定: pin the chosen version. Closing is the caller's decision so the
+   * dialog can stay open when the write fails.
+   */
+  async function confirmVersionChoice(): Promise<boolean> {
+    const choice = versionPickerChoice.value
+    if (!choice) return false
+    const applied = await applyVersion(choice)
+    if (applied) closeVersionPicker()
+    return applied
+  }
+
+  /**
    * 「检查更新」: ask the registry for the latest dsh release and compare it
    * with the recorded pin. Read-only — applying the update is `applyVersion`,
    * called only after the panel's confirmation dialog is accepted.
@@ -567,6 +639,10 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     pendingRestart,
     pendingRestartReason,
     updatingVersion,
+    versionPickerVisible,
+    versionPickerList,
+    versionPickerChoice,
+    versionPickerError,
     qrVisible,
     isDirty,
     isRunning,
@@ -586,6 +662,10 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     closeQr,
     checkUpdate,
     applyVersion,
+    openVersionPicker,
+    closeVersionPicker,
+    chooseVersion,
+    confirmVersionChoice,
     start,
     startWith,
     stop,

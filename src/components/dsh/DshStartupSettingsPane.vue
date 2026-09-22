@@ -58,10 +58,10 @@
     </div>
 
     <!--
-      固定版本：每次启动成功后后端会记录当时实际运行的版本，下次启动用
-      npx 按该版本启动（命中本地缓存，不再每次解析 latest）。「检查更新」
-      是唯一会重新解析 latest 的入口：先只读查询，发现新版本时弹窗确认，
-      确认后才固定；运行中的服务不会被隐式重启，只标注重启后生效。
+      固定版本：每次启动成功后后端会记录当时实际运行的版本，下次启动按该版本
+      直接用本地缓存离线启动，不再解析 latest、也不碰网络。「检查更新」是唯
+      一联网入口，点开版本列表后由用户挑选并确认；运行中的服务不会被隐式重启，
+      只标注重启后生效。
     -->
     <div class="field-row">
       <label class="field-label">版本</label>
@@ -71,9 +71,9 @@
           class="btn btn-secondary"
           type="button"
           :disabled="store.updatingVersion || store.isBusy"
-          @click="checkForUpdate"
+          @click="store.openVersionPicker()"
         >
-          {{ store.updatingVersion ? '正在检查更新…' : '检查更新' }}
+          {{ store.updatingVersion ? '正在获取版本…' : '检查更新' }}
         </button>
       </div>
     </div>
@@ -116,9 +116,9 @@
         <strong>{{ statusLabel }}</strong>
         <span v-if="store.status?.version" class="status-block__version">v{{ store.status.version }}</span>
       </div>
-      <p v-if="statusMessage" class="status-block__message">{{ statusMessage }}</p>
+      <p v-if="showStatusMessage" class="status-block__message">{{ statusMessage }}</p>
       <pre v-if="store.status?.detail" class="status-block__detail">{{ store.status.detail }}</pre>
-      <div v-if="store.isBusy && store.progress" class="status-block__progress">
+      <div v-if="showProgress" class="status-block__progress">
         {{ progressText }}
       </div>
     </div>
@@ -247,6 +247,18 @@
         </section>
       </div>
     </Teleport>
+
+    <!-- 版本选择列表：同样走 Teleport 浮层，避免被面板的滚动容器裁切 -->
+    <Teleport to="body">
+      <div
+        v-if="store.versionPickerVisible"
+        class="dsh-version-overlay"
+        role="presentation"
+        @click.self="store.closeVersionPicker()"
+      >
+        <DshVersionPickerDialog />
+      </div>
+    </Teleport>
   </section>
 </template>
 
@@ -263,6 +275,7 @@ import {
 import { describeCopyTarget, describeInstallProgress, formatUptimeZh, type DshAddressRow } from '@/utils/dshRuntime'
 import { useConfigWorkspaceStore } from '@/stores/configWorkspace'
 import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
+import DshVersionPickerDialog from './DshVersionPickerDialog.vue'
 import { useDshLink } from './useDshLink'
 import { describePortCleanupHint, shouldOfferPortCleanup } from './portCleanup'
 
@@ -511,32 +524,22 @@ const pendingRestartText = computed(() => (
 ))
 
 /**
- * 「检查更新」的完整流程：先只读查询注册表，已是最新时只提示不弹窗；发现
- * 新版本时弹窗确认（写清会从哪个版本换到哪个版本、运行中的服务不受影响、
- * 重启后生效），确认后才固定。弹窗里展示的就是即将固定的版本，后端按确认
- * 值写入，不会在确认与写入之间重新解析 latest。
- */
-async function checkForUpdate() {
-  const report = await store.checkUpdate()
-  if (!report || !report.updateAvailable) return
-  const pinned = report.pinned ? `v${report.pinned}` : '未固定'
-  const accepted = await confirm(
-    `npm 注册表最新版本为 v${report.latest}，当前固定版本为 ${pinned}。\n\n`
-    + (store.isRunning
-      ? '确认后将固定到新版本；正在运行的服务不受影响，重启 dsh 服务后生效。'
-      : '确认后将固定到新版本，下次启动时使用。')
-    + '是否更新？',
-    { title: '更新 dsh 版本', kind: 'info' },
-  )
-  if (!accepted) return
-  await store.applyVersion(report.latest)
-}
-
-/**
  * 冷缓存与缓存命中的文案必须分开：命中时字节几乎不增长，显示 0 MB/s 会误导。
  * 采样到的是 tarball 落盘量，所以不承诺"精确网速"。
  */
 const progressText = computed(() => describeInstallProgress(store.progress))
+
+/**
+ * 进度行是否在场 —— 消息行要不要让位就看它。
+ *
+ * 进度行自己已经是一整句「正在准备 dsh（首次运行需要下载）· 已下载 …」，而
+ * 「准备中」阶段的消息只是这半句话的重复，两行一起出现就是三段式里的废话。
+ * 进度还没到的那个空窗期仍然显示消息行，否则那块就只剩标题、没有任何反馈。
+ */
+const showProgress = computed(() => store.isBusy && !!store.progress)
+
+/** 消息行只在进度行不在场时出现（失败/已运行等阶段没有进度行，消息照常显示）。 */
+const showStatusMessage = computed(() => !!statusMessage.value && !showProgress.value)
 
 onMounted(() => {
   // 挂载时必须主动探测一次：否则 portStatus 保持 null，占用提示与「一键清理占用」
@@ -687,7 +690,7 @@ function refreshStatus() {
   margin: 4px 0 12px;
   padding: 10px 12px;
   border: 1px solid var(--separator);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   background: var(--tab-bg);
 }
 
@@ -772,7 +775,7 @@ function refreshStatus() {
   margin: 0 0 10px;
   padding: 10px 12px;
   border: 1px solid var(--warning, #b26a00);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   background: color-mix(in srgb, var(--warning, #b26a00) 8%, transparent);
 }
 
@@ -794,7 +797,7 @@ function refreshStatus() {
   margin-top: 10px;
   padding: 10px 12px;
   border: 1px solid var(--separator);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   background: var(--tab-bg);
 }
 
@@ -899,11 +902,22 @@ function refreshStatus() {
   background: rgba(0, 0, 0, 0.45);
 }
 
+/* 版本列表浮层：与二维码同样的全屏遮罩，卡片内容由子组件负责。 */
+.dsh-version-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
 .dsh-qr-card {
   width: min(420px, calc(100vw - 40px));
   padding: 16px 18px 18px;
   border: 1px solid var(--separator);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   background: var(--card-bg, var(--tab-bg));
   text-align: center;
 }

@@ -838,3 +838,46 @@ test('the dsh panel replaces 启动前检测 with a distinctively coloured jump 
   // 跳转按钮独占一行，靠右；设置入口已经搬到侧边栏页脚，这里不再有它。
   assert.equal(declarations(css, '.runtime-entry').get('justify-content'), 'flex-end')
 })
+
+/**
+ * 状态块的信息量上限是两行，不是三行。
+ *
+ * 「准备中」阶段的进度行自己就是一整句「正在准备 dsh（首次运行需要下载）· 已下载
+ * …」，而后端那句 message 只是这半句话的重复；两者同时在场就是
+ * 「正在准备 dsh。」+「正在准备 dsh（…）」，三行里第二行纯属废话。
+ *
+ * 做法是消息行让位给进度行，而不是把消息删掉 —— 失败、已运行、以及进度事件还没
+ * 到达的那个空窗期都没有进度行，那些时候消息行是那块区域唯一的说明。
+ */
+test('the status block never stacks the progress line under a duplicate message', () => {
+  const markup = readFileSync(resolve(repoRoot, STARTUP), 'utf8')
+
+  // 消息行不再无条件渲染；进度行与它共用同一个「进度在场」判定，避免两处条件漂移。
+  assert.match(
+    markup,
+    /v-if="showStatusMessage"/,
+    'the message line must be gated, not rendered on every status',
+  )
+  assert.doesNotMatch(markup, /v-if="statusMessage"/)
+  assert.match(markup, /v-if="showProgress"/)
+  assert.doesNotMatch(markup, /v-if="store\.isBusy && store\.progress"/)
+
+  // 互斥关系本身：消息行 = 有消息 && 进度不在场。
+  assert.match(
+    markup,
+    /const showStatusMessage = computed\(\(\) => !!statusMessage\.value && !showProgress\.value\)/,
+    'the message line must stand down exactly when the progress line is up',
+  )
+  assert.match(
+    markup,
+    /const showProgress = computed\(\(\) => store\.isBusy && !!store\.progress\)/,
+  )
+
+  // 顺序不变：消息、细节、进度，进度行仍在最后一行。
+  const block = /<div class="status-block">([\s\S]*?)<\/div>\s*\n\s*<div class="action-row">/.exec(markup)
+  assert.ok(block, 'missing the status block')
+  assert.ok(
+    block[1].indexOf('showStatusMessage') < block[1].indexOf('showProgress'),
+    'the progress line must stay the last line of the block',
+  )
+})
