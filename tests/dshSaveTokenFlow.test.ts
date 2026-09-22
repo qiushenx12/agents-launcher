@@ -25,9 +25,14 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { mock } from 'node:test'
 import { registerHooks } from 'node:module'
+import { dirname, resolve as resolvePath } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 // `@/` 是 vite 的 src 别名，node 测试里手动解析。
-const SRC = 'file:///D:/Project/agents-launcher/src/'
+// 路径从本文件位置推导：写死绝对路径会在仓库换目录后静默指向另一个 checkout
+// （曾经是 `file:///D:/Project/agents-launcher/src/`），报出来的是
+// ERR_MODULE_NOT_FOUND，看起来像源码缺文件。
+const SRC = `${pathToFileURL(resolvePath(dirname(fileURLToPath(import.meta.url)), '../src')).href}/`
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier.startsWith('@/')) {
@@ -195,8 +200,8 @@ function makeBackend() {
 // 只有一个 mock 实例：store 模块只会导入一次（模块缓存），live binding 指向这里，
 // 每个场景通过 current 切换后端状态。
 let current: ReturnType<typeof makeBackend> | null = null
-mock.module('@tauri-apps/api/core', {
-  exports: {
+mock.module("@tauri-apps/api/core", {
+  namedExports: {
     invoke: (command: string, args?: Record<string, unknown>) => {
       if (!current) throw new Error('current 后端未设置')
       return current.invoke(command, args)
