@@ -22,6 +22,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -75,9 +76,28 @@ const DSH_NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 
 /// Package spec handed to npx. A recorded version pins the start to exactly
-/// that release (`@deepseek-ai/dsh@0.1.0`), which npx serves from its cache
-/// without re-resolving `latest`; without a record the bare spec keeps the
-/// previous "resolve latest" behaviour for the first-ever start.
+/// that release, which npx serves from its cache without re-resolving `latest`;
+/// without a record the bare spec keeps the previous "resolve latest" behaviour
+/// for the first-ever start.
+///
+/// The pin is an **exact** version, and that is load-bearing rather than
+/// cosmetic. dsh's transient dependencies are released in waves that do not
+/// land atomically, and every intra-release range in the closure is a caret
+/// range over a prerelease (`^0.1.5-rc.1`). Caret ranges treat the whole
+/// `0.1.5` prerelease ladder as one compatible series, so `^0.1.5-rc.1`
+/// happily resolves to `rc.2` or `rc.3`. Asking npx for
+/// `@deepseek-ai/dsh@0.1.5-rc.1` therefore does **not** pin the closure: npm
+/// rewrites `dsh-base@^0.1.5-rc.1` to the newest matching prerelease, and the
+/// whole tree drifts up to the newest wave. When that newest wave is the one
+/// whose siblings have not been published yet, the install fails with ETARGET
+/// on a package the user never asked for — the observed failure where pinning
+/// `rc.1` still died on `dsh-client-ui-sidebar-documentpreview@^0.1.5-rc.3`.
+///
+/// npm has no global "exact" switch for a dependency subtree, so the launcher
+/// pins what it can control: the top-level spec stays exact (it always was),
+/// and the resolved closure is *verified* after the fact instead of being
+/// trusted — see [`closure_drifted_from_pin`]. A drifted closure is reported as
+/// the same upstream publishing gap rather than being silently accepted.
 fn dsh_package_spec(version: Option<&str>) -> String {
     match version {
         Some(version) => format!("{DSH_PACKAGE}@{version}"),
@@ -102,6 +122,168 @@ fn is_valid_pinned_version(version: &str) -> bool {
 fn start_pinned_version() -> Option<String> {
     crate::persistent_state::load_dsh_pinned_version()
         .filter(|version| is_valid_pinned_version(version))
+}
+
+/// Whether a failed install was caused by the pinned release's closure
+/// resolving *past* the pin, and if so which package npm named.
+///
+/// [`is_unresolvable_version_failure`] says npm could not satisfy *some*
+/// range. This narrows it to the case that matters for a pinned start: the
+/// range npm failed on belongs to a *newer* wave than the one requested. The
+/// `^0.1.5-rc.3` in the message versus a `0.1.5-rc.1` pin is exactly that
+/// signature, and it is worth separating because the remedy differs — a pin
+/// that cannot hold its closure is best answered by choosing a version whose
+/// wave is complete, not merely by waiting.
+///
+/// Returns the offending version when the pin's prerelease ladder was walked
+/// forward, or `None` when the message carries no version to compare — in
+/// which case the generic upstream-gap wording stays accurate.
+fn closure_drifted_from_pin(detail: &str, pinned: Option<&str>) -> Option<String> {
+    let pinned = pinned?;
+    let mut found = None;
+    for line in detail.lines() {
+        // The npm error names the range it wanted: `…for <pkg>@<range>.`
+        let Some((_, tail)) = line.split_once("for ") else {
+            continue;
+        };
+        let range = tail.trim().trim_end_matches('.').rsplit_once('@')?.1;
+        let digits = range.trim_start_matches(['^', '~', '>', '=', '<', ' ']);
+        // A drifted closure mentions a version with the same release core but a
+        // later prerelease than the pin (`0.1.5-rc.3` vs `0.1.5-rc.1`).
+        if digits == pinned || !digits.starts_with(prerelease_core(pinned)) {
+            continue;
+        }
+        found = Some(digits.to_string());
+    }
+    found
+}
+
+/// The `major.minor.patch` prefix of a prerelease version, used to tell
+/// "another prerelease of the same wave" from an unrelated package version.
+fn prerelease_core(version: &str) -> &str {
+    match version.split_once('-') {
+        Some((core, _)) => core,
+        None => version,
+    }
+}
+
+/// Whether a key of npm's `time` object is a version rather than one of the
+/// metadata keys npm mixes in (`created`, `modified`).
+///
+/// The charset check alone is not enough: `created` is all-alphanumeric and
+/// would pass [`is_valid_pinned_version`]. A version key always starts with a
+/// digit and carries a dot.
+fn is_version_key(key: &str) -> bool {
+    key.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && key.contains('.')
+        && is_valid_pinned_version(key)
+}
+
+/// When each published version of the dsh package landed, oldest first.
+///
+/// Same read-only shape as [`query_available_versions`] (registry metadata, no
+/// download). An entry whose timestamp will not parse is dropped instead of
+/// failing the read: a missing entry only makes the cutoff less precise, while
+/// failing here would silently disable closure locking altogether.
+fn query_release_times(npm: &Path) -> Result<Vec<(String, DateTime<Utc>)>, String> {
+    let output = hidden_command(npm)
+        .args(["view", DSH_PACKAGE, "time", "--json"])
+        .output()
+        .map_err(|error| format!("无法运行 npm: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail: Vec<&str> = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(3)
+            .collect();
+        return Err(format!(
+            "查询 dsh 发布时间表失败（{}）。",
+            if detail.is_empty() {
+                format!("npm 退出码 {}", output.status.code().unwrap_or(-1))
+            } else {
+                detail.join("；")
+            }
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|_| "npm 返回的 dsh 发布时间表无法解析。".to_string())?;
+    let Some(object) = parsed.as_object() else {
+        return Err("npm 返回的 dsh 发布时间表格式异常。".to_string());
+    };
+    let mut times: Vec<(String, DateTime<Utc>)> = object
+        .iter()
+        .filter(|entry| is_version_key(entry.0))
+        .filter_map(|(version, value)| {
+            let time = DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
+            Some((version.clone(), time.with_timezone(&Utc)))
+        })
+        .collect();
+    times.sort_by_key(|entry| entry.1);
+    if times.is_empty() {
+        return Err("npm 返回的 dsh 发布时间表为空。".to_string());
+    }
+    Ok(times)
+}
+
+/// The instant npm should be told to resolve *no later than*, so a prerelease
+/// pin keeps the closure belonging to its own release wave.
+///
+/// The value is the **midpoint** between the pinned version's publish time and
+/// the next version in the same prerelease ladder. Midpoint rather than "next
+/// minus one second", because the measured shape of a dsh release makes the
+/// edge rule unsafe:
+///
+/// * a wave lands package by package over roughly 16 minutes (measured across
+///   `0.1.5-rc.2` and `0.1.5-rc.3`), and
+/// * the top-level `@deepseek-ai/dsh` package lands **last** in its wave
+///   (`rc.3`: siblings from 05:39, the top package at 05:55).
+///
+/// So `next_time - 1s` would still admit every sibling of the next wave
+/// published before the top package — nearly all of them, and exactly the
+/// `^0.1.5-rc.3` ranges that break an `rc.1` pin. The midpoint maximises the
+/// distance from *both* waves, the right hedge when neither wave's extent is
+/// knowable from the top package's timeline alone.
+///
+/// `None` when the pin has no later sibling in its ladder: the newest wave
+/// cannot be isolated because there is nothing to cut it off from. That is the
+/// one case `--before` cannot help with, and the caller starts normally.
+fn release_cutoff(times: &[(String, DateTime<Utc>)], pinned: &str) -> Option<String> {
+    let ladder = prerelease_core(pinned);
+    let pin_time = times
+        .iter()
+        .find(|entry| entry.0.as_str() == pinned)
+        .map(|entry| entry.1)?;
+    // The earliest later publish wins, not the next version number: waves have
+    // landed out of order before, and the point is to clear the whole wave.
+    let next_time = times
+        .iter()
+        .map(|entry| (entry.0.as_str(), entry.1))
+        .filter(|(version, time)| prerelease_core(version) == ladder && *time > pin_time)
+        .map(|(_, time)| time)
+        .min()?;
+    let midpoint = pin_time + (next_time - pin_time) / 2;
+    Some(midpoint.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+/// The `--before` value for a start that is about to resolve against the
+/// registry, or `None` when there is nothing to lock.
+///
+/// Best-effort by construction: a pinned start must not fail because the
+/// timeline could not be read, and every failure here degrades to exactly the
+/// earlier behaviour — resolve normally, then report drift if it happens.
+fn resolve_start_cutoff(version: Option<&str>) -> Option<String> {
+    let version = version?;
+    let npm = locate_npm()?;
+    match query_release_times(&npm) {
+        Ok(times) => release_cutoff(&times, version),
+        Err(error) => {
+            eprintln!("未能获取 dsh 发布时间表，本次不锁定依赖闭包：{error}");
+            None
+        }
+    }
 }
 
 /// Persist the version that just started, unless the stored pin moved while
@@ -187,7 +369,7 @@ pub struct DshRuntimeStatus {
     pub uptime_secs: Option<u64>,
     /// Short machine-readable code for the failed phase:
     /// `port_in_use` / `npx_missing` / `spawn_failed` / `ready_timeout` /
-    /// `exited` / `stop_failed`.
+    /// `exited` / `stop_failed` / `version_unavailable`.
     pub issue: Option<String>,
     /// Sanitized tail of stderr, populated for failed starts only.
     pub detail: Option<String>,
@@ -326,6 +508,29 @@ pub struct DshVersionUpdate {
     pub changed: bool,
     /// User-facing Chinese summary, rendered verbatim by the panel.
     pub message: String,
+}
+
+/// The version picker's data: every version the registry offers, plus which one
+/// is currently pinned so the dialog can mark that row.
+///
+/// This replaces the old "is there a newer `latest`?" report. The question a
+/// user actually has is "which version should I run", and the answer is not
+/// always the newest: when a release wave is published out of order, the newest
+/// version is exactly the one that cannot install. Showing the full list lets
+/// them step back to a version whose closure is complete, which the
+/// `latest`-only report could never express.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshVersionList {
+    /// Every published version, newest first.
+    pub versions: Vec<String>,
+    /// The pin future starts use, when one has been recorded. `None` before the
+    /// first recorded start, or when the stored value failed validation.
+    pub pinned: Option<String>,
+    /// The registry's `latest` dist-tag, when it could be read. Used to label
+    /// the newest row; a failure here does not fail the whole listing because
+    /// the version list itself is still usable.
+    pub latest: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -855,8 +1060,43 @@ fn configure_process_tree(_command: &mut Command) {
 /// launcher parses its own flags and hands *everything after the first unknown
 /// token* to the app, so `--patch` after `--port` would reach the web app and
 /// be rejected with `unknown option '--patch'`.
-fn dsh_arguments(overlay: &Path, port: u16, version: Option<&str>) -> Vec<String> {
-    vec![
+/// Arguments for `npx`. Launcher flags must precede app arguments: dsh's
+/// launcher parses its own flags and hands *everything after the first unknown
+/// token* to the app, so `--patch` after `--port` would reach the web app and
+/// be rejected with `unknown option '--patch'`.
+///
+/// `offline` adds `--offline`, which tells npm to satisfy the spec from its
+/// cache alone (`cache mode: only-if-cached`) instead of re-resolving the
+/// dependency closure against the registry. This is the difference between a
+/// start that can run with no network at all and one that fails whenever the
+/// registry's view of the pinned release is incomplete.
+///
+/// `before` adds `--before=<instant>`, npm's "only consider versions published
+/// on or before this moment" switch. It is the answer to the one hole an exact
+/// pin cannot cover: pinning `@deepseek-ai/dsh@0.1.5-rc.1` fixes the top-level
+/// package but not the closure, because every intra-release range in that
+/// closure is a caret range over a prerelease (`^0.1.5-rc.1`), and npm reads
+/// those as "any rc of 0.1.5, newest wins" — see [`release_cutoff`] for how the
+/// instant is chosen.
+///
+/// It is deliberately **skipped when `offline` is set**. The switch only
+/// changes what npm is allowed to *resolve*; an offline attempt reads the
+/// cached entry instead of resolving at all, so carrying it there would be
+/// noise. Passing it on the networked attempts is what makes it effective.
+fn dsh_arguments(
+    overlay: &Path,
+    port: u16,
+    version: Option<&str>,
+    offline: bool,
+    before: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(12);
+    if offline {
+        args.push("--offline".to_string());
+    } else if let Some(cutoff) = before {
+        args.push(format!("--before={cutoff}"));
+    }
+    args.extend([
         "--yes".to_string(),
         dsh_package_spec(version),
         "web".to_string(),
@@ -865,7 +1105,8 @@ fn dsh_arguments(overlay: &Path, port: u16, version: Option<&str>) -> Vec<String
         "--port".to_string(),
         port.to_string(),
         "--no-open".to_string(),
-    ]
+    ]);
+    args
 }
 
 // ---------------------------------------------------------------------------
@@ -1601,10 +1842,20 @@ fn spawn_and_wait(
     // attempt *is* a fresh download and must get the sliding download window,
     // not the 30s cache-hit window that fired the first timeout.
     fresh_download: bool,
+    // `true` for the offline-first attempt: npm is told to use its cache only.
+    // A pinned start has everything it needs on disk already, so this is the
+    // normal path; it only falls back to a networked attempt when the cache
+    // genuinely cannot satisfy the spec.
+    offline: bool,
+    // The `--before` instant that keeps a networked resolution inside the
+    // pinned release's own wave, from [`resolve_start_cutoff`]. `None` for an
+    // offline attempt (where it would be meaningless) and for the newest wave
+    // (where there is nothing to cut it off from).
+    before: Option<&str>,
 ) -> Result<SpawnOutcome, SpawnFailure> {
     let mut command = hidden_command(npx);
     command
-        .args(dsh_arguments(overlay, port, version))
+        .args(dsh_arguments(overlay, port, version, offline, before))
         // Route only this download through the fast mirror; the user's global
         // npm config is untouched. See `DSH_NPM_REGISTRY`.
         .env("NPM_CONFIG_REGISTRY", DSH_NPM_REGISTRY)
@@ -1821,6 +2072,101 @@ fn corrupt_npx_cache_dir(detail: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether this stderr is npm refusing an offline start because its cache
+/// cannot satisfy the spec — `ENOTCACHED`.
+///
+/// ```text
+/// npm error code ENOTCACHED
+/// npm error request to https://registry.npmjs.org/left-pad failed: cache mode is 'only-if-cached' but no cached response is available.
+/// ```
+///
+/// Used for **logging only**, not as the gate on the networked retry. The gate
+/// is deliberately broader — see [`offline_failure_justifies_download`] — and
+/// this narrower check exists so the log line can say which of the two reasons
+/// sent the launcher back online.
+fn is_offline_cache_miss(detail: &str) -> bool {
+    detail.contains("ENOTCACHED") || detail.contains("only-if-cached")
+}
+
+/// Whether a failed *offline* attempt should be retried online.
+///
+/// Offline resolution and online resolution fail in ways that are **not**
+/// distinguishable from each other by their error text, which is the subtlety
+/// this whole fallback turns on. Measured behaviour, all with `--offline`:
+///
+/// | cache state | error |
+/// |---|---|
+/// | package absent entirely | `ENOTCACHED` |
+/// | metadata cached, tarball absent | `ENOTCACHED` |
+/// | metadata cached, closure unsatisfiable | `ETARGET` |
+/// | entry present but damaged | `ENOENT` |
+///
+/// The third row is the problem: a *partially* cached closure reports the same
+/// `ETARGET` an upstream publishing gap would, because npm resolved against
+/// cached metadata and found the same missing sibling it would have found
+/// online. So `ETARGET` offline means "this could not be resolved from what is
+/// on disk" — which is precisely the case that must go online, since the
+/// networked resolution may well succeed (a newer sibling may have landed since
+/// the metadata was cached).
+///
+/// That makes the honest rule "retry whenever the offline attempt failed for
+/// any reason that a download could fix", and the only failures it excludes are
+/// the ones a download provably cannot fix:
+///
+/// - `spawn_failed`: npx could not even be launched.
+/// - `ready_timeout`: the process ran but never became ready; the cache served
+///   it fine, so the problem is elsewhere (and the timeout path already has its
+///   own self-repair).
+///
+/// Everything else — every early exit with npm stderr — earns exactly one
+/// networked attempt. The cost of being wrong in that direction is a slower
+/// start; the cost of being wrong in the other is a start that could have
+/// worked refusing to.
+fn offline_failure_justifies_download(failure: &SpawnFailure) -> bool {
+    match spawn_failure_issue(failure) {
+        SpawnIssue::ReadyTimeout => false,
+        SpawnIssue::Other => {
+            failure.0 != "spawn_failed" && failure.2.as_deref().is_some_and(|d| !d.trim().is_empty())
+        }
+    }
+}
+
+/// Whether this stderr is npm's "a required version does not exist" failure —
+/// `ETARGET` / `notarget`.
+///
+/// ```text
+/// npm error code ETARGET
+/// npm error notarget No matching version found for @deepseek-ai/dsh-session-projection@^0.1.5-rc.3.
+/// ```
+///
+/// This is *not* a corrupt cache and must never be repaired by deleting one.
+/// npm resolves the whole dependency closure before it touches the `_npx`
+/// entry, so the failure happens before anything is installed: the entry is
+/// untouched and purging it would only throw away a good download.
+///
+/// The cause is upstream. dsh's transient dependencies are published in waves
+/// that do not land atomically, and its intra-release ranges are caret ranges
+/// over a prerelease (`^0.1.5-rc.1`). A caret range treats the whole `0.1.5`
+/// prerelease ladder as one compatible series, so it resolves to the newest
+/// `0.1.5-rc.*` — which is why a start pinned at `rc.1` still asks npm for the
+/// `rc.3` closure. When a wave has published a parent before one of its
+/// children (`dsh-web-app@rc.3` requiring
+/// `dsh-client-ui-sidebar-documentpreview@^0.1.5-rc.3` before that package's
+/// rc.3 exists) the closure is unsatisfiable.
+///
+/// Whether it heals by waiting depends on which side of the gap you are on,
+/// which is exactly what [`closure_drifted_from_pin`] separates: an unpinned
+/// `latest` start heals as soon as the missing sibling lands, while a pin whose
+/// ladder is walked forward is deterministic and keeps failing until the pin
+/// moves. Detection here stays deliberately broad; the caller narrows it.
+///
+/// Detected from the stderr **without** a filesystem target: unlike the ENOENT
+/// path there is no directory to clean, and returning `None` here keeps the
+/// repair chain from inventing one.
+fn is_unresolvable_version_failure(detail: &str) -> bool {
+    detail.contains("ETARGET") || detail.contains("notarget")
+}
+
 /// Remove one corrupt npx cache entry so the next start reinstalls it.
 ///
 /// The stderr text is the only evidence pointing at `dir`, so two facts are
@@ -1990,10 +2336,33 @@ fn purge_incomplete_npx_entry(dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("清理不完整的 npx 缓存条目（{}）失败：{error}", dir.display()))
 }
 
-/// One spawn attempt plus a single self-heal retry for the corrupt-npx-cache
-/// failure. Clearing the broken entry and starting over is exactly what a user
-/// would do by hand; the retry gets exactly one chance so a persistent failure
-/// still surfaces instead of looping.
+/// Start dsh, preferring the local cache and only touching the network when the
+/// cache cannot serve the request.
+///
+/// The order of attempts is the whole point, so it is worth stating plainly:
+///
+/// 1. **Offline first.** A pinned start already has its closure on disk, and
+///    `--offline` makes npm use exactly that instead of re-resolving the
+///    dependency tree against the registry. This is what makes a normal start
+///    immune to registry problems: a pinned release whose siblings are still
+///    being published upstream simply never comes up, because nothing asks.
+/// 2. **Networked whenever the cache cannot serve the spec.** The gate is
+///    deliberately broad — any early exit carrying npm stderr earns one
+///    download, because offline and online produce *identical* error text for
+///    a partially cached closure. See [`offline_failure_justifies_download`].
+/// 3. **Self-repair.** A cache hit that never becomes ready, or an npm report
+///    naming a damaged entry, gets the entry purged and one clean retry.
+/// 4. **Closure locking.** Steps 2 and 3 both resolve against the registry, so
+///    both ask [`resolve_start_cutoff`] for the `--before` instant that keeps
+///    the resolution inside the pinned version's own release wave. Without it,
+///    `^0.1.5-rc.1` is free to resolve up to a partially published `rc.3` —
+///    the failure this whole chain exists to survive. The lookup is
+///    best-effort: if it cannot be made, the attempt proceeds unlocked.
+///
+/// The first attempt is offline only when a version is pinned. Without a pin
+/// the spec is bare `latest`, which by definition cannot be resolved from
+/// cache — asking offline would fail every time, so an unpinned start goes
+/// straight to the networked path.
 fn spawn_with_cache_repair(
     app: &AppHandle,
     npx: &Path,
@@ -2002,13 +2371,85 @@ fn spawn_with_cache_repair(
     version: Option<&str>,
 ) -> Result<SpawnOutcome, SpawnFailure> {
     let attempt_started_at = Instant::now();
-    let first = match spawn_and_wait(app, npx, overlay, port, version, false) {
+
+    // Step 1: offline, for pinned starts. An unpinned start has no cache to
+    // consult — `latest` is a registry lookup by definition — so it skips
+    // straight to the download. No cutoff is passed: this attempt reads the
+    // cached entry rather than resolving, so `--before` would have no effect.
+    let first = match spawn_and_wait(app, npx, overlay, port, version, false, version.is_some(), None)
+    {
         Ok(outcome) => return Ok(outcome),
         Err(failure) => failure,
     };
 
+    // Step 2: the cache could not serve it, so go online. The *reason* is only
+    // used for the log line — the decision itself is deliberately broad, since
+    // offline and online produce identical error text for a partially cached
+    // closure. See `offline_failure_justifies_download`.
+    if offline_failure_justifies_download(&first) {
+        let reason = if first.2.as_deref().is_some_and(is_offline_cache_miss) {
+            "本地缓存中没有该版本"
+        } else {
+            "本地缓存无法解析该版本的依赖"
+        };
+        eprintln!(
+            "{reason}（dsh{}），改为联网获取。",
+            version.map(|v| format!("@{v}")).unwrap_or_default()
+        );
+        let before = resolve_start_cutoff(version);
+        if let Some(cutoff) = before.as_deref() {
+            eprintln!("为避免依赖被解析到更新的发布批次，本次安装限定在 {cutoff} 之前发布的版本。");
+        }
+        return spawn_and_wait(
+            app,
+            npx,
+            overlay,
+            port,
+            version,
+            true,
+            false,
+            before.as_deref(),
+        );
+    }
+
     // Fast path, keyed off npm's own report: the entry is corrupt and npm said
     // exactly which one. Works for the early-exit failure shape.
+    //
+    // The ETARGET check comes *first* on purpose. A version-resolution failure
+    // also exits early with npm stderr, but it is not corruption and its
+    // stderr carries no `_npx` path at all — so it would fall through the
+    // ENOENT parser anyway. Checking it explicitly keeps the two apart at the
+    // point where the decision is made, and gives the user the one piece of
+    // information that actually helps: this is an upstream publishing gap, and
+    // retrying later is the fix.
+    if let Some(detail) = first.2.as_deref() {
+        if is_unresolvable_version_failure(detail) {
+            // Two different situations reach this point, and the user needs to
+            // know which one they are in — "wait a bit" and "pick another
+            // version" are not interchangeable advice.
+            let message = match closure_drifted_from_pin(detail, version) {
+                // The pin could not hold its closure: npm walked the
+                // prerelease ladder past `version` and landed on a wave with
+                // unpublished siblings. Waiting will not help while the pin
+                // stays where it is, because the resolution is deterministic —
+                // the same spec resolves the same way every time.
+                Some(drifted) => format!(
+                    "dsh 依赖解析越过了你固定的版本：固定 v{pinned}，但它的依赖范围\
+                     （^ 前缀）被 npm 解析到了 v{drifted}，而 v{drifted} 这一批配套包还没发布完。\
+                     重试不会有变化，请在「启动设置」里改用一个配套包已发布完整的版本。",
+                    pinned = version.unwrap_or(""),
+                    drifted = drifted
+                ),
+                // No pin, or the message named nothing comparable: the plain
+                // upstream-gap wording is the accurate one.
+                None => "dsh 所需的某个依赖版本在注册表上尚不存在（npm ETARGET）。这是 dsh \
+                         官方发布不同步导致的——本次要装的版本已发布，但它依赖的配套包还没跟上。\
+                         无需改动配置，稍后重试即可；也可在「启动设置」里改用其它版本。"
+                    .to_string(),
+            };
+            return Err(("version_unavailable".to_string(), message, first.2));
+        }
+    }
     if let Some(cache_dir) = first.2.as_deref().and_then(corrupt_npx_cache_dir) {
         if let Err(error) = purge_corrupt_npx_cache(&cache_dir) {
             eprintln!("dsh 启动失败，且无法自动修复 npx 缓存：{error}");
@@ -2022,17 +2463,28 @@ fn spawn_with_cache_repair(
             "检测到损坏的 npx 缓存（{}），已自动清理并重新尝试启动 dsh。",
             cache_dir.display()
         );
-        // The entry was just deleted, so the retry downloads from scratch: it
-        // must not inherit the cache-hit window that fired this timeout.
-        return spawn_and_wait(app, npx, overlay, port, version, true).map_err(
-            |(issue, message, detail)| {
-                (
-                    issue,
-                    format!("{message}（已自动清理损坏的 npx 缓存并重试一次。）"),
-                    detail,
-                )
-            },
-        );
+        // The entry was just deleted, so the retry must download: it is a
+        // networked attempt, and it must not inherit the cache-hit window that
+        // fired this timeout. Being networked, it is also one of the two
+        // attempts that carry the closure cutoff.
+        let before = resolve_start_cutoff(version);
+        return spawn_and_wait(
+            app,
+            npx,
+            overlay,
+            port,
+            version,
+            true,
+            false,
+            before.as_deref(),
+        )
+        .map_err(|(issue, message, detail)| {
+            (
+                issue,
+                format!("{message}（已自动清理损坏的 npx 缓存并重试一次。）"),
+                detail,
+            )
+        });
     }
 
     // Slow path: a readiness *timeout* produces no npm error to parse — the
@@ -2046,16 +2498,25 @@ fn spawn_with_cache_repair(
             if purge_suspect_npx_cache_entries(&cache_dir, attempt_started_at) {
                 // Same reasoning as the fast path: the retry is a fresh
                 // download, so give it the download window, not the cache-hit
-                // window that just fired.
-                return spawn_and_wait(app, npx, overlay, port, version, true).map_err(
-                    |(issue, message, detail)| {
-                        (
-                            issue,
-                            format!("{message}（已自动清理疑似中断的 npx 缓存并重试一次。）"),
-                            detail,
-                        )
-                    },
-                );
+                // window that just fired — and, being networked, the cutoff.
+                let before = resolve_start_cutoff(version);
+                return spawn_and_wait(
+                    app,
+                    npx,
+                    overlay,
+                    port,
+                    version,
+                    true,
+                    false,
+                    before.as_deref(),
+                )
+                .map_err(|(issue, message, detail)| {
+                    (
+                        issue,
+                        format!("{message}（已自动清理疑似中断的 npx 缓存并重试一次。）"),
+                        detail,
+                    )
+                });
             }
         }
     }
@@ -2195,13 +2656,17 @@ fn with_shutdown_error(detail: Option<String>, outcome: Result<(), String>) -> O
     })
 }
 
-/// The version of the dsh package behind one spec. A pinned spec is served
-/// from the npx cache without a registry round-trip; the bare spec resolves
-/// `latest`, which is why it is only used before the first version record
-/// exists.
+/// The version of the dsh package behind one spec, read from the local cache.
+///
+/// `--offline` is used for the same reason the start uses it: with a pinned
+/// spec this is a pure local lookup, and going online would make a routine
+/// status refresh fail (or stall) whenever the registry is slow or mid-
+/// publish. The bare `latest` spec cannot be answered offline, so it is only
+/// ever passed before a version has been recorded — and a `None` result there
+/// is already the expected "unknown yet" state, which the caller tolerates.
 fn read_version(npx: &Path, spec: &str) -> Option<String> {
     let output = hidden_command(npx)
-        .args(["--yes", spec, "-V"])
+        .args(["--offline", "--yes", spec, "-V"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -2230,11 +2695,62 @@ fn locate_npm() -> Option<PathBuf> {
     crate::platform_env::locate_executable("npm")
 }
 
-/// The `latest` dist-tag of the dsh package, from npm registry metadata.
+/// Every published version of the dsh package, newest first.
 ///
-/// `npm view` answers without downloading the package, keeping 「更新版本」 a
-/// quick check; the download happens on the next start, under the same
-/// progress reporting as any other start.
+/// `npm view` answers from registry metadata without downloading anything, so
+/// this stays a quick read-only call; the actual download still happens on the
+/// next start. `--json` is used because the field is a list and the default
+/// `npm view` output for a list is not a stable parse target.
+///
+/// Ordering is **newest first** and is deliberately npm's own order reversed
+/// rather than a hand-rolled semver comparison: the list is a picker, and the
+/// registry's ordering is the one users see in `npm view` itself. Prereleases
+/// are kept — dsh ships almost exclusively prereleases, so filtering them out
+/// would leave an empty list.
+fn query_available_versions(npm: &Path) -> Result<Vec<String>, String> {
+    let output = hidden_command(npm)
+        .args(["view", DSH_PACKAGE, "versions", "--json"])
+        .output()
+        .map_err(|error| format!("无法运行 npm: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail: Vec<&str> = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(3)
+            .collect();
+        return Err(format!(
+            "查询 dsh 可用版本失败（{}）。请检查网络与代理后重试。",
+            if detail.is_empty() {
+                format!("npm 退出码 {}", output.status.code().unwrap_or(-1))
+            } else {
+                detail.join("；")
+            }
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // npm prints a bare string instead of a one-element array when exactly one
+    // version exists; accept both so a single-version registry is not an error.
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|_| "npm 返回的 dsh 版本列表无法解析。".to_string())?;
+    let mut versions: Vec<String> = match parsed {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(single) => vec![single],
+        _ => Vec::new(),
+    };
+    versions.retain(|version| is_valid_pinned_version(version));
+    versions.reverse();
+    if versions.is_empty() {
+        return Err("npm 返回的 dsh 版本列表为空。".to_string());
+    }
+    Ok(versions)
+}
+
+/// The `latest` dist-tag of the dsh package, from npm registry metadata.
 fn query_latest_version(npm: &Path) -> Result<String, String> {
     let output = hidden_command(npm)
         .args(["view", DSH_PACKAGE, "version"])
@@ -2680,6 +3196,38 @@ pub async fn dsh_release_port(port: u16) -> Result<DshPortReleaseReport, String>
         .map_err(|error| format!("清理端口任务异常结束: {error}"))
 }
 
+/// 「检查更新」: list the versions the registry offers for the picker, plus
+/// the currently pinned one. Read-only — the choice is made in the frontend's
+/// version dialog and carried out by `dsh_update_version`.
+///
+/// `npm view` answers from registry metadata without downloading the package,
+/// so this stays quick; the download happens on the next start, under the same
+/// progress reporting as any other start.
+///
+/// This is also the **only** place the launcher talks to the registry during
+/// normal operation. Starting dsh is offline-first, so nothing on the launch
+/// path depends on the network; a user who never opens this dialog never pays
+/// for a registry round-trip.
+#[tauri::command]
+pub async fn dsh_list_versions() -> Result<DshVersionList, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Some(npm) = locate_npm() else {
+            return Err("未检测到 npm。请先安装 Node.js（含 npm/npx）后重试。".to_string());
+        };
+        let versions = query_available_versions(&npm)?;
+        // The `latest` label is a nicety, not a requirement: the list is fully
+        // usable without it, so a failure here must not sink the whole call.
+        let latest = query_latest_version(&npm).ok();
+        Ok(DshVersionList {
+            versions,
+            pinned: start_pinned_version(),
+            latest,
+        })
+    })
+    .await
+    .map_err(|error| format!("获取 dsh 版本列表任务异常结束: {error}"))?
+}
+
 /// 「检查更新」: resolve the registry's `latest` and compare it with the
 /// recorded pin. Read-only — whether to apply the update is decided by the
 /// frontend's confirmation dialog and carried out by `dsh_update_version`.
@@ -2893,6 +3441,102 @@ mod tests {
             package_json.display(),
             package_json.display()
         )
+    }
+
+    #[test]
+    fn closure_drift_is_detected_when_a_pin_resolves_forward() {
+        // The exact 2026-09-22 shape: pin rc.1, npm resolves a rc.3 sibling.
+        let detail = "npm error code ETARGET\n\
+                      npm error notarget No matching version found for @deepseek-ai/dsh-client-ui-sidebar-documentpreview@^0.1.5-rc.3.";
+        assert_eq!(
+            closure_drifted_from_pin(detail, Some("0.1.5-rc.1")).as_deref(),
+            Some("0.1.5-rc.3")
+        );
+    }
+
+    #[test]
+    fn closure_drift_is_detected_for_the_agent_closure_shape() {
+        // The first error this project ever saw, from the same gap.
+        let detail = "npm error code ETARGET\n\
+                      npm error notarget No matching version found for @deepseek-ai/dsh-session-projection@^0.1.5-rc.3.";
+        assert_eq!(
+            closure_drifted_from_pin(detail, Some("0.1.5-rc.1")).as_deref(),
+            Some("0.1.5-rc.3")
+        );
+    }
+
+    #[test]
+    fn closure_drift_needs_a_pin_to_compare_against() {
+        // Without a recorded pin the launcher asked for `latest`; there is no
+        // requested version for the message to have drifted *from*, so the
+        // generic wording must be used instead of inventing a comparison.
+        let detail = "npm error code ETARGET\n\
+                      npm error notarget No matching version found for @deepseek-ai/dsh-session-projection@^0.1.5-rc.3.";
+        assert_eq!(closure_drifted_from_pin(detail, None), None);
+    }
+
+    #[test]
+    fn closure_drift_ignores_a_failure_inside_the_pinned_wave() {
+        // npm failing on the pinned version itself names the same version, not
+        // a later one — that is not drift.
+        let detail = "npm error code ETARGET\n\
+                      npm error notarget No matching version found for @deepseek-ai/dsh@^0.1.5-rc.1.";
+        assert_eq!(closure_drifted_from_pin(detail, Some("0.1.5-rc.1")), None);
+    }
+
+    #[test]
+    fn closure_drift_ignores_an_unrelated_version_line() {
+        // A different release core is a different package's problem, not the
+        // pinned ladder being walked forward.
+        let detail = "npm error code ETARGET\n\
+                      npm error notarget No matching version found for @deepseek-ai/dsh@^0.1.6-alpha.1.";
+        assert_eq!(closure_drifted_from_pin(detail, Some("0.1.5-rc.1")), None);
+    }
+
+    #[test]
+    fn prerelease_core_splits_the_ladder_from_the_core() {
+        assert_eq!(prerelease_core("0.1.5-rc.1"), "0.1.5");
+        assert_eq!(prerelease_core("0.1.6-alpha.2"), "0.1.6");
+        assert_eq!(prerelease_core("1.2.3"), "1.2.3");
+    }
+
+    #[test]
+    fn unresolvable_version_failure_is_read_from_the_etarget_block() {
+        // The real shape observed on 2026-09-22: dsh's own peer closure named a
+        // sibling release that had not been published yet.
+        let detail = "npm error code ETARGET\n\
+                      npm error notarget No matching version found for @deepseek-ai/dsh-session-projection@^0.1.5-rc.3.\n\
+                      npm error notarget In most cases you or one of your dependencies are requesting\n\
+                      npm error notarget a package version that doesn't exist.";
+        assert!(is_unresolvable_version_failure(detail));
+    }
+
+    #[test]
+    fn unresolvable_version_failure_accepts_the_bare_notarget_line() {
+        // npm also prints `notarget` without the `code ETARGET` line depending
+        // on which error path reports it; either spelling must classify.
+        let detail = "npm error notarget No matching version found for @deepseek-ai/dsh-agent@^0.1.5-rc.3.";
+        assert!(is_unresolvable_version_failure(detail));
+    }
+
+    #[test]
+    fn unresolvable_version_failure_rejects_the_corrupt_cache_shape() {
+        // The two failures must never overlap: an ENOENT block is a corrupt
+        // entry that *should* be purged, and must not be reported as an
+        // upstream publishing gap (which would leave the entry in place and
+        // make every later start fail the same way).
+        let detail = npm_enoent_detail(&npx_entry("1da1392061ab1944").join("package.json"));
+        assert!(!is_unresolvable_version_failure(&detail));
+        assert!(corrupt_npx_cache_dir(&detail).is_some());
+    }
+
+    #[test]
+    fn etarget_failure_names_no_cache_entry_to_purge() {
+        // Nothing about a version-resolution failure points at a directory, so
+        // the repair chain must find no target and leave the cache untouched.
+        let detail = "npm error code ETARGET\n\
+                      npm error notarget No matching version found for @deepseek-ai/dsh@^0.1.5-rc.3.";
+        assert_eq!(corrupt_npx_cache_dir(detail), None);
     }
 
     #[test]
@@ -3324,7 +3968,7 @@ mod tests {
 
     #[test]
     fn dsh_arguments_put_launcher_flags_before_app_flags() {
-        let args = dsh_arguments(Path::new("/tmp/overlay.yml"), 3199, None);
+        let args = dsh_arguments(Path::new("/tmp/overlay.yml"), 3199, None, false, None);
         assert_eq!(
             args,
             vec![
@@ -3342,13 +3986,223 @@ mod tests {
 
     #[test]
     fn dsh_arguments_pin_the_package_to_the_recorded_version() {
-        let args = dsh_arguments(Path::new("/tmp/overlay.yml"), 3199, Some("0.1.0"));
+        let args = dsh_arguments(Path::new("/tmp/overlay.yml"), 3199, Some("0.1.0"), false, None);
         assert_eq!(args[1], "@deepseek-ai/dsh@0.1.0");
         assert_eq!(args[0], "--yes");
         assert_eq!(args[2], "web");
 
         assert_eq!(dsh_package_spec(None), "@deepseek-ai/dsh");
         assert_eq!(dsh_package_spec(Some("0.2.0-beta.1")), "@deepseek-ai/dsh@0.2.0-beta.1");
+    }
+
+    #[test]
+    fn dsh_arguments_put_offline_ahead_of_the_package_spec() {
+        // npm must see `--offline` before the spec it applies to; the app's own
+        // flags still trail the package name.
+        let args = dsh_arguments(
+            Path::new("/tmp/overlay.yml"),
+            3199,
+            Some("0.1.5-rc.1"),
+            true,
+            None,
+        );
+        assert_eq!(args[0], "--offline");
+        assert_eq!(args[1], "--yes");
+        assert_eq!(args[2], "@deepseek-ai/dsh@0.1.5-rc.1");
+        assert_eq!(args[3], "web");
+        assert!(!dsh_arguments(
+            Path::new("/tmp/overlay.yml"),
+            3199,
+            Some("0.1.5-rc.1"),
+            false,
+            None
+        )
+        .contains(&"--offline".to_string()));
+    }
+
+    #[test]
+    fn dsh_arguments_carry_the_cutoff_only_when_resolving_online() {
+        // `--before` changes what npm may *resolve*, so it belongs on the
+        // networked attempt and nowhere else. An offline attempt reads the
+        // cached entry instead, and putting the flag there would be noise the
+        // reader has to reason about for no effect.
+        let args = dsh_arguments(
+            Path::new("/tmp/overlay.yml"),
+            3199,
+            Some("0.1.5-rc.1"),
+            false,
+            Some("2026-09-16T10:26:16Z"),
+        );
+        assert_eq!(args[0], "--before=2026-09-16T10:26:16Z");
+        assert_eq!(args[1], "--yes");
+        assert_eq!(args[2], "@deepseek-ai/dsh@0.1.5-rc.1");
+        assert_eq!(args[3], "web");
+
+        // Offline wins the slot: npm sees `--offline`, and the cutoff is gone.
+        let offline = dsh_arguments(
+            Path::new("/tmp/overlay.yml"),
+            3199,
+            Some("0.1.5-rc.1"),
+            true,
+            Some("2026-09-16T10:26:16Z"),
+        );
+        assert_eq!(offline[0], "--offline");
+        assert_eq!(offline[1], "--yes");
+        assert!(!offline.iter().any(|arg| arg.starts_with("--before")));
+    }
+
+    #[test]
+    fn version_keys_are_told_apart_from_the_time_objects_metadata() {
+        // `created` and `modified` live in the same object as the version keys
+        // and would pass a charset-only check, because they are all
+        // alphanumeric. Treating them as versions would put a bogus entry in
+        // the timeline and corrupt the cutoff arithmetic.
+        assert!(is_version_key("0.1.5-rc.1"));
+        assert!(is_version_key("0.1.6-alpha.2"));
+        assert!(is_version_key("1.2.3"));
+        assert!(!is_version_key("created"));
+        assert!(!is_version_key("modified"));
+        assert!(!is_version_key("0"));
+    }
+
+    fn at(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .expect("test timestamps are valid rfc3339")
+            .with_timezone(&Utc)
+    }
+
+    /// The measured `0.1.5` timeline, trimmed to the entries the cutoff uses.
+    /// The wave shape is the whole reason the rule is a midpoint: the top
+    /// package publishes last within its own wave.
+    fn observed_timeline() -> Vec<(String, DateTime<Utc>)> {
+        vec![
+            ("0.1.5-rc.1".to_string(), at("2026-09-10T03:12:53Z")),
+            ("0.1.6-alpha.1".to_string(), at("2026-09-15T03:23:13Z")),
+            ("0.1.5-rc.2".to_string(), at("2026-09-10T14:57:10Z")),
+            ("0.1.6-alpha.2".to_string(), at("2026-09-17T13:52:10Z")),
+            ("0.1.5-rc.3".to_string(), at("2026-09-22T05:55:20Z")),
+        ]
+    }
+
+    #[test]
+    fn release_cutoff_lands_between_the_pin_and_the_next_prerelease() {
+        let cutoff = release_cutoff(&observed_timeline(), "0.1.5-rc.2").expect("a cutoff exists");
+        // Midpoint of rc.2 (09-10 14:57:10) and rc.3 (09-22 05:55:20) is
+        // 09-16 10:26:15, i.e. ~6 days clear of either wave — far outside the
+        // ~16 minute window in which a wave actually lands.
+        assert_eq!(cutoff, "2026-09-16T10:26:15Z");
+        let cutoff = at(&cutoff);
+        assert!(cutoff > at("2026-09-10T14:57:10Z"), "must include the pin");
+        assert!(cutoff < at("2026-09-22T05:55:20Z"), "must exclude the next wave");
+    }
+
+    #[test]
+    fn release_cutoff_ignores_other_release_cores() {
+        // `0.1.6-alpha.1` was published between rc.1 and rc.2. It is a different
+        // ladder, so it must not be mistaken for rc.1's successor — otherwise
+        // every rc.1 pin would be cut off days too early, and only by luck
+        // after rc.2.
+        let cutoff = release_cutoff(&observed_timeline(), "0.1.5-rc.1").expect("a cutoff exists");
+        assert_eq!(cutoff, "2026-09-10T09:05:01Z");
+        assert!(at(&cutoff) > at("2026-09-10T03:12:53Z"));
+        assert!(at(&cutoff) < at("2026-09-10T14:57:10Z"));
+    }
+
+    #[test]
+    fn release_cutoff_is_absent_for_the_newest_prerelease() {
+        // Nothing follows rc.3, so there is no wave to cut it off from. The
+        // honest answer is "cannot help", not a cutoff invented from the whole
+        // version list — an arbitrary one would silently hide valid versions.
+        assert_eq!(release_cutoff(&observed_timeline(), "0.1.5-rc.3"), None);
+    }
+
+    #[test]
+    fn release_cutoff_needs_the_pin_itself_in_the_timeline() {
+        // A pin the registry has since removed (or a timeline that failed to
+        // parse its entry) must not produce a cutoff at all: without the pin's
+        // own instant there is no anchor, and any value would be a guess.
+        assert_eq!(release_cutoff(&observed_timeline(), "0.1.5-rc.9"), None);
+    }
+
+    #[test]
+    fn release_cutoff_uses_the_earliest_later_publish_not_the_next_number() {
+        // Waves have landed out of order, so "the next version number" is the
+        // wrong anchor — the goal is to clear the entire following wave, which
+        // means cutting at its first package, whichever number that carries.
+        let times = vec![
+            ("0.1.5-rc.1".to_string(), at("2026-01-01T00:00:00Z")),
+            ("0.1.5-rc.3".to_string(), at("2026-01-02T00:00:00Z")),
+            ("0.1.5-rc.2".to_string(), at("2026-01-09T00:00:00Z")),
+        ];
+        let cutoff = release_cutoff(&times, "0.1.5-rc.1").expect("a cutoff exists");
+        // Midpoint with rc.3 (the earliest later publish), not with rc.2.
+        assert_eq!(cutoff, "2026-01-01T12:00:00Z");
+    }
+
+    #[test]
+    fn offline_cache_miss_is_read_from_the_enotcached_block() {
+        // The real shape npm prints when `--offline` cannot satisfy the spec.
+        let detail = "npm error code ENOTCACHED\n\
+                      npm error request to https://registry.npmjs.org/left-pad failed: cache mode is 'only-if-cached' but no cached response is available.";
+        assert!(is_offline_cache_miss(detail));
+    }
+
+    #[test]
+    fn a_partially_cached_closure_still_earns_a_networked_retry() {
+        // Measured: with metadata cached but the closure unsatisfiable, npm
+        // reports ETARGET offline — identical text to the upstream-gap case.
+        // Offline cannot tell the two apart, so the retry gate must not try to:
+        // it has to fire on both or a stale cached metadata set would wedge the
+        // start forever.
+        let etarget: SpawnFailure = (
+            "exited".to_string(),
+            "dsh 进程在就绪前退出。".to_string(),
+            Some(
+                "npm error code ETARGET\n\
+                 npm error notarget No matching version found for @deepseek-ai/dsh-client-ui-sidebar-documentpreview@^0.1.5-rc.3."
+                    .to_string(),
+            ),
+        );
+        assert!(
+            offline_failure_justifies_download(&etarget),
+            "an ETARGET offline must still get one online attempt"
+        );
+    }
+
+    #[test]
+    fn a_damaged_entry_earns_the_repair_path_not_a_plain_download() {
+        // An ENOENT offline is a damaged entry; it also justifies going online,
+        // but the repair chain runs first and handles it there.
+        let enoent: SpawnFailure = (
+            "exited".to_string(),
+            "dsh 进程在就绪前退出。".to_string(),
+            Some(npm_enoent_detail(&npx_entry("1da1392061ab1944").join("package.json"))),
+        );
+        assert!(offline_failure_justifies_download(&enoent));
+    }
+
+    #[test]
+    fn a_failure_a_download_cannot_fix_does_not_earn_a_retry() {
+        // npx could not be launched at all: no download changes that.
+        let spawn_failed: SpawnFailure = (
+            "spawn_failed".to_string(),
+            "无法启动 dsh。".to_string(),
+            Some("some spawn error".to_string()),
+        );
+        assert!(!offline_failure_justifies_download(&spawn_failed));
+
+        // A readiness timeout means the cache served it and the process ran,
+        // so the problem is not resolution — the timeout self-repair owns it.
+        let timeout: SpawnFailure = (
+            "ready_timeout".to_string(),
+            "超时。".to_string(),
+            Some("whatever".to_string()),
+        );
+        assert!(!offline_failure_justifies_download(&timeout));
+
+        // No npm stderr at all: nothing to conclude from, so no retry.
+        let silent: SpawnFailure = ("exited".to_string(), "退出。".to_string(), None);
+        assert!(!offline_failure_justifies_download(&silent));
     }
 
     /// The recorded version ends up inside an npx package spec on a command

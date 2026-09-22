@@ -288,6 +288,7 @@ pub fn run() {
             dsh_runtime::dsh_check_port,
             dsh_runtime::dsh_release_port,
             dsh_runtime::dsh_check_update,
+            dsh_runtime::dsh_list_versions,
             dsh_runtime::dsh_update_version,
             // dsh 用户设置文档（`$DSH_HOME/settings.yaml`）里的供应方与模型，
             // 以及凭据文件（`.credentials.yaml`）里的认证令牌值。
