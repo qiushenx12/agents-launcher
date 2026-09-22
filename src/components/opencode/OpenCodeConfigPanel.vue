@@ -593,7 +593,7 @@ watch(leftWidth, (width) => {
 .editor-header p, .provider-header span, .models-header span, .source-note p { color: var(--text-secondary); font-size: var(--font-size-small); }
 .global-action-row { display: flex; gap: 8px; margin-top: 9px; padding-top: 10px; border-top: 1px solid var(--separator); }
 
-.permission-setup { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 0 0 12px; padding: 12px; border: 1px solid var(--warning, #b26a00); border-radius: var(--radius-md); background: color-mix(in srgb, var(--warning, #b26a00) 10%, transparent); }
+.permission-setup { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 0 0 12px; padding: 12px; border: 1px solid var(--warning, #b26a00); border-radius: var(--radius); background: color-mix(in srgb, var(--warning, #b26a00) 10%, transparent); }
 .permission-setup > div { min-width: 0; }
 .permission-setup p { margin: 4px 0; color: var(--text-secondary); font-size: var(--font-size-small); line-height: 1.45; }
 .permission-setup code { display: block; margin-top: 2px; overflow-wrap: anywhere; }
