@@ -198,7 +198,7 @@ function formatDate(iso: string): string {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.4);
+  background: var(--overlay);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -208,7 +208,7 @@ function formatDate(iso: string): string {
 .preset-manager {
   background: var(--card);
   border-radius: var(--radius);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  box-shadow: var(--modal-shadow);
   width: 480px;
   max-width: 90vw;
   max-height: 80vh;

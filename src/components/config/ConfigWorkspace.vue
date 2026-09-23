@@ -193,13 +193,16 @@ const sourceDescription = computed(() => {
     return `全局配置：${codexStore.globalConfigPath || '~/.codex/config.toml'}（仅显式勾选时同步）；启动器方案：${codexStore.profilesPath || launcherPath}；auth.json 只读。`
   }
   if (workspaceStore.activeKind === 'dsh') {
+    const packageSpec = dshStore.saved.pinnedVersion
+      ? `@deepseek-ai/dsh@${dshStore.saved.pinnedVersion}`
+      : '@deepseek-ai/dsh'
     const overlayPath = isMacOS.value
       ? '~/Library/Application Support/ClaudeEnvManager/dsh/runtime.overlay.yml'
       : '%APPDATA%\\ClaudeEnvManager\\dsh\\runtime.overlay.yml'
     const statePath = isMacOS.value
       ? '~/Library/Application Support/ClaudeEnvManager/app_state.json'
       : '%APPDATA%\\ClaudeEnvManager\\app_state.json'
-    return `运行方式：npx --yes @deepseek-ai/dsh web；访问范围与端口保存在 ${statePath} 的 dsh_runtime 字段；每次启动生成 ${overlayPath} 覆盖 webserver 行的 host/port。模型与凭据由 dsh 自行管理。`
+    return `运行方式：npx --yes ${packageSpec} web；访问范围与端口保存在 ${statePath} 的 dsh_runtime 字段；每次启动生成 ${overlayPath} 覆盖 webserver 行的 host/port。模型与凭据由 dsh 自行管理。`
   }
   return `唯一配置来源：${opencodeStore.globalConfigPath || '~/.config/opencode/opencode.jsonc'}；界面直接读取和保存该文件，只管理其中带 npm 的自定义 Provider，内置 Provider 保持不变。`
 })
@@ -280,7 +283,7 @@ const safeDiagnostic = computed(() => JSON.stringify(redactConfigRecord({
     issue: dshStore.status?.issue ?? null,
     version: dshStore.status?.version ?? null,
     portAvailable: dshStore.portStatus?.available ?? null,
-    invocation: 'npx --yes @deepseek-ai/dsh web --patch <overlay> --port <port> --no-open',
+    invocation: `npx --yes @deepseek-ai/dsh${dshStore.saved.pinnedVersion ? `@${dshStore.saved.pinnedVersion}` : ''} web --patch <overlay> --port <port> --no-open`,
   } : null,
 }), null, 2))
 

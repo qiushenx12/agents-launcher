@@ -522,8 +522,8 @@ onBeforeUnmount(() => {
 }
 
 .provider-list__state--draft {
-  color: var(--warning, #d49a45);
-  background: color-mix(in srgb, var(--warning, #d49a45) 13%, transparent);
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 13%, transparent);
 }
 
 .provider-list__item--selected .provider-list__state {

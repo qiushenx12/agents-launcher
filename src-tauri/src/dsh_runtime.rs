@@ -13,7 +13,7 @@
 //! ready-line grammar, the overlay template and the npx invocation are the
 //! three things an unpinned dsh release can move out from under us.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -531,6 +531,15 @@ pub struct DshVersionList {
     /// the newest row; a failure here does not fail the whole listing because
     /// the version list itself is still usable.
     pub latest: Option<String>,
+}
+
+/// A runnable dsh release found in npm's `_npx` cache. One release can have
+/// several entries when npm used different resolution options.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshCachedVersion {
+    pub version: String,
+    pub entries: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1618,6 +1627,85 @@ fn npm_cache_dir() -> Option<PathBuf> {
     }
 }
 
+/// Only count complete, top-level dsh installs. npm also caches unrelated
+/// packages under `_npx`, and a failed install may leave an empty entry behind.
+fn cached_dsh_version(entry: &Path) -> Option<String> {
+    for path in [
+        entry.to_path_buf(),
+        entry.join("node_modules"),
+        entry.join("node_modules").join("@deepseek-ai"),
+        entry.join("node_modules").join("@deepseek-ai").join("dsh"),
+    ] {
+        let kind = std::fs::symlink_metadata(path).ok()?.file_type();
+        if !kind.is_dir() || kind.is_symlink() {
+            return None;
+        }
+    }
+    let root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(entry.join("package.json")).ok()?).ok()?;
+    root.get("dependencies")?.get(DSH_PACKAGE)?.as_str()?;
+    let manifest = entry
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("package.json");
+    let package: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(manifest).ok()?).ok()?;
+    if package.get("name")?.as_str()? != DSH_PACKAGE {
+        return None;
+    }
+    let version = package.get("version")?.as_str()?;
+    is_version_key(version).then(|| version.to_string())
+}
+
+fn cached_dsh_entries(cache_dir: &Path) -> Result<BTreeMap<String, Vec<PathBuf>>, String> {
+    let root = cache_dir.join("_npx");
+    let metadata = match std::fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(format!("无法读取 npx 缓存目录：{error}")),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("npx 缓存目录不是普通目录，已拒绝访问。".to_string());
+    }
+    let mut versions = BTreeMap::<String, Vec<PathBuf>>::new();
+    for item in std::fs::read_dir(&root).map_err(|error| format!("无法列出 npx 缓存：{error}"))? {
+        let item = item.map_err(|error| format!("无法读取 npx 缓存条目：{error}"))?;
+        if let Some(version) = cached_dsh_version(&item.path()) {
+            versions.entry(version).or_default().push(item.path());
+        }
+    }
+    Ok(versions)
+}
+
+fn delete_cached_dsh_version_from(cache_dir: &Path, version: &str) -> Result<usize, String> {
+    let root = cache_dir.join("_npx");
+    let entries = cached_dsh_entries(cache_dir)?;
+    let targets = entries
+        .get(version)
+        .ok_or_else(|| format!("本机缓存中已没有 v{version}。"))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("无法核对 npx 缓存目录：{error}"))?;
+    // Recheck every target immediately before deletion. The version is
+    // supplied by the UI, never used to construct a filesystem path.
+    for target in targets {
+        let canonical = target
+            .canonicalize()
+            .map_err(|error| format!("无法核对缓存条目：{error}"))?;
+        if canonical.parent() != Some(canonical_root.as_path())
+            || cached_dsh_version(target).as_deref() != Some(version)
+        {
+            return Err("缓存条目已变化，已取消删除；请重新打开版本列表。".to_string());
+        }
+    }
+    for target in targets {
+        std::fs::remove_dir_all(target)
+            .map_err(|error| format!("删除缓存条目 {} 失败：{error}", target.display()))?;
+    }
+    Ok(targets.len())
+}
+
 fn directory_size(path: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
@@ -1830,6 +1918,13 @@ fn spawn_failure_issue(failure: &SpawnFailure) -> SpawnIssue {
     } else {
         SpawnIssue::Other
     }
+}
+
+/// An install can stop before readiness either by timing out or by exiting
+/// after npm has written only part of its `_npx` entry. A spawn failure never
+/// started npm and cannot have created one.
+fn failure_may_leave_incomplete_npx_entry(failure: &SpawnFailure) -> bool {
+    matches!(failure.0.as_str(), "ready_timeout" | "exited")
 }
 
 fn spawn_and_wait(
@@ -2200,12 +2295,11 @@ fn purge_corrupt_npx_cache(dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("清理损坏的 npx 缓存（{}）失败：{error}", dir.display()))
 }
 
-/// One `_npx` entry a readiness timeout has reason to suspect.
+/// One `_npx` entry a failed start has reason to suspect.
 ///
-/// The ENOENT repair above keys off stderr, but a timeout after a cache *hit*
-/// never produces that stderr: npx found the entry and simply never got dsh
-/// running. That is the failure an interrupted install leaves behind — the
-/// entry directory exists, so npx reuses it as-is forever.
+/// The ENOENT repair above keys off stderr, but an incomplete install can also
+/// time out or exit without naming its cache path. The entry directory remains,
+/// so npx may reuse it as-is forever.
 ///
 /// Two independent facts must both hold before an entry is touched:
 ///
@@ -2370,7 +2464,7 @@ fn spawn_with_cache_repair(
     port: u16,
     version: Option<&str>,
 ) -> Result<SpawnOutcome, SpawnFailure> {
-    let attempt_started_at = Instant::now();
+    let mut repair_window_start = Instant::now();
 
     // Step 1: offline, for pinned starts. An unpinned start has no cache to
     // consult — `latest` is a registry lookup by definition — so it skips
@@ -2386,7 +2480,7 @@ fn spawn_with_cache_repair(
     // used for the log line — the decision itself is deliberately broad, since
     // offline and online produce identical error text for a partially cached
     // closure. See `offline_failure_justifies_download`.
-    if offline_failure_justifies_download(&first) {
+    let first = if version.is_some() && offline_failure_justifies_download(&first) {
         let reason = if first.2.as_deref().is_some_and(is_offline_cache_miss) {
             "本地缓存中没有该版本"
         } else {
@@ -2400,7 +2494,8 @@ fn spawn_with_cache_repair(
         if let Some(cutoff) = before.as_deref() {
             eprintln!("为避免依赖被解析到更新的发布批次，本次安装限定在 {cutoff} 之前发布的版本。");
         }
-        return spawn_and_wait(
+        repair_window_start = Instant::now();
+        match spawn_and_wait(
             app,
             npx,
             overlay,
@@ -2409,8 +2504,16 @@ fn spawn_with_cache_repair(
             true,
             false,
             before.as_deref(),
-        );
-    }
+        ) {
+            Ok(outcome) => return Ok(outcome),
+            // A networked install can also leave an incomplete `_npx` entry.
+            // Let the same guarded repair path inspect that failure instead of
+            // returning it before the cache checks below can run.
+            Err(failure) => failure,
+        }
+    } else {
+        first
+    };
 
     // Fast path, keyed off npm's own report: the entry is corrupt and npm said
     // exactly which one. Works for the early-exit failure shape.
@@ -2487,15 +2590,13 @@ fn spawn_with_cache_repair(
         });
     }
 
-    // Slow path: a readiness *timeout* produces no npm error to parse — the
-    // cache-hit start just never became ready because its `_npx` entry came
-    // from an interrupted install. Identify the entry structurally instead:
-    // touched inside this attempt's window and missing its manifest or its
-    // dsh payload. Only a timeout earns this scan; an early exit already had
-    // its chance through the stderr above.
-    if spawn_failure_issue(&first) == SpawnIssue::ReadyTimeout {
+    // A timeout or early exit can leave an incomplete `_npx` entry without an
+    // ENOENT path in stderr. Identify it structurally instead: touched during
+    // the failed attempt and missing its manifest or dsh payload. This also
+    // covers a networked install that downloaded data before failing.
+    if failure_may_leave_incomplete_npx_entry(&first) {
         if let Some(cache_dir) = npm_cache_dir() {
-            if purge_suspect_npx_cache_entries(&cache_dir, attempt_started_at) {
+            if purge_suspect_npx_cache_entries(&cache_dir, repair_window_start) {
                 // Same reasoning as the fast path: the retry is a fresh
                 // download, so give it the download window, not the cache-hit
                 // window that just fired — and, being networked, the cutoff.
@@ -2656,17 +2757,16 @@ fn with_shutdown_error(detail: Option<String>, outcome: Result<(), String>) -> O
     })
 }
 
-/// The version of the dsh package behind one spec, read from the local cache.
+/// The version of an unpinned dsh start, read from the local cache.
 ///
-/// `--offline` is used for the same reason the start uses it: with a pinned
-/// spec this is a pure local lookup, and going online would make a routine
-/// status refresh fail (or stall) whenever the registry is slow or mid-
-/// publish. The bare `latest` spec cannot be answered offline, so it is only
-/// ever passed before a version has been recorded — and a `None` result there
-/// is already the expected "unknown yet" state, which the caller tolerates.
+/// A first-ever start has no recorded pin. Recheck the same package spec and
+/// registry offline so this lookup cannot switch to a newer release while the
+/// service is starting. npm may still lack the metadata needed to answer a
+/// bare `latest` spec offline; in that case the version remains unknown.
 fn read_version(npx: &Path, spec: &str) -> Option<String> {
     let output = hidden_command(npx)
         .args(["--offline", "--yes", spec, "-V"])
+        .env("NPM_CONFIG_REGISTRY", DSH_NPM_REGISTRY)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -2895,7 +2995,12 @@ fn start_server(app: &AppHandle, access: DshAccess, port: u16) -> DshRuntimeStat
             detail,
         );
     }
-    let version = read_version(&npx, &dsh_package_spec(pinned.as_deref()));
+    // An exact top-level pin already tells us the running release. Re-running
+    // npx offline to discover it can fail when npm cached the install under a
+    // `--before` resolution, leaving a healthy service with no shown version.
+    let version = pinned
+        .clone()
+        .or_else(|| read_version(&npx, &dsh_package_spec(None)));
     if let Some(version) = version.as_deref() {
         // This is the version record every later start is pinned to. Persisting
         // it is best-effort: a failed write must not turn a healthy start into
@@ -3226,6 +3331,48 @@ pub async fn dsh_list_versions() -> Result<DshVersionList, String> {
     })
     .await
     .map_err(|error| format!("获取 dsh 版本列表任务异常结束: {error}"))?
+}
+
+/// Read the local runnable dsh releases without contacting the registry.
+#[tauri::command]
+pub async fn dsh_list_cached_versions() -> Result<Vec<DshCachedVersion>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let cache = npm_cache_dir().ok_or_else(|| "无法确定 npm 缓存目录。".to_string())?;
+        let mut versions: Vec<_> = cached_dsh_entries(&cache)?
+            .into_iter()
+            .map(|(version, entries)| DshCachedVersion { version, entries: entries.len() })
+            .collect();
+        versions.reverse();
+        Ok(versions)
+    })
+    .await
+    .map_err(|error| format!("读取本机 dsh 版本任务异常结束: {error}"))?
+}
+
+/// Remove every `_npx` entry containing the selected release. npm's shared
+/// tarball cache is deliberately untouched because other packages can use it.
+#[tauri::command]
+pub async fn dsh_delete_cached_version(version: String) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !is_version_key(&version) {
+            return Err("要删除的 dsh 版本号无法识别。".to_string());
+        }
+        let cache = npm_cache_dir().ok_or_else(|| "无法确定 npm 缓存目录。".to_string())?;
+        let mut guard = lock_registry()?;
+        if guard.busy {
+            return Err("dsh 正在启动或停止，请稍后再删除缓存。".to_string());
+        }
+        if let Some(status) = live_status(&mut guard) {
+            if status.phase == DshPhase::Running
+                && (status.version.as_deref() == Some(version.as_str()) || status.version.is_none())
+            {
+                return Err("该版本正在运行。请先停止 dsh 服务，再删除本机缓存。".to_string());
+            }
+        }
+        delete_cached_dsh_version_from(&cache, &version)
+    })
+    .await
+    .map_err(|error| format!("删除本机 dsh 版本任务异常结束: {error}"))?
 }
 
 /// 「检查更新」: resolve the registry's `latest` and compare it with the
@@ -3641,6 +3788,56 @@ mod tests {
         entry
     }
 
+    fn runnable_cache_entry(root: &Path, key: &str, version: &str) -> PathBuf {
+        let entry = cache_entry(root, key, true, true);
+        std::fs::write(
+            entry.join("package.json"),
+            format!(r#"{{"dependencies":{{"@deepseek-ai/dsh":"^{version}"}}}}"#),
+        ).expect("write npx manifest");
+        std::fs::write(
+            entry.join("node_modules").join("@deepseek-ai").join("dsh").join("package.json"),
+            format!(r#"{{"name":"@deepseek-ai/dsh","version":"{version}"}}"#),
+        ).expect("write dsh manifest");
+        entry
+    }
+
+    #[test]
+    fn local_cache_groups_versions_and_delete_removes_only_the_chosen_release() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        let first = runnable_cache_entry(cache.path(), "first", "0.1.5-rc.1");
+        let second = runnable_cache_entry(cache.path(), "second", "0.1.5-rc.1");
+        let other = runnable_cache_entry(cache.path(), "other", "0.1.6-alpha.1");
+        let incomplete = cache_entry(cache.path(), "incomplete", true, false);
+        let versions = cached_dsh_entries(cache.path()).expect("scan cache");
+        assert_eq!(versions["0.1.5-rc.1"].len(), 2);
+        assert_eq!(versions["0.1.6-alpha.1"].len(), 1);
+        assert_eq!(versions.len(), 2);
+
+        assert_eq!(delete_cached_dsh_version_from(cache.path(), "0.1.5-rc.1").unwrap(), 2);
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(other.exists());
+        assert!(incomplete.exists());
+        assert!(delete_cached_dsh_version_from(cache.path(), "0.1.5-rc.1").is_err());
+    }
+
+    #[test]
+    fn local_cache_ignores_an_unrelated_npx_package() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        let entry = runnable_cache_entry(cache.path(), "unrelated", "0.1.5-rc.1");
+        std::fs::write(entry.join("package.json"), r#"{"dependencies":{"another-package":"1.0.0"}}"#)
+            .expect("replace npx manifest");
+        assert!(cached_dsh_entries(cache.path()).unwrap().is_empty());
+        assert!(entry.exists());
+    }
+
+    #[test]
+    fn local_cache_refuses_a_non_directory_npx_root() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        std::fs::write(cache.path().join("_npx"), "not a directory").expect("write file");
+        assert!(cached_dsh_entries(cache.path()).is_err());
+    }
+
     #[test]
     fn timeout_scan_flags_an_entry_that_is_missing_its_manifest() {
         let cache = tempfile::tempdir().expect("temp cache");
@@ -3729,6 +3926,24 @@ mod tests {
         assert_eq!(spawn_failure_issue(&exit), SpawnIssue::Other);
         let spawn: SpawnFailure = ("spawn_failed".to_string(), "msg".to_string(), None);
         assert_eq!(spawn_failure_issue(&spawn), SpawnIssue::Other);
+    }
+
+    #[test]
+    fn early_exit_after_a_partial_download_earns_guarded_cache_repair() {
+        let failure: SpawnFailure = ("exited".to_string(), "npm exited".to_string(), None);
+        assert!(failure_may_leave_incomplete_npx_entry(&failure));
+        let spawn_failed: SpawnFailure = ("spawn_failed".to_string(), "msg".to_string(), None);
+        assert!(!failure_may_leave_incomplete_npx_entry(&spawn_failed));
+
+        let cache = tempfile::tempdir().expect("temp cache");
+        let incomplete = cache_entry(cache.path(), "partial", true, false);
+        let complete = cache_entry(cache.path(), "healthy", true, true);
+        assert!(purge_suspect_npx_cache_entries(
+            cache.path(),
+            Instant::now() - Duration::from_secs(1)
+        ));
+        assert!(!incomplete.exists());
+        assert!(complete.exists());
     }
 
     fn address(ip: &str, interface: Option<&str>, has_gateway: bool) -> LocalAddress {

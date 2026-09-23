@@ -48,6 +48,14 @@ function definedTokens(): Set<string> {
     for (const match of source.matchAll(/setProperty\(\s*['"](--[a-zA-Z0-9-]+)['"]/g)) {
       defined.add(match[1])
     }
+    /*
+     * Vue 的 `:style` 绑定写的是对象字面量键 —— `'--x': \`${n}px\``。令牌与冒号
+     * 之间隔着一个引号，上面那条 CSS 声明的模式匹配不到，于是这类运行时注入的
+     * 名字会被误判成「无处定义」。它们确实是定义：绑定生效后令牌就在元素上。
+     */
+    for (const match of source.matchAll(/['"](--[a-zA-Z0-9-]+)['"]\s*:/g)) {
+      defined.add(match[1])
+    }
   }
   return defined
 }
@@ -120,6 +128,65 @@ test('the version picker panel paints an opaque surface', () => {
     assert.ok(
       definedTokens().has(token[1]),
       `${background} names a token that is defined nowhere, so the background is dropped`,
+    )
+  }
+})
+
+/**
+ * 兜底值本身也是一条静默失效的路。
+ *
+ * `CodexSessionIssuesDialog` 写的是 `var(--bg-primary, #fff)` 与
+ * `var(--border-color, #e2e5ea)`，两个名字在本项目里都不存在 —— 而带兜底的
+ * `var()` 恰好落在上面那条通则的盲区里（通则只钉「不带兜底又没定义」）。结果
+ * 是深色主题下弹窗照旧白底黑字、边框浅灰，只有按钮跟着主题变了，整块面板像
+ * 贴在界面上的外来窗口，而测试全绿。
+ *
+ * 所以把兜底值也纳入约束：只要写了 `var(--x, …)`，`--x` 就必须真的被定义。
+ * 想给某个令牌留「未注入时退回」的语义，就该用运行时注入的那个名字（如
+ * `--settings-menu-max-height`，由 App.vue 的 setProperty 声明），它同样能通过。
+ */
+test('every var() with a fallback still names a defined style token', () => {
+  const defined = definedTokens()
+  const unresolved: string[] = []
+  for (const file of SOURCE_FILES.filter((name) => name.endsWith('.vue'))) {
+    const source = readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '')
+    for (const match of source.matchAll(/var\(\s*(--[a-zA-Z0-9-]+)\s*,/g)) {
+      if (!defined.has(match[1])) {
+        unresolved.push(`${file.slice(repoRoot.length + 1).replace(/\\/g, '/')}: var(${match[1]}, …)`)
+      }
+    }
+  }
+
+  assert.deepEqual(
+    [...new Set(unresolved)].sort(),
+    [],
+    'a fallback hides a misspelled token name: the fallback paints in BOTH themes, '
+      + 'so the light-theme colour leaks into the dark theme and nothing errors',
+  )
+})
+
+/**
+ * 会话完整性弹窗的面板必须取主题令牌，不能靠兜底值。
+ *
+ * 这条把「弹窗在深色主题下是白底」这个具体故障钉住：面板底色、正文色与边框
+ * 三者缺一不可，只修按钮是修不好的。
+ */
+const SESSION_DIALOG = 'src/components/codex/CodexSessionIssuesDialog.vue'
+
+test('the codex session dialog follows the theme instead of its fallbacks', () => {
+  const panel = declarations(scopedStyle(SESSION_DIALOG), '.session-issues')
+  for (const property of ['background', 'color', 'border']) {
+    const value = panel.get(property)
+    assert.ok(value, `.session-issues must declare ${property}`)
+    assert.match(
+      value,
+      /var\(\s*--/,
+      `${property}: ${value} is hard-coded, so it cannot follow the theme`,
+    )
+    assert.doesNotMatch(
+      value,
+      /#fff|#ffffff|rgba\(/i,
+      `${property}: ${value} carries a literal colour, which paints the same in both themes`,
     )
   }
 })

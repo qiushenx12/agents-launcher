@@ -2,20 +2,21 @@
 /**
  * dsh 版本选择列表。
  *
- * 后端只返回「有哪些版本 + 当前固定的是哪个」，勾选与确定都在这里完成：
- * 列表是倒序（最新在上），当前版本所在行显示勾选状态，底部常驻显示当前版本号。
+ * 上方展示本机 npx 缓存并提供按版本删除；下方展示仓库可选版本。
+ * 仓库列表倒序（最新在上），当前固定版本所在行显示勾选状态。
  *
  * 为什么不是「查到 latest 就提示更新」：dsh 的发版是分批的，最新版本经常正是
  * 装不上的那个（配套包还没发完）。用户真正要回答的是「我该跑哪个版本」，所以
  * 需要看到完整列表并能往回挑，而不是被推着往最新走。
  */
 import { computed, nextTick, ref, watch } from 'vue'
+import { confirm } from '@tauri-apps/plugin-dialog'
 import { useDshConfigStore } from '../../stores/dshConfig'
 
 const store = useDshConfigStore()
 
 const versions = computed(() => store.versionPickerList?.versions ?? [])
-const pinned = computed(() => store.versionPickerList?.pinned ?? null)
+const pinned = computed(() => store.versionPickerList?.pinned ?? store.saved.pinnedVersion ?? null)
 const latest = computed(() => store.versionPickerList?.latest ?? null)
 const loading = computed(() => store.updatingVersion && !store.versionPickerList)
 
@@ -51,17 +52,61 @@ function rowState(version: string) {
     'version-row--pinned': pinned.value === version,
   }
 }
+
+function runningVersion(version: string) {
+  return store.status?.phase === 'running' && store.status.version === version
+}
+
+async function removeCachedVersion(version: string, entries: number) {
+  if (runningVersion(version) || store.isBusy || store.deletingCachedVersion) return
+  const pinnedHint = pinned.value === version
+    ? '\n该版本仍是当前固定版本，删除后下次启动会重新下载。'
+    : '\n下次选择该版本时会重新下载。'
+  const accepted = await confirm(
+    `确定删除本机缓存的 dsh v${version}（${entries} 个条目）吗？${pinnedHint}`,
+    { title: '删除本机 dsh 版本', kind: 'warning' },
+  )
+  if (accepted) await store.deleteCachedVersion(version)
+}
 </script>
 
 <template>
-  <div class="version-dialog" role="dialog" aria-modal="true" aria-label="选择 dsh 版本">
+  <div class="version-dialog" role="dialog" aria-modal="true" aria-label="管理 dsh 版本">
     <div class="version-dialog__panel">
       <header class="version-dialog__head">
-        <h3>选择 dsh 版本</h3>
+        <h3>管理 dsh 版本</h3>
         <button class="version-dialog__close" type="button" @click="store.closeVersionPicker()">
           &times;
         </button>
       </header>
+
+      <section class="version-dialog__local" aria-label="本机已缓存版本">
+        <h4>本机已缓存版本</h4>
+        <p v-if="store.cachedVersionsLoading" class="version-dialog__hint">正在读取本机缓存…</p>
+        <p v-else-if="store.cachedVersionsError" class="version-dialog__error">{{ store.cachedVersionsError }}</p>
+        <p v-else-if="store.cachedVersions.length === 0" class="version-dialog__hint">本机尚无可运行的 dsh 缓存版本。</p>
+        <ul v-else class="cached-version-list">
+          <li v-for="item in store.cachedVersions" :key="item.version" class="cached-version-row">
+            <span class="cached-version-row__name">v{{ item.version }}</span>
+            <span v-if="item.entries > 1" class="cached-version-row__count">{{ item.entries }} 个缓存</span>
+            <span v-if="pinned === item.version" class="version-row__tag">已固定</span>
+            <span v-if="runningVersion(item.version)" class="version-row__tag version-row__tag--current">运行中</span>
+            <button
+              class="btn btn-secondary cached-version-row__delete"
+              type="button"
+              :disabled="store.isBusy || !!store.deletingCachedVersion || runningVersion(item.version)"
+              :title="runningVersion(item.version) ? '请先停止正在运行的 dsh 服务' : `删除 v${item.version} 的本机缓存`"
+              @click="removeCachedVersion(item.version, item.entries)"
+            >
+              {{ store.deletingCachedVersion === item.version ? '删除中…' : '删除' }}
+            </button>
+          </li>
+        </ul>
+        <p v-if="store.cachedDeleteError" class="version-dialog__error">{{ store.cachedDeleteError }}</p>
+        <p v-if="store.cachedDeleteNotice" class="version-dialog__hint">{{ store.cachedDeleteNotice }}</p>
+      </section>
+
+      <h4 class="version-dialog__online-title">可选版本</h4>
 
       <p v-if="loading" class="version-dialog__hint">正在获取可用版本…</p>
       <p v-else-if="store.versionPickerError" class="version-dialog__error">
@@ -141,13 +186,13 @@ function rowState(version: string) {
 .version-dialog__panel {
   display: flex;
   flex-direction: column;
-  width: min(420px, 100%);
+  width: min(480px, 100%);
   /*
    * 上限必须落在视口单位上。父级（.version-dialog）的高度由内容撑开，是
    * 不确定值，百分比在这里解析不出结果 —— 整条 max-height 会被判无效，
    * 列表于是一路溢出到窗口外面，连底部的按钮都推出去了。
    */
-  max-height: min(560px, calc(100vh - 32px));
+  max-height: min(640px, calc(100vh - 32px));
   padding: 16px;
   border: 1px solid var(--separator);
   border-radius: var(--radius-lg);
@@ -189,6 +234,42 @@ function rowState(version: string) {
 
 .version-dialog__hint { color: var(--text-secondary); }
 .version-dialog__error { color: var(--danger); }
+
+.version-dialog__local {
+  flex-shrink: 0;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--separator);
+}
+
+.version-dialog__local h4,
+.version-dialog__online-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.cached-version-list {
+  max-height: 152px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.cached-version-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.cached-version-row__name { font-family: var(--font-mono); }
+.cached-version-row__count { color: var(--text-secondary); }
+.cached-version-row__delete { margin-left: auto; padding: 2px 8px; font-size: 12px; }
 
 /* 唯一的滚动区：撑满标题与页脚之间的剩余高度，越界时内部滚动。 */
 .version-list {

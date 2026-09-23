@@ -8,10 +8,15 @@
   ],
   "platforms": {
     "windows": {
-      "status": "pending",
-      "architecture": null,
-      "testedAt": null,
-      "artifacts": []
+      "status": "passed",
+      "architecture": "x64",
+      "testedAt": "2026-09-23T20:10:00+08:00",
+      "artifacts": [
+        {
+          "path": "src-tauri/release-bundle/nsis/Agents Launcher_1.0.0_x64-setup.exe",
+          "size": 7428678
+        }
+      ]
     },
     "macos": {
       "status": "pending",

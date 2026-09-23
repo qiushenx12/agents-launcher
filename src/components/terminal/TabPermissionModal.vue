@@ -68,7 +68,7 @@ function isTargetSelected(tabId: number): boolean {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.4);
+  background: var(--overlay);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -81,7 +81,7 @@ function isTargetSelected(tabId: number): boolean {
   width: 420px;
   max-height: 80vh;
   overflow-y: auto;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+  box-shadow: var(--modal-shadow);
 }
 
 .perm-modal__header {

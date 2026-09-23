@@ -740,7 +740,7 @@ function refreshStatus() {
 
 .status-dot--running { background: var(--success, #22c55e); }
 .status-dot--failed { background: var(--danger, #d96c6c); }
-.status-dot--pending { background: var(--warning, #d49a45); }
+.status-dot--pending { background: var(--warning); }
 
 .action-row {
   display: flex;
@@ -774,9 +774,9 @@ function refreshStatus() {
   gap: 10px;
   margin: 0 0 10px;
   padding: 10px 12px;
-  border: 1px solid var(--warning, #b26a00);
+  border: 1px solid var(--warning-border);
   border-radius: var(--radius);
-  background: color-mix(in srgb, var(--warning, #b26a00) 8%, transparent);
+  background: var(--warning-surface);
 }
 
 .port-cleanup .btn {
@@ -918,7 +918,7 @@ function refreshStatus() {
   padding: 16px 18px 18px;
   border: 1px solid var(--separator);
   border-radius: var(--radius);
-  background: var(--card-bg, var(--tab-bg));
+  background: var(--card);
   text-align: center;
 }
 
@@ -968,7 +968,7 @@ function refreshStatus() {
 
 .dsh-qr-card__warning {
   margin: 12px 0 0;
-  color: var(--warning, #b26a00);
+  color: var(--warning);
   font-size: var(--font-size-small);
   line-height: 1.5;
   text-align: left;

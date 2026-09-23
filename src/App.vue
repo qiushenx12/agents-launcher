@@ -1142,7 +1142,7 @@ async function openCliTab(kind: CliKind, forceCheck = false) {
   // 检测在跑时，只有「需要按检测结论整理工作区」的前端才该丢弃这次点击。
   // dsh 不属于这一类（见 src/utils/cliEntry.ts）：它的切页只读缓存结论，
   // 把点击丢掉就是纯粹的无反应——点了「进入DeepSeek Harness」和顶栏 项目/dsh
-  // 都毫无动静，直到那次 npx 探测结束再点一次才生效。
+  // 都毫无动静，直到后台检测结束再点一次才生效。
   if (!appReady.value || entryBlockedWhileChecking(kind, cliRuntimeStore.checking)) return
   if (workspaceMode.value === 'config') {
     if (kind === activeCliKind.value) {
@@ -1163,9 +1163,9 @@ async function openCliTab(kind: CliKind, forceCheck = false) {
   //
   // dsh 同样不吃「整理工作区」这道门禁：没有项目与会话要发现，运行面板（未启动
   // 时的空态卡片、启动进度，或运行中的内嵌界面）挂上即到位。切页因此完全不依赖
-  // 检测结论——检测只在后台补齐缓存（它对 dsh 是一次 npx 解析，可能耗时数十秒），
+  // 检测结论——检测只在后台确认 npx 是否可用，
   // 结论回来后由 activeCliStatus 直接采用；可用性由运行面板自己的启动链路兜底。
-  // 让一次可能很慢的探测挡住切页，正是「点了没反应、过一会儿又能进」的由来。
+  // 让后台检测挡住切页，会造成「点了没反应、过一会儿又能进」。
   //
   // 「进入项目」前的那段确认对话框（confirmDiscardActiveChanges / selectKind）
   // 是原生窗口，focusout 会让界面感觉"卡了好几下"，所以那之后要立刻切页。

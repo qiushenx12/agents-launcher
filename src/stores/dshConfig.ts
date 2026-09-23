@@ -94,6 +94,12 @@ export interface DshVersionList {
   latest: string | null
 }
 
+/** A runnable version present in npm's local `_npx` cache. */
+export interface DshCachedVersion {
+  version: string
+  entries: number
+}
+
 /** Read-only outcome of 「检查更新」 (`dsh_check_update`): nothing is written. */
 export interface DshVersionCheck {
   /** The registry's current `latest`. */
@@ -172,6 +178,13 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
   /** Draft selection inside the picker; committed only on 确定. */
   const versionPickerChoice = ref<string | null>(null)
   const versionPickerError = ref('')
+  const cachedVersions = ref<DshCachedVersion[]>([])
+  const cachedVersionsLoading = ref(false)
+  const cachedVersionsError = ref('')
+  const cachedDeleteNotice = ref('')
+  const cachedDeleteError = ref('')
+  const deletingCachedVersion = ref<string | null>(null)
+  let versionPickerRequestId = 0
   /** The address QR dialog lives in the configuration panel. */
   const qrVisible = ref(false)
   let loadPromise: Promise<void> | null = null
@@ -403,29 +416,71 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
    * something else.
    */
   async function openVersionPicker() {
+    const requestId = ++versionPickerRequestId
     versionPickerVisible.value = true
     versionPickerList.value = null
     versionPickerError.value = ''
     versionPickerChoice.value = null
+    cachedVersions.value = []
+    cachedDeleteNotice.value = ''
+    cachedDeleteError.value = ''
+    void refreshCachedVersions(requestId)
     updatingVersion.value = true
     actionError.value = ''
     actionNotice.value = ''
     try {
       const list = await invoke<DshVersionList>('dsh_list_versions')
-      versionPickerList.value = list
-      versionPickerChoice.value = list.pinned
+      if (requestId === versionPickerRequestId) {
+        versionPickerList.value = list
+        versionPickerChoice.value = list.pinned
+      }
     } catch (error) {
-      versionPickerError.value = `获取 dsh 版本列表失败：${String(error)}`
+      if (requestId === versionPickerRequestId) {
+        versionPickerError.value = `获取 dsh 版本列表失败：${String(error)}`
+      }
     } finally {
-      updatingVersion.value = false
+      if (requestId === versionPickerRequestId) updatingVersion.value = false
     }
   }
 
   function closeVersionPicker() {
+    versionPickerRequestId += 1
     versionPickerVisible.value = false
     versionPickerList.value = null
     versionPickerChoice.value = null
     versionPickerError.value = ''
+  }
+
+  async function refreshCachedVersions(requestId = versionPickerRequestId) {
+    cachedVersionsLoading.value = true
+    cachedVersionsError.value = ''
+    try {
+      const versions = await invoke<DshCachedVersion[]>('dsh_list_cached_versions')
+      if (requestId === versionPickerRequestId) cachedVersions.value = versions
+    } catch (error) {
+      if (requestId === versionPickerRequestId) {
+        cachedVersionsError.value = `读取本机 dsh 版本失败：${String(error)}`
+      }
+    } finally {
+      if (requestId === versionPickerRequestId) cachedVersionsLoading.value = false
+    }
+  }
+
+  /** The dialog asks for confirmation before calling this destructive action. */
+  async function deleteCachedVersion(version: string): Promise<void> {
+    if (deletingCachedVersion.value || isBusy.value) return
+    deletingCachedVersion.value = version
+    cachedDeleteError.value = ''
+    cachedDeleteNotice.value = ''
+    try {
+      const entries = await invoke<number>('dsh_delete_cached_version', { version })
+      cachedDeleteNotice.value = `已删除 v${version} 的 ${entries} 个本机缓存条目。`
+    } catch (error) {
+      cachedDeleteError.value = `删除 v${version} 失败：${String(error)}`
+    } finally {
+      deletingCachedVersion.value = null
+      if (versionPickerVisible.value) await refreshCachedVersions()
+    }
   }
 
   /** Select a row in the picker. A second click on the same row clears it. */
@@ -643,6 +698,12 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     versionPickerList,
     versionPickerChoice,
     versionPickerError,
+    cachedVersions,
+    cachedVersionsLoading,
+    cachedVersionsError,
+    cachedDeleteNotice,
+    cachedDeleteError,
+    deletingCachedVersion,
     qrVisible,
     isDirty,
     isRunning,
@@ -666,6 +727,7 @@ export const useDshConfigStore = defineStore('dshConfig', () => {
     closeVersionPicker,
     chooseVersion,
     confirmVersionChoice,
+    deleteCachedVersion,
     start,
     startWith,
     stop,

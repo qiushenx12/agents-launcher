@@ -1163,7 +1163,7 @@ watch(leftWidth, (width) => {
 }
 
 .official-auth-status { margin-left: 120px; }
-.scope-warning { color: var(--warning, #b26a00); overflow-wrap: anywhere; }
+.scope-warning { color: var(--warning); overflow-wrap: anywhere; }
 .action-row {
   padding: 4px 0;
   display: flex;

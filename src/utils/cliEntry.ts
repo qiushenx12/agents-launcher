@@ -7,8 +7,7 @@
  *
  * dsh reaches the workspace through a supervised `dsh web` service and its own
  * browser UI, not through a discovered project/session workspace. The check for
- * it is an `npx` probe: it resolves the package over the network and routinely
- * takes tens of seconds, while the answer cannot gate anything — when the
+ * it checks whether `npx` is available, while the answer cannot gate anything — when the
  * service is down the runtime panel offers to start it, and when it is up the
  * backend answers from the live process and skips the probe entirely.
  *
@@ -61,7 +60,7 @@ export function cliWorkspaceCanMount(kind: string | null, state: string | null |
  *
  * The gate reports a missing or unusable executable and offers a re-check. For
  * dsh that verdict is never the whole story (the service can be running, or
- * startable, regardless of what an `npx` probe says), and covering its tab
+ * startable, regardless of what an availability check says), and covering its tab
  * with the gate is what made a click look like it did nothing.
  */
 export function cliAvailabilityGateApplies(kind: string | null | undefined): boolean {

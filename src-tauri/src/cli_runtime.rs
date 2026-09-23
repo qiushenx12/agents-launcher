@@ -152,29 +152,13 @@ fn hidden_command(program: impl AsRef<OsStr>) -> Command {
 }
 
 /// Human-facing name of a CLI. For dsh this is the package bin name, which is
-/// **not** guaranteed to be on `PATH`; use [`cli_invocation`] to actually run it.
+/// **not** guaranteed to be on `PATH`; the supervised runtime runs it via npx.
 fn command_name(kind: CliKind) -> &'static str {
     match kind {
         CliKind::Claude => "claude",
         CliKind::Codex => "codex",
         CliKind::Opencode => "opencode",
         CliKind::Dsh => "dsh",
-    }
-}
-
-/// Executable plus arguments used to run a CLI.
-///
-/// Three CLIs are single executables. dsh is distributed as the npm package
-/// `@deepseek-ai/dsh` whose bin name is `dsh`; unless the user globally
-/// installed it, `dsh` is not on `PATH`, so it must run through `npx`.
-fn cli_invocation(kind: CliKind) -> Vec<String> {
-    match kind {
-        CliKind::Dsh => vec![
-            "npx".to_string(),
-            "--yes".to_string(),
-            "@deepseek-ai/dsh".to_string(),
-        ],
-        other => vec![command_name(other).to_string()],
     }
 }
 
@@ -206,8 +190,7 @@ pub fn locate_cli(kind: CliKind) -> Option<PathBuf> {
 
 fn inspect_cli(kind: CliKind) -> CliStatus {
     // A running supervised dsh service is definitive proof that the CLI works
-    // and already knows its version: entering the dsh workspace while the
-    // service is up must not pay for the seconds-long npx probe below.
+    // and already knows its version.
     if kind == CliKind::Dsh {
         if let Some((version, executable)) = crate::dsh_runtime::running_supervised_proof() {
             return CliStatus {
@@ -235,15 +218,21 @@ fn inspect_cli(kind: CliKind) -> CliStatus {
         });
     };
 
-    let invocation = cli_invocation(kind);
-    let mut probe = hidden_command(&path);
-    // dsh must be probed through npx, which resolves the npm dist-tag over the
-    // network and is far slower than a local `--version`.
-    if invocation.len() > 1 {
-        probe.args(&invocation[1..]);
+    if kind == CliKind::Dsh {
+        // The selected dsh package is verified by dsh_runtime on start. A bare
+        // `npx @deepseek-ai/dsh -V` probes `latest` instead, can install a
+        // different release alongside the selected one, and competes with its
+        // first download. The availability check only needs npx itself.
+        return CliStatus {
+            kind,
+            state: CliStatusState::Ready,
+            issue_code: None,
+            message: "npx 已就绪；dsh 版本将在服务启动时验证。".to_string(),
+            executable_path: Some(path.to_string_lossy().to_string()),
+            version: None,
+        };
     }
-    let version_flag = if kind == CliKind::Dsh { "-V" } else { "--version" };
-    let output = match probe.arg(version_flag).output() {
+    let output = match hidden_command(&path).arg("--version").output() {
         Ok(output) => output,
         Err(error) => {
             let mut status =

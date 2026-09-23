@@ -20,6 +20,15 @@
   --success-hover: #248A3D;
   --danger: #FF3B30;
   --danger-hover: #D70015;
+  /* 「提示/降级」档：既不是错误也不是成功，用于配置页里的草稿态、待处理状态，
+     以及会挡住用户操作的提醒（如缺少凭据）。`--warning-strong` 是它在正文
+     文字上的取色——浅色底上字要更深才够对比度。 */
+  --warning: #B26A00;
+  --warning-strong: #8A5100;
+  /* 告警块的底色与描边。浅色主题用极浅的橙、深色主题用低透明度的橙，
+     所以不能从 `--warning` 用 color-mix 推——两个主题的方向相反。 */
+  --warning-surface: #FFF6E5;
+  --warning-border: #E8C48A;
   --separator: #E5E5EA;
   --input-bg: #FFFFFF;
   --input-border: #D2D2D7;
@@ -31,6 +40,10 @@
   --dot-idle: #34C759;
   --terminal-bg: #1E1E1E;
   --terminal-fg: #F0F0F0;
+  /* 弹窗遮罩。深色主题下要更沉，否则「面板浮在亮底上」的层级读不出来。 */
+  --overlay: rgba(0, 0, 0, 0.4);
+  /* 弹窗投影。同样是层级的一部分，浅色主题的投影要轻。 */
+  --modal-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
   --font-base: "Microsoft YaHei UI", system-ui, sans-serif;
   --font-mono: "SFMono-Regular", Menlo, Monaco, monospace;
   --font-size-base: 13px;
@@ -67,6 +80,12 @@
   --success-hover: #248A3D;
   --danger: #FF453A;
   --danger-hover: #FF6961;
+  /* 深色主题里 `--warning` 直接当正文色用（#D49A45 在 #0F1216 上够亮）；
+     告警块的底与边走 rgba 橙，方向与浅色主题相反，所以是独立令牌。 */
+  --warning: #D49A45;
+  --warning-strong: #E0AC5C;
+  --warning-surface: rgba(212, 154, 69, 0.1);
+  --warning-border: rgba(212, 154, 69, 0.42);
   --separator: #373E48;
   --input-bg: #2A3038;
   --input-border: #48515D;
@@ -78,6 +97,10 @@
   --dot-idle: #30D158;
   --terminal-bg: #171A1F;
   --terminal-fg: #F2F4F7;
+  /* 深色主题的遮罩必须比浅色主题更沉：面板本身已经很暗，0.4 的黑在暗底上
+     压不出层级，弹窗会像是「平贴」在界面上。 */
+  --overlay: rgba(0, 0, 0, 0.58);
+  --modal-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
 }
 
 /* Global reset */

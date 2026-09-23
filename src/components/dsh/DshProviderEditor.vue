@@ -510,8 +510,8 @@ function toggleWireExpanded(model: DshModelProfile) {
 }
 
 .provider-write-state--draft {
-  color: var(--warning, #d49a45);
-  background: color-mix(in srgb, var(--warning, #d49a45) 13%, transparent);
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 13%, transparent);
 }
 
 .field-row {
@@ -742,7 +742,7 @@ function toggleWireExpanded(model: DshModelProfile) {
 }
 
 .wires-toggle__hint {
-  color: var(--accent, #4c8dff);
+  color: var(--primary);
 }
 
 .wire-field {
