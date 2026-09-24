@@ -652,6 +652,17 @@ def pause_on_error() -> None:
     input("\n按回车键退出……")
 
 
+def pause_on_success() -> None:
+    """成功路径也暂停一下，让用户能看到最后的版本状态/产物路径。
+
+    与 pause_on_error 一样，wrapper（build-macos.command）会自己暂停，
+    所以检测到 wrapper 环境变量时直接返回，避免重复等待。
+    """
+    if os.environ.get("AGENTS_LAUNCHER_COMMAND_WRAPPER") == "1":
+        return
+    input("\n按回车键退出……")
+
+
 def main() -> int:
     try:
         platform_key = detect_current_platform()
@@ -705,17 +716,6 @@ def main() -> int:
     for artifact in artifacts:
         print(f"  {artifact}")
 
-    test_input = input(
-        f"\n{platform_label} {version} 测试通过请输入 r 后回车；"
-        "测试未通过请直接回车："
-    ).strip().lower()
-    if test_input != "r":
-        print(
-            f"{platform_label} {version} 保持待测试；"
-            "下一次打包仍使用该版本号。"
-        )
-        return 0
-
     try:
         updated_state = record_platform_passed(version, platform_key, artifacts)
     except (OSError, VersionStateError) as error:
@@ -728,10 +728,12 @@ def main() -> int:
         labels = "、".join(PLATFORM_LABELS[item] for item in remaining)
         print(f"已记录 {platform_label} {version} 测试通过；仍需完成：{labels}。")
         print("所有必需平台通过前，版本号不会递增。")
+        pause_on_success()
         return 0
 
     print(f"版本 {version} 的所有必需平台均已通过，已记录为发布。")
     print(f"下一次在 Windows 上打包时将自动使用 {next_version(version)}。")
+    pause_on_success()
     return 0
 
 

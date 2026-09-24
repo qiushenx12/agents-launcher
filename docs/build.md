@@ -84,8 +84,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 状态规则：
 
-- `pending`：该平台尚未通过测试。
-- `passed`：该平台安装包已构建、测试并归档。
+- `pending`：该平台尚未完成一次打包。
+- `passed`：该平台安装包已成功构建并归档。
 - 只有 `requiredPlatforms` 中的所有平台均为 `passed`，整个版本的 `published` 才会变为 `true`。
 - 任一平台重新运行打包时，只会把该平台重置为 `pending`，其它平台状态保持不变。
 - **版本号只由 Windows 端推进**：已发布版本在 Windows 下一次打包时才递增（或打包开始时手动输入更高版本号），并同时重置所有平台状态；macOS 端始终沿用仓库里的当前版本号，不提问、不递增。
@@ -121,12 +121,9 @@ Mac 用户也可以在 Finder 中双击根目录的 `build-macos.command`。该�
 - `src-tauri/Cargo.toml`
 - `src-tauri/Cargo.lock`
 
-打包完成后的输入规则：
+打包成功且找到安装包后，脚本会直接把当前平台记为 `passed` 并归档产物，**不再需要手动输入确认**。
 
-- 当前平台测试通过：输入 `r` 后回车。
-- 当前平台测试未通过：直接回车。
-
-输入 `r` 只代表“当前平台通过”。例如 Windows 首先通过时：
+例如 Windows 首先打包完成时：
 
 ```text
 currentVersion: 1.0.0
@@ -135,7 +132,7 @@ macos: pending
 published: false
 ```
 
-之后 Mac 使用相同版本完成打包并输入 `r`：
+之后 Mac 使用相同版本完成打包：
 
 ```text
 currentVersion: 1.0.0
@@ -144,7 +141,7 @@ macos: passed
 published: true
 ```
 
-下次打包才会变成 `1.0.1`。版本进位规则为：
+下次在 Windows 上打包才会变成 `1.0.1`。版本进位规则为：
 
 ```text
 1.0.0 -> 1.0.1
@@ -160,17 +157,17 @@ published: true
 | --- | --- | --- |
 | 推荐入口 | `python build.py` | Finder 双击 `build-macos.command`，或执行 `./build-macos.command` |
 | 构建类型 | NSIS `.exe` | `.app` 和 `.dmg` |
-| 测试通过输入 | `r` | `r` |
+| 通过判定 | 打包成功即通过 | 打包成功即通过 |
 | 状态字段 | `platforms.windows` | `platforms.macos` |
 | 测试归档 | `src-tauri/release-bundle/nsis/` | `src-tauri/release-bundle/dmg/` |
 | GitHub 附件 | `Agents Launcher_<版本>_x64-setup.exe` | `Agents Launcher_<版本>_<架构>.dmg` |
 
-每个平台输入 `r` 后只确认自己的产物：
+打包通过是平台各自的判定，互不影响：
 
-- Windows 输入 `r` 不会代替 Mac 测试。
-- Mac 输入 `r` 不会重新确认 Windows 产物。
-- 未通过的平台直接回车，保持 `pending`。
-- 已通过的平台重新打包时会先回到 `pending`，必须重新测试并输入 `r`。
+- Windows 通过不会代替 Mac 打包。
+- Mac 通过不会重新确认 Windows 产物。
+- 打包失败的平台保持 `pending`。
+- 已通过的平台重新打包时会先回到 `pending`，直到本次打包成功才恢复为 `passed`。
 - 最后一个必需平台通过时，脚本才写入版本级发布记录。
 
 ## Mac 端完整打包流程
@@ -212,7 +209,7 @@ macos: pending
 
 ### 3. 测试 DMG
 
-构建完成后检查脚本显示的 DMG 路径，至少验证：
+构建完成后脚本会自动把 macOS 记为 `passed` 并归档 DMG。建议抽查：
 
 - DMG 可以正常挂载。
 - 应用可以复制到 Applications 并启动。
@@ -220,7 +217,7 @@ macos: pending
 - 主要功能和终端功能在当前 Mac 架构上可用。
 - 如用于外部分发，签名和公证结果符合要求。
 
-测试通过后在脚本窗口输入 `r`。测试未通过则直接回车，修复后重新运行。
+如果发现问题，修复后重新运行 `build-macos.command` 即可（本次打包已记为 `passed`，但下一次成功的打包会覆盖产物路径与 `testedAt`，无需手动改 `version.json`）。
 
 ### 4. 核对最终状态
 
@@ -301,10 +298,10 @@ Agents Launcher_1.0.0_aarch64.dmg
 两个平台必须使用相同版本号和同一份业务源码。**版本号以 Windows 为准**，推荐顺序如下：
 
 1. 提交并推送待发布源码，确认 `currentVersion` 正确。
-2. Windows 拉取该提交，运行 `python build.py`——开始时确认或输入新版本号，测试通过后输入 `r`。
-3. 提交并推送 Windows 平台在 `version.json` 中的测试记录。
+2. Windows 拉取该提交，运行 `python build.py`——开始时确认或输入新版本号，打包成功即记录通过。
+3. 提交并推送 Windows 平台在 `version.json` 中的记录。
 4. Mac 拉取最新提交，确认仍是同一版本号（Mac 端不会询问也不会修改版本号）。
-5. Mac 运行 `python build.py` 或 `build-macos.command`，测试 DMG，通过后输入 `r`。
+5. Mac 运行 `python build.py` 或 `build-macos.command`，打包成功即记录通过。
 6. 此时 `published` 自动变为 `true`；提交最终发布记录。
 7. 创建唯一的版本 Tag，并将 Windows、macOS 安装包上传到同一个 GitHub Release。
 
@@ -414,7 +411,7 @@ gh release edit v1.0.0 --draft=false
 
 ### Windows 已通过后又重新打包会怎样？
 
-Windows 会先重置为 `pending`。只有新的 Windows 安装包再次测试并输入 `r` 后，才会恢复为 `passed`。
+Windows 会先重置为 `pending`，本次打包成功后再次记为 `passed`，产物路径与 `passedAt` 会被覆盖。
 
 ### 能否先发布 Windows，之后再向正式 Release 增加 Mac？
 
