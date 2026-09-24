@@ -1,6 +1,6 @@
 [package]
 name = "agents-launcher"
-version = "1.0.0"
+version = "1.0.1"
 description = "Agents Launcher - Tauri Edition"
 authors = ["you"]
 edition = "2021"
