@@ -378,14 +378,8 @@ struct ManagedGlobalEnv {
     previous_value: Option<String>,
 }
 
-fn app_data_dir() -> Result<PathBuf, String> {
-    dirs::data_dir()
-        .map(|path| path.join("ClaudeEnvManager"))
-        .ok_or_else(|| "无法确定 %APPDATA% 目录".to_string())
-}
-
 fn codex_data_dir() -> Result<PathBuf, String> {
-    Ok(app_data_dir()?.join("codex"))
+    Ok(crate::app_paths::app_data_dir_result()?.join("codex"))
 }
 
 /// 会话修复备份根目录。必须位于 CODEX_HOME 的 sessions/ 之外，
@@ -4977,7 +4971,7 @@ mod tests {
             .filter_map(TomlValue::as_str)
             .collect::<Vec<_>>();
         assert_eq!(&arguments[..3], ["-extract", profile.id.as_str(), "raw"]);
-        assert!(arguments[3].ends_with("ClaudeEnvManager/codex/credentials.json"));
+        assert!(arguments[3].ends_with("AgentsLauncher/codex/credentials.json"));
         assert!(!rendered.contains("sk-test-secret"));
     }
 

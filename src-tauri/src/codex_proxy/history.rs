@@ -271,7 +271,7 @@ impl CodexChatHistoryStore {
 }
 
 fn history_path(profile_id: &str) -> Option<PathBuf> {
-    let app_data = dirs::data_dir()?.join("ClaudeEnvManager").join("codex").join("proxy-history");
+    let app_data = crate::app_paths::app_data_dir()?.join("codex").join("proxy-history");
     let safe_id = profile_id
         .chars()
         .map(|character| {

@@ -899,7 +899,7 @@ function refreshStatus() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.45);
+  background: var(--overlay);
 }
 
 /* 版本列表浮层：与二维码同样的全屏遮罩，卡片内容由子组件负责。 */
@@ -910,7 +910,7 @@ function refreshStatus() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.45);
+  background: var(--overlay);
 }
 
 .dsh-qr-card {

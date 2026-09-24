@@ -9,14 +9,8 @@ use serde_json::{Map, Value};
 use crate::cli_contract::CliKind;
 use crate::cli_migration::migrate_project_store_value;
 
-fn app_data_dir() -> Result<PathBuf, String> {
-    dirs::data_dir()
-        .map(|d| d.join("ClaudeEnvManager"))
-        .ok_or_else(|| "Could not determine %APPDATA% directory".to_string())
-}
-
 fn projects_path() -> Result<PathBuf, String> {
-    Ok(app_data_dir()?.join("projects.json"))
+    Ok(crate::app_paths::app_data_dir_result()?.join("projects.json"))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -616,7 +610,7 @@ fn save_pasted_image_to(dir: &Path, data_base64: &str, extension: &str) -> Resul
 
 #[tauri::command]
 pub fn save_pasted_image(data_base64: String, extension: String) -> Result<String, String> {
-    let dir = app_data_dir()?.join("pasted_images");
+    let dir = crate::app_paths::app_data_dir_result()?.join("pasted_images");
     save_pasted_image_to(&dir, &data_base64, &extension)
 }
 

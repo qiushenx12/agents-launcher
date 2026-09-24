@@ -197,7 +197,7 @@ async function removeCachedVersion(version: string, entries: number) {
   border: 1px solid var(--separator);
   border-radius: var(--radius-lg);
   background: var(--card);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+  box-shadow: var(--modal-shadow);
 }
 
 .version-dialog__head {

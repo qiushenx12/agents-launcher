@@ -2150,9 +2150,7 @@ fn has_useful_log_artifacts(log_dir: &Path) -> bool {
 }
 
 fn app_data_base_dir() -> Result<PathBuf, String> {
-    dirs::data_dir()
-        .map(|path| path.join("ClaudeEnvManager"))
-        .ok_or_else(|| "无法确定应用数据目录".to_string())
+    crate::app_paths::app_data_dir_result()
 }
 
 fn write_statusline_settings(

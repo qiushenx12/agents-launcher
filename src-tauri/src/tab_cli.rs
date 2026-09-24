@@ -580,10 +580,7 @@ pub fn get_tab_permission(
 // ── Snapshot Persistence ─────────────────────────────────────────────────────
 
 fn snapshot_dir() -> Result<std::path::PathBuf, String> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| "Could not determine config directory".to_string())?
-        .join("ClaudeEnvManager")
-        .join("terminal_snapshots");
+    let base = crate::app_paths::app_data_dir_result()?.join("terminal_snapshots");
     std::fs::create_dir_all(&base).map_err(|e| format!("Failed to create snapshot dir: {}", e))?;
     Ok(base)
 }
@@ -800,10 +797,7 @@ pub struct PresetEntry {
 }
 
 fn preset_dir() -> Result<std::path::PathBuf, String> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| "Could not determine config directory".to_string())?
-        .join("ClaudeEnvManager")
-        .join("orchestration_presets");
+    let base = crate::app_paths::app_data_dir_result()?.join("orchestration_presets");
     std::fs::create_dir_all(&base).map_err(|e| format!("Failed to create preset dir: {}", e))?;
     Ok(base)
 }

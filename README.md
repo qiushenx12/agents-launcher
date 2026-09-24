@@ -117,8 +117,8 @@ Application-managed state is stored under:
 
 | Platform | Directory |
 | --- | --- |
-| Windows | `%APPDATA%\ClaudeEnvManager\` |
-| macOS | `~/Library/Application Support/ClaudeEnvManager/` |
+| Windows | `%APPDATA%\AgentsLauncher\` |
+| macOS | `~/Library/Application Support/AgentsLauncher/` |
 
 The application preserves unknown fields when updating supported external configuration files and uses transactional writes for sensitive state changes. On Windows, managed Codex and OpenCode secrets use DPAPI where supported. The current macOS implementation uses application-private files rather than Keychain protection, so local application data must be treated as sensitive.
 

@@ -593,14 +593,8 @@ fn lock_registry() -> Result<MutexGuard<'static, DshRegistry>, String> {
         .map_err(|_| "dsh 运行时注册表不可用".to_string())
 }
 
-fn app_data_dir() -> Result<PathBuf, String> {
-    dirs::data_dir()
-        .map(|path| path.join("ClaudeEnvManager"))
-        .ok_or_else(|| "无法确定应用数据目录".to_string())
-}
-
 fn runtime_dir() -> Result<PathBuf, String> {
-    Ok(app_data_dir()?.join("dsh"))
+    Ok(crate::app_paths::app_data_dir_result()?.join("dsh"))
 }
 
 fn overlay_path() -> Result<PathBuf, String> {
@@ -1065,10 +1059,6 @@ fn configure_process_tree(_command: &mut Command) {
     }
 }
 
-/// Arguments for `npx`. Launcher flags must precede app arguments: dsh's
-/// launcher parses its own flags and hands *everything after the first unknown
-/// token* to the app, so `--patch` after `--port` would reach the web app and
-/// be rejected with `unknown option '--patch'`.
 /// Arguments for `npx`. Launcher flags must precede app arguments: dsh's
 /// launcher parses its own flags and hands *everything after the first unknown
 /// token* to the app, so `--patch` after `--port` would reach the web app and

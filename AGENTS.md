@@ -10,9 +10,9 @@ Agents Launcher is a Windows and macOS desktop workspace for **Claude Code**, **
 - **Backend:** Rust and Tauri 2 commands/events
 - **Target platforms:** Windows (primary) and macOS (supported via `src-tauri/tauri.macos.conf.json` and `build-macos.command`)
 - **Package manager:** npm
-- **Application data:** `%APPDATA%\ClaudeEnvManager\`
-- **Claude capture logs (when “Claude 日志输出” is enabled):** `%APPDATA%\ClaudeEnvManager\terminal_logs\claude\<capture-id>\`
-- **Claude conversation UI error log:** `%APPDATA%\ClaudeEnvManager\terminal_logs\claude\ui-errors.jsonl`
+- **Application data:** `%APPDATA%\AgentsLauncher\`
+- **Claude capture logs (when “Claude 日志输出” is enabled):** `%APPDATA%\AgentsLauncher\terminal_logs\claude\<capture-id>\`
+- **Claude conversation UI error log:** `%APPDATA%\AgentsLauncher\terminal_logs\claude\ui-errors.jsonl`
 
 The backend also compiles and runs on macOS. Windows-only APIs (`winreg`, `windows` crates) are gated behind `[target.'cfg(windows)']` in `src-tauri/Cargo.toml`, and macOS-specific code (e.g. `objc2`, `objc2-app-kit`) behind `cfg(target_os = "macos")`. Keep every platform-specific call behind the matching `cfg` gate so both platforms keep compiling, and use the frontend `usePlatform` composable (`isMacOS`) for platform branching in Vue/TS code.
 
@@ -61,6 +61,11 @@ node --test tests/dshRuntime.test.ts
 
 # Top-bar surface invariants (single owner of the app background)
 node --test tests/topBarSurface.test.ts
+
+# dsh save-token flow. Requires `--experimental-test-module-mocks` and Node 22.15+:
+# the file stubs `@tauri-apps/api/core` with `mock.module()`, and without the flag
+# it fails at import time rather than on an assertion.
+node --experimental-test-module-mocks --test tests/dshSaveTokenFlow.test.ts
 
 # Rust unit tests
 cargo test --manifest-path src-tauri/Cargo.toml

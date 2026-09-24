@@ -182,14 +182,14 @@ const sourceDescription = computed(() => {
     const settingsSource = claudeStore.settingsSourcePath || '~/.claude/settings.json'
     const compatibility = claudeStore.settingsUsingLegacyPath ? '（当前从历史路径兼容读取）' : ''
     const launcherPath = isMacOS.value
-      ? '~/Library/Application Support/ClaudeEnvManager/env_configs.json'
-      : '%APPDATA%\\ClaudeEnvManager\\env_configs.json'
+      ? '~/Library/Application Support/AgentsLauncher/env_configs.json'
+      : '%APPDATA%\\AgentsLauncher\\env_configs.json'
     return `启动器方案：${launcherPath}；Claude 设置：${settingsSource}${compatibility}。`
   }
   if (workspaceStore.activeKind === 'codex') {
     const launcherPath = isMacOS.value
-      ? '~/Library/Application Support/ClaudeEnvManager/codex/profiles.json'
-      : '%APPDATA%\\ClaudeEnvManager\\codex\\profiles.json'
+      ? '~/Library/Application Support/AgentsLauncher/codex/profiles.json'
+      : '%APPDATA%\\AgentsLauncher\\codex\\profiles.json'
     return `全局配置：${codexStore.globalConfigPath || '~/.codex/config.toml'}（仅显式勾选时同步）；启动器方案：${codexStore.profilesPath || launcherPath}；auth.json 只读。`
   }
   if (workspaceStore.activeKind === 'dsh') {
@@ -197,11 +197,11 @@ const sourceDescription = computed(() => {
       ? `@deepseek-ai/dsh@${dshStore.saved.pinnedVersion}`
       : '@deepseek-ai/dsh'
     const overlayPath = isMacOS.value
-      ? '~/Library/Application Support/ClaudeEnvManager/dsh/runtime.overlay.yml'
-      : '%APPDATA%\\ClaudeEnvManager\\dsh\\runtime.overlay.yml'
+      ? '~/Library/Application Support/AgentsLauncher/dsh/runtime.overlay.yml'
+      : '%APPDATA%\\AgentsLauncher\\dsh\\runtime.overlay.yml'
     const statePath = isMacOS.value
-      ? '~/Library/Application Support/ClaudeEnvManager/app_state.json'
-      : '%APPDATA%\\ClaudeEnvManager\\app_state.json'
+      ? '~/Library/Application Support/AgentsLauncher/app_state.json'
+      : '%APPDATA%\\AgentsLauncher\\app_state.json'
     return `运行方式：npx --yes ${packageSpec} web；访问范围与端口保存在 ${statePath} 的 dsh_runtime 字段；每次启动生成 ${overlayPath} 覆盖 webserver 行的 host/port。模型与凭据由 dsh 自行管理。`
   }
   return `唯一配置来源：${opencodeStore.globalConfigPath || '~/.config/opencode/opencode.jsonc'}；界面直接读取和保存该文件，只管理其中带 npm 的自定义 Provider，内置 Provider 保持不变。`

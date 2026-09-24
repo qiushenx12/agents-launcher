@@ -365,14 +365,8 @@ fn default_state_version() -> u32 {
     STATE_VERSION
 }
 
-fn app_data_dir() -> Result<PathBuf, String> {
-    dirs::data_dir()
-        .map(|path| path.join("ClaudeEnvManager"))
-        .ok_or_else(|| "无法确定 %APPDATA% 目录".to_string())
-}
-
 fn data_dir() -> Result<PathBuf, String> {
-    Ok(app_data_dir()?.join("opencode"))
+    Ok(crate::app_paths::app_data_dir_result()?.join("opencode"))
 }
 
 fn profiles_path() -> Result<PathBuf, String> {

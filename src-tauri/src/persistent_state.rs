@@ -1,6 +1,6 @@
 //! persistent_state.rs
 //!
-//! Manages all UI state in a single file: {data_dir}/ClaudeEnvManager/app_state.json
+//! Manages all UI state in a single file: {data_dir}/AgentsLauncher/app_state.json
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,14 +16,8 @@ use crate::file_transaction::{restore_json_backup_if_missing, write_json_atomic}
 // Path helpers
 // ---------------------------------------------------------------------------
 
-fn app_data_dir() -> Result<PathBuf, String> {
-    dirs::data_dir()
-        .map(|d| d.join("ClaudeEnvManager"))
-        .ok_or_else(|| "Could not determine application data directory".to_string())
-}
-
 fn app_state_path() -> Result<PathBuf, String> {
-    Ok(app_data_dir()?.join("app_state.json"))
+    Ok(crate::app_paths::app_data_dir_result()?.join("app_state.json"))
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +422,7 @@ fn pane_widths_from_state(state: &AppState, keys: Vec<String>) -> BTreeMap<Strin
 // ---------------------------------------------------------------------------
 
 fn legacy_path(filename: &str) -> Option<PathBuf> {
-    app_data_dir().ok().map(|d| d.join(filename))
+    crate::app_paths::app_data_dir().map(|d| d.join(filename))
 }
 
 fn read_legacy<T: for<'de> Deserialize<'de>>(filename: &str) -> Option<T> {
@@ -471,7 +465,7 @@ struct LegacyUseBuiltinTerminal {
 }
 
 fn migrate_legacy() -> Option<AppState> {
-    let dir = app_data_dir().ok()?;
+    let dir = crate::app_paths::app_data_dir()?;
     if !dir.exists() {
         return None;
     }

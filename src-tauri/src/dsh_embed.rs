@@ -167,8 +167,8 @@ fn parse_url(raw: &str) -> Result<url::Url, String> {
 /// block.
 #[tauri::command]
 pub async fn dsh_debug_log(line: String) -> Result<(), String> {
-    let Ok(dir) = dirs::data_dir()
-        .map(|path| path.join("ClaudeEnvManager").join("dsh"))
+    let Ok(dir) = crate::app_paths::app_data_dir()
+        .map(|path| path.join("dsh"))
         .ok_or_else(|| "no data dir".to_string())
     else {
         return Ok(());

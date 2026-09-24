@@ -20,9 +20,7 @@ pub fn get_current_env_vars(var_names: Vec<String>) -> HashMap<String, String> {
 
 #[tauri::command]
 pub fn get_claude_config_dir() -> Result<String, String> {
-    let dir = dirs::data_dir()
-        .ok_or("Cannot determine application data directory")?
-        .join("ClaudeEnvManager");
+    let dir = crate::app_paths::app_data_dir_result()?;
     Ok(dir.to_string_lossy().to_string())
 }
 

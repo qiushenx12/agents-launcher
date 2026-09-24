@@ -1,3 +1,4 @@
+pub mod app_paths;
 pub mod claude_launcher;
 pub mod claude_observer;
 pub mod cli_capabilities;
@@ -140,6 +141,18 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let setup_started_at = std::time::Instant::now();
+
+            // 数据目录改名（ClaudeEnvManager → AgentsLauncher）后的一次性搬家。
+            // 必须排在所有读写之前：历史监听、代理同步、状态加载都在下面，任何一个
+            // 先跑都会在新目录里凭空建出空状态，让搬家再也无从判断。
+            let migration_started_at = std::time::Instant::now();
+            match app_paths::migrate_legacy_app_data_dir() {
+                Ok(true) => println!("已把旧数据目录迁移到 {}", app_paths::APP_DATA_DIR_NAME),
+                Ok(false) => {}
+                // 搬家失败不阻止启动：旧目录原样保留，仍可人工处理。
+                Err(error) => eprintln!("{error}"),
+            }
+            record_startup_duration("app-data-migration", migration_started_at);
 
             let watcher_started_at = std::time::Instant::now();
             session_manager::start_history_watcher(app.handle().clone());

@@ -117,8 +117,8 @@ Rust 应用位于 `src-tauri/src/`：
 
 | 平台 | 目录 |
 | --- | --- |
-| Windows | `%APPDATA%\ClaudeEnvManager\` |
-| macOS | `~/Library/Application Support/ClaudeEnvManager/` |
+| Windows | `%APPDATA%\AgentsLauncher\` |
+| macOS | `~/Library/Application Support/AgentsLauncher/` |
 
 应用更新所支持的外部配置文件时会保留未知字段，并对敏感状态变更使用事务写入。在 Windows 上，受管理的 Codex 与 OpenCode 密钥会在支持时使用 DPAPI。当前 macOS 实现使用应用私有文件而不是 Keychain，因此本地应用数据应被视为敏感信息。
 
