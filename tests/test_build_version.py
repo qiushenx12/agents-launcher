@@ -22,7 +22,9 @@ class BuildVersionTests(unittest.TestCase):
             ):
                 self.assertTrue(build.install_deps())
 
-            run.assert_called_once_with(["npm", "install"], cwd=project_dir)
+            run.assert_called_once_with(
+                ["npm", "install", "--no-audit", "--no-fund"], cwd=project_dir
+            )
 
     def test_next_version_increments_patch_until_nine(self) -> None:
         self.assertEqual(build.next_version("1.0.0"), "1.0.1")
@@ -70,7 +72,9 @@ class BuildVersionTests(unittest.TestCase):
             state["releases"] = [{"version": "1.0.0"}]
             build.save_version_state(state, version_file)
 
-            version, prepared_state = build.prepare_build_version(version_file, project_dir)
+            version, prepared_state = build.prepare_build_version(
+                None, version_file, project_dir
+            )
 
             self.assertEqual(version, "1.0.1")
             self.assertFalse(prepared_state["published"])
@@ -87,7 +91,9 @@ class BuildVersionTests(unittest.TestCase):
             state["platforms"]["windows"] = self.passed_platform("windows.exe", "x64")
             build.save_version_state(state, version_file)
 
-            version, prepared_state = build.prepare_build_version(version_file, project_dir)
+            version, prepared_state = build.prepare_build_version(
+                None, version_file, project_dir
+            )
             build.begin_platform_build(prepared_state, "macos", version_file)
 
             self.assertEqual(version, "1.0.0")
@@ -200,6 +206,65 @@ class BuildVersionTests(unittest.TestCase):
             build.platform_build_command("npm", "macos"),
             ["npm", "run", "tauri", "build", "--", "--bundles", "app,dmg"],
         )
+
+    def test_manual_version_overrides_even_when_unpublished(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            self.write_project_files(project_dir)
+            version_file = project_dir / "version.json"
+            state = build.default_version_state()
+            build.save_version_state(state, version_file)
+
+            version, prepared_state = build.prepare_build_version(
+                "2.3.4", version_file, project_dir
+            )
+
+            self.assertEqual(version, "2.3.4")
+            self.assertFalse(prepared_state["published"])
+            reloaded = build.load_version_state(version_file)
+            self.assertEqual(reloaded["currentVersion"], "2.3.4")
+            self.assert_project_versions(project_dir, "2.3.4")
+
+    def test_manual_version_must_exceed_current_and_releases(self) -> None:
+        state = build.default_version_state()
+        state["currentVersion"] = "1.2.3"
+        state["releases"] = [{"version": "1.2.3"}]
+
+        with self.assertRaises(build.VersionStateError):
+            build.validate_new_version("1.2.3", state)
+        with self.assertRaises(build.VersionStateError):
+            build.validate_new_version("1.2.2", state)
+        with self.assertRaises(build.VersionStateError):
+            build.validate_new_version("1.2.10", state)
+
+    def test_macos_never_prompts_for_version(self) -> None:
+        state = build.default_version_state()
+        # macOS 不提问，任何状态下都返回 None（不经过 input）。
+        self.assertIsNone(build.prompt_build_version(state, "macos"))
+        state["published"] = True
+        self.assertIsNone(build.prompt_build_version(state, "macos"))
+
+    def test_macos_published_state_still_uses_current_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            self.write_project_files(project_dir)
+            version_file = project_dir / "version.json"
+            state = build.default_version_state()
+            # 模拟 Windows 刚发完 1.0.0：published=True，平台记录齐。
+            state["published"] = True
+            state["platforms"]["windows"] = self.passed_platform("windows.exe", "x64")
+            state["platforms"]["macos"] = self.passed_platform("macos.dmg", "arm64")
+            state["releases"] = [{"version": "1.0.0"}]
+            build.save_version_state(state, version_file)
+
+            version, prepared_state = build.prepare_build_version(
+                None, version_file, project_dir, platform_key="macos"
+            )
+
+            # macOS 端即使看到 published 也不递增：它要补的就是 1.0.0 的 mac 半边。
+            self.assertEqual(version, "1.0.0")
+            self.assertTrue(prepared_state["published"])
+            self.assert_project_versions(project_dir, "1.0.0")
 
     @staticmethod
     def passed_platform(path: str, architecture: str) -> dict[str, object]:

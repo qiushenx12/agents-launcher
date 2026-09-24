@@ -88,7 +88,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - `passed`：该平台安装包已构建、测试并归档。
 - 只有 `requiredPlatforms` 中的所有平台均为 `passed`，整个版本的 `published` 才会变为 `true`。
 - 任一平台重新运行打包时，只会把该平台重置为 `pending`，其它平台状态保持不变。
-- 已发布版本在下一次任一平台打包时才会递增，并同时重置所有平台状态。
+- **版本号只由 Windows 端推进**：已发布版本在 Windows 下一次打包时才递增（或打包开始时手动输入更高版本号），并同时重置所有平台状态；macOS 端始终沿用仓库里的当前版本号，不提问、不递增。
 - 旧版 `schemaVersion: 1` 会由 `build.py` 自动迁移为平台级状态。
 
 如果某个版本明确只发布一个平台，可以在开始打包前调整 `requiredPlatforms`。已经开始双平台测试后不要临时删除平台要求。
@@ -109,8 +109,8 @@ Mac 用户也可以在 Finder 中双击根目录的 `build-macos.command`。该�
 
 脚本会自动识别当前系统：
 
-- Windows：生成 NSIS `.exe` 安装包。
-- macOS：生成 `.app` 和 `.dmg`，版本记录使用 `.dmg`。
+- Windows：生成 NSIS `.exe` 安装包。**打包开始时会询问版本号**：输入更高的新版本号则本次使用它，直接回车则沿用 `currentVersion`（若上一版本已发布则自动递增）。
+- macOS：生成 `.app` 和 `.dmg`，版本记录使用 `.dmg`。**不询问版本号**，始终跟随仓库里 Windows 已定好的 `currentVersion`——因此 Mac 打包前必须先 `git pull` 到 Windows 打包并提交后的提交。
 - 其它系统：拒绝正式打包。
 
 脚本还会把当前版本号同步到：
@@ -298,13 +298,13 @@ Agents Launcher_1.0.0_aarch64.dmg
 
 ## 两台电脑协作打包
 
-两个平台必须使用相同版本号和同一份业务源码。推荐顺序如下：
+两个平台必须使用相同版本号和同一份业务源码。**版本号以 Windows 为准**，推荐顺序如下：
 
 1. 提交并推送待发布源码，确认 `currentVersion` 正确。
-2. Windows 拉取该提交，运行 `python build.py`，测试通过后输入 `r`。
+2. Windows 拉取该提交，运行 `python build.py`——开始时确认或输入新版本号，测试通过后输入 `r`。
 3. 提交并推送 Windows 平台在 `version.json` 中的测试记录。
-4. Mac 拉取最新提交，确认仍是同一版本号。
-5. Mac 运行 `python build.py`，测试 DMG，通过后输入 `r`。
+4. Mac 拉取最新提交，确认仍是同一版本号（Mac 端不会询问也不会修改版本号）。
+5. Mac 运行 `python build.py` 或 `build-macos.command`，测试 DMG，通过后输入 `r`。
 6. 此时 `published` 自动变为 `true`；提交最终发布记录。
 7. 创建唯一的版本 Tag，并将 Windows、macOS 安装包上传到同一个 GitHub Release。
 
@@ -407,6 +407,10 @@ gh release edit v1.0.0 --draft=false
 ### Windows 已通过，Mac 打包失败会递增版本吗？
 
 不会。版本保持不变，Windows 继续为 `passed`，macOS 保持 `pending`。修复后在 Mac 上重新打包即可。
+
+### 为什么 Mac 打包时没有版本号提问？
+
+版本号以 Windows 为准。Mac 端只做兼容性验证与补打包，始终使用仓库里 Windows 已定的 `currentVersion`。如果 Mac 上看到的版本号不对，先 `git pull` 到 Windows 打包并提交后的提交再打包。
 
 ### Windows 已通过后又重新打包会怎样？
 

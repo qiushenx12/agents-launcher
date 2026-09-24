@@ -274,13 +274,58 @@ def reset_platform_records(state: dict[str, Any]) -> None:
     state["platforms"] = new_platform_records()
 
 
+def validate_new_version(version: str, state: dict[str, Any]) -> None:
+    candidate = parse_version(version)
+    current = parse_version(state["currentVersion"])
+    if candidate <= current:
+        raise VersionStateError(f"新版本号必须高于当前版本 {state['currentVersion']}")
+    if any(release.get("version") == version for release in state["releases"]):
+        raise VersionStateError(f"版本 {version} 已有发布记录")
+    if state["releases"] and candidate <= max(
+        parse_version(release["version"]) for release in state["releases"]
+    ):
+        raise VersionStateError("新版本号必须高于所有已发布版本")
+
+
+def prompt_build_version(state: dict[str, Any], platform_key: str) -> str | None:
+    if platform_key != "windows":
+        # macOS 只做兼容性验证与补打包：版本号由 Windows 端在打包时定好并随
+        # git 提交带过来，这里不提问、不升版，直接用仓库里的版本。
+        return None
+    current = state["currentVersion"]
+    while True:
+        version = input(
+            f"\n当前版本 {current}。升版本请输入新版本号（x.y.z，修订号 0–9）；"
+            "不升版本号直接回车："
+        ).strip()
+        if not version:
+            return None
+        try:
+            validate_new_version(version, state)
+        except VersionStateError as error:
+            print(f"版本号无效：{error}。请重新输入。")
+            continue
+        return version
+
+
 def prepare_build_version(
+    requested_version: str | None = None,
     version_file: Path = VERSION_FILE,
     project_dir: Path = PROJECT_DIR,
+    platform_key: str = "windows",
 ) -> tuple[str, dict[str, Any]]:
     state = load_version_state(version_file)
     version = state["currentVersion"]
-    if state["published"]:
+    if requested_version is not None:
+        validate_new_version(requested_version, state)
+        version = requested_version
+        state["currentVersion"] = version
+        state["published"] = False
+        reset_platform_records(state)
+        print(f"本次打包使用手动指定版本 {version}。")
+    elif state["published"] and platform_key == "windows":
+        # 只有 Windows 端推进版本号；macOS 端即使看到 published 也沿用当前版本
+        # （那是 Windows 刚发完的版本，本次 macOS 打包就是在补它的 macOS 半边）。
         version = next_version(version)
         state["currentVersion"] = version
         state["published"] = False
@@ -616,6 +661,19 @@ def main() -> int:
         return 1
 
     platform_label = PLATFORM_LABELS[platform_key]
+    if platform_key == "macos":
+        # 版本号以 Windows 为准：mac 打包前应先 git pull 到 Windows 打完包的那个提交。
+        print("macOS 打包：版本号跟随 Windows（请先 git pull 到 Windows 打包后的提交）。")
+    try:
+        # 先问版本再检查环境：用户直接回车沿用旧版本时，package.json 等
+        # 五个文件不会被同步重写，也就不会产生无关的 git 噪音。
+        initial_state = load_version_state()
+        requested_version = prompt_build_version(initial_state, platform_key)
+    except (OSError, VersionStateError) as error:
+        print(f"版本选择失败：{error}")
+        pause_on_error()
+        return 1
+
     print(f"正在检查 {platform_label} 打包环境……")
     if not check_npm() or not check_rust():
         pause_on_error()
@@ -625,7 +683,7 @@ def main() -> int:
         return 1
 
     try:
-        version, state = prepare_build_version()
+        version, state = prepare_build_version(requested_version, platform_key=platform_key)
         begin_platform_build(state, platform_key)
         product_name = load_product_name()
     except (OSError, VersionStateError) as error:
@@ -673,7 +731,7 @@ def main() -> int:
         return 0
 
     print(f"版本 {version} 的所有必需平台均已通过，已记录为发布。")
-    print(f"下一次任一平台打包将自动使用 {next_version(version)}。")
+    print(f"下一次在 Windows 上打包时将自动使用 {next_version(version)}。")
     return 0
 
 
