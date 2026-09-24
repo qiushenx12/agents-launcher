@@ -584,7 +584,11 @@ fn running_codex_client_processes() -> Vec<String> {
 #[cfg(not(windows))]
 fn running_codex_client_processes() -> Vec<String> {
     let mut found = Vec::new();
-    for name in ["Code", "Codex"] {
+    // 进程名要与可执行文件名逐字相同（`pgrep -x`）。`ChatGPT` 是 macOS 上
+    // Codex 桌面端的载体（`/Applications/ChatGPT.app/Contents/MacOS/ChatGPT`），
+    // 对应 Windows 分支里的 `chatgpt.exe`；漏掉它会让修复在客户端持有状态库时
+    // 照常进行，而客户端退出时又会用内存旧状态覆盖修复结果。
+    for name in ["Code", "Codex", "ChatGPT"] {
         let running = std::process::Command::new("pgrep")
             .args(["-x", name])
             .output()
