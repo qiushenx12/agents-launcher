@@ -53,56 +53,145 @@ class BuildVersionTests(unittest.TestCase):
 
             state = build.load_version_state(version_file)
 
-            self.assertEqual(state["schemaVersion"], 2)
-            self.assertEqual(state["requiredPlatforms"], ["windows", "macos"])
+            self.assertEqual(state["schemaVersion"], 3)
             self.assertEqual(state["platforms"]["windows"]["status"], "pending")
             self.assertEqual(state["platforms"]["macos"]["status"], "pending")
             persisted = json.loads(version_file.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["schemaVersion"], 2)
+            self.assertEqual(persisted["schemaVersion"], 3)
 
-    def test_published_version_advances_and_resets_all_platforms(self) -> None:
+    def test_migration_drops_the_publish_controls(self) -> None:
+        """schema 2 的 `published` / `requiredPlatforms` 必须被丢弃。
+
+        它们让「直接回车」的含义取决于一个看不见的标志，正是本次要取消的多重
+        控制。`releases` 保留为历史，`publishedAt` 改名为中性的 `recordedAt`。
+        """
         with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            self.write_project_files(project_dir)
-            version_file = project_dir / "version.json"
-            state = build.default_version_state()
-            state["published"] = True
-            state["platforms"]["windows"] = self.passed_platform("windows.exe", "x64")
-            state["platforms"]["macos"] = self.passed_platform("macos.dmg", "arm64")
-            state["releases"] = [{"version": "1.0.0"}]
-            build.save_version_state(state, version_file)
-
-            version, prepared_state = build.prepare_build_version(
-                None, version_file, project_dir
+            version_file = Path(temp_dir) / "version.json"
+            version_file.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 2,
+                        "currentVersion": "1.0.1",
+                        "published": True,
+                        "requiredPlatforms": ["windows", "macos"],
+                        "platforms": {
+                            "windows": self.passed_platform("windows.exe", "x64"),
+                            "macos": self.passed_platform("macos.dmg", "arm64"),
+                        },
+                        "releases": [
+                            {
+                                "version": "1.0.1",
+                                "published": True,
+                                "publishedAt": "2026-09-25T08:03:41+08:00",
+                                "platforms": {
+                                    "windows": self.passed_platform("windows.exe", "x64"),
+                                    "macos": self.passed_platform("macos.dmg", "arm64"),
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
             )
 
+            state = build.load_version_state(version_file)
+
+            self.assertEqual(state["schemaVersion"], 3)
+            self.assertNotIn("published", state)
+            self.assertNotIn("requiredPlatforms", state)
+            # 平台状态与历史都保住了。
+            self.assertEqual(state["platforms"]["windows"]["status"], "passed")
+            self.assertEqual(len(state["releases"]), 1)
+            self.assertNotIn("published", state["releases"][0])
+            self.assertEqual(
+                state["releases"][0]["recordedAt"], "2026-09-25T08:03:41+08:00"
+            )
+            self.assertIn("platforms", state["releases"][0])
+
+    def test_enter_always_keeps_the_current_version(self) -> None:
+        """直接回车 = 沿用当前版本，永远如此。
+
+        这里曾经有第二条路径：`published` 为真时自动升一版。于是同一个按键在
+        不同时刻做不同的事，取决于用户看不见的标志 —— 已移除。
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            self.write_project_files(project_dir)
+            version_file = project_dir / "version.json"
+            # 两个平台都 passed 的状态，正是旧代码里会自动升版的那种。
+            state = build.default_version_state()
+            state["currentVersion"] = "1.0.1"
+            state["platforms"]["windows"] = self.passed_platform("windows.exe", "x64")
+            state["platforms"]["macos"] = self.passed_platform("macos.dmg", "arm64")
+            build.save_version_state(state, version_file)
+
+            version, prepared_state = build.prepare_build_version(None, version_file, project_dir)
+
             self.assertEqual(version, "1.0.1")
-            self.assertFalse(prepared_state["published"])
-            self.assertEqual(prepared_state["platforms"]["windows"]["status"], "pending")
-            self.assertEqual(prepared_state["platforms"]["macos"]["status"], "pending")
+            # 平台记录也不该被重置 —— 本次只是重出，不是开新版本。
+            self.assertEqual(prepared_state["platforms"]["windows"]["status"], "passed")
+            self.assertEqual(prepared_state["platforms"]["macos"]["status"], "passed")
             self.assert_project_versions(project_dir, "1.0.1")
 
-    def test_unpublished_version_reuses_number_and_preserves_other_platform(self) -> None:
+    def test_higher_version_resets_both_platform_records(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
             self.write_project_files(project_dir)
             version_file = project_dir / "version.json"
             state = build.default_version_state()
+            state["currentVersion"] = "1.0.1"
             state["platforms"]["windows"] = self.passed_platform("windows.exe", "x64")
             build.save_version_state(state, version_file)
 
             version, prepared_state = build.prepare_build_version(
-                None, version_file, project_dir
+                "1.0.2", version_file, project_dir
+            )
+
+            self.assertEqual(version, "1.0.2")
+            self.assertEqual(prepared_state["platforms"]["windows"]["status"], "pending")
+            self.assertEqual(prepared_state["platforms"]["macos"]["status"], "pending")
+            self.assert_project_versions(project_dir, "1.0.2")
+
+    def test_same_version_keeps_the_other_platform_record(self) -> None:
+        """输入与当前相同的版本号 = 重出，不动另一个平台的记录。
+
+        否则重出 mac 会顺手把 windows 刚做好的 `passed` 抹掉。
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            self.write_project_files(project_dir)
+            version_file = project_dir / "version.json"
+            state = build.default_version_state()
+            state["currentVersion"] = "1.0.1"
+            state["platforms"]["windows"] = self.passed_platform("windows.exe", "x64")
+            build.save_version_state(state, version_file)
+
+            version, prepared_state = build.prepare_build_version(
+                "1.0.1", version_file, project_dir
             )
             build.begin_platform_build(prepared_state, "macos", version_file)
 
-            self.assertEqual(version, "1.0.0")
+            self.assertEqual(version, "1.0.1")
             reloaded = build.load_version_state(version_file)
             self.assertEqual(reloaded["platforms"]["windows"]["status"], "passed")
             self.assertEqual(reloaded["platforms"]["macos"]["status"], "pending")
-            self.assert_project_versions(project_dir, "1.0.0")
+            self.assert_project_versions(project_dir, "1.0.1")
 
-    def test_version_is_published_only_after_all_required_platforms_pass(self) -> None:
+    def test_manual_version_may_repeat_current_but_never_goes_backwards(self) -> None:
+        state = build.default_version_state()
+        state["currentVersion"] = "1.2.3"
+        state["releases"] = [{"version": "1.2.3"}]
+
+        # 等于当前版本 = 重出同一版本，必须放行。
+        build.validate_new_version("1.2.3", state)
+        build.validate_new_version("1.2.4", state)
+        with self.assertRaises(build.VersionStateError):
+            build.validate_new_version("1.2.2", state)
+        with self.assertRaises(build.VersionStateError):
+            build.validate_new_version("1.2.10", state)
+
+    def test_packaging_records_both_platforms_without_a_gate(self) -> None:
+        """平台各记各的，互不为前提。没有「都通过才算发布」这道门禁。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
             version_file = project_dir / "version.json"
@@ -124,16 +213,17 @@ class BuildVersionTests(unittest.TestCase):
                 "x64",
             )
 
-            self.assertFalse(windows_state["published"])
             self.assertEqual(windows_state["platforms"]["windows"]["status"], "passed")
-            self.assertEqual(build.remaining_required_platforms(windows_state), ["macos"])
-            self.assertEqual(windows_state["releases"], [])
+            # macOS 还没打过包，但这不妨碍 Windows 的产物被记录与归档。
+            self.assertEqual(windows_state["platforms"]["macos"]["status"], "pending")
             self.assertEqual(
                 (windows_archive / windows_installer.name).read_bytes(),
                 b"windows-installer",
             )
+            self.assertEqual(windows_state["releases"][0]["version"], "1.0.0")
+            self.assertEqual(set(windows_state["releases"][0]["platforms"]), {"windows"})
 
-            published_state = build.record_platform_passed(
+            final_state = build.record_platform_passed(
                 "1.0.0",
                 "macos",
                 [macos_installer],
@@ -143,23 +233,18 @@ class BuildVersionTests(unittest.TestCase):
                 "arm64",
             )
 
-            self.assertTrue(published_state["published"])
-            self.assertEqual(build.remaining_required_platforms(published_state), [])
-            self.assertEqual(published_state["releases"][0]["version"], "1.0.0")
-            self.assertEqual(
-                set(published_state["releases"][0]["platforms"]),
-                {"windows", "macos"},
-            )
-            self.assertEqual(
-                published_state["releases"][0]["platforms"]["windows"]["architecture"],
-                "x64",
-            )
+            self.assertEqual(final_state["platforms"]["macos"]["status"], "passed")
             self.assertEqual(
                 (macos_archive / macos_installer.name).read_bytes(),
                 b"macos-installer",
             )
+            # 同一版本只有一条历史，两个平台的快照都在里面。
+            self.assertEqual(len(final_state["releases"]), 1)
+            self.assertEqual(
+                set(final_state["releases"][0]["platforms"]), {"windows", "macos"}
+            )
 
-    def test_retested_unpublished_platform_can_replace_its_archive(self) -> None:
+    def test_retested_platform_can_replace_its_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
             version_file = project_dir / "version.json"
@@ -190,8 +275,33 @@ class BuildVersionTests(unittest.TestCase):
                 "x64",
             )
 
-            self.assertFalse(updated_state["published"])
             self.assertEqual((archive_dir / installer.name).read_bytes(), b"second-build")
+            # 重出刷新那条历史，而不是追加第二条。
+            self.assertEqual(len(updated_state["releases"]), 1)
+            self.assertEqual(updated_state["releases"][0]["version"], "1.0.0")
+
+    def test_rebuild_keeps_the_first_recorded_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            version_file = project_dir / "version.json"
+            archive_dir = project_dir / "release-history" / "macos"
+            installer = project_dir / "Agents Launcher_1.0.0_aarch64.dmg"
+            build.save_version_state(build.default_version_state(), version_file)
+            installer.write_bytes(b"first-dmg")
+
+            first = build.record_platform_passed(
+                "1.0.0", "macos", [installer], version_file, project_dir, archive_dir, "arm64"
+            )
+            first_recorded_at = first["releases"][0]["recordedAt"]
+
+            installer.write_bytes(b"second-dmg")
+            second = build.record_platform_passed(
+                "1.0.0", "macos", [installer], version_file, project_dir, archive_dir, "arm64"
+            )
+
+            self.assertEqual(len(second["releases"]), 1)
+            # 首次记录时间是历史，重出不该改写它。
+            self.assertEqual(second["releases"][0]["recordedAt"], first_recorded_at)
 
     def test_platform_detection_and_build_commands(self) -> None:
         self.assertEqual(build.detect_current_platform("win32"), "windows")
@@ -207,154 +317,10 @@ class BuildVersionTests(unittest.TestCase):
             ["npm", "run", "tauri", "build", "--", "--bundles", "app,dmg"],
         )
 
-    def test_manual_version_overrides_even_when_unpublished(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            self.write_project_files(project_dir)
-            version_file = project_dir / "version.json"
-            state = build.default_version_state()
-            build.save_version_state(state, version_file)
-
-            version, prepared_state = build.prepare_build_version(
-                "2.3.4", version_file, project_dir
-            )
-
-            self.assertEqual(version, "2.3.4")
-            self.assertFalse(prepared_state["published"])
-            reloaded = build.load_version_state(version_file)
-            self.assertEqual(reloaded["currentVersion"], "2.3.4")
-            self.assert_project_versions(project_dir, "2.3.4")
-
-    def test_manual_version_may_repeat_current_but_never_goes_backwards(self) -> None:
-        state = build.default_version_state()
-        state["currentVersion"] = "1.2.3"
-        state["releases"] = [{"version": "1.2.3"}]
-
-        # 等于当前版本 = 重出同一版本，必须放行 —— 已发布过也一样。
-        build.validate_new_version("1.2.3", state)
-        build.validate_new_version("1.2.4", state)
-        with self.assertRaises(build.VersionStateError):
-            build.validate_new_version("1.2.2", state)
-        with self.assertRaises(build.VersionStateError):
-            build.validate_new_version("1.2.10", state)
-
-    def test_published_version_can_be_rebuilt_without_bumping(self) -> None:
-        """同一版本号必须能反复出包，发布之后也一样。
-
-        这正是「1.0.1 发布后又要重打 macOS」的场景：旧代码在
-        `begin_platform_build` 直接抛「已发布版本不能重新开始平台打包」，
-        出包根本进不去。
-        """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            self.write_project_files(project_dir)
-            version_file = project_dir / "version.json"
-            macos_archive = project_dir / "release-history" / "macos"
-            installer = project_dir / "Agents Launcher_1.0.1_aarch64.dmg"
-            installer.write_bytes(b"first-dmg")
-
-            state = build.default_version_state()
-            state["currentVersion"] = "1.0.1"
-            state["published"] = True
-            state["platforms"]["windows"] = self.passed_platform("windows.exe", "x64")
-            state["platforms"]["macos"] = self.passed_platform("macos.dmg", "arm64")
-            state["releases"] = [
-                {
-                    "version": "1.0.1",
-                    "published": True,
-                    "publishedAt": "2026-09-25T08:03:41+08:00",
-                    "platforms": {
-                        "windows": self.passed_platform("windows.exe", "x64"),
-                        "macos": self.passed_platform("macos.dmg", "arm64"),
-                    },
-                }
-            ]
-            build.save_version_state(state, version_file)
-
-            version, prepared_state = build.prepare_build_version(
-                None, version_file, project_dir, platform_key="macos"
-            )
-            self.assertEqual(version, "1.0.1")
-            build.begin_platform_build(prepared_state, "macos", version_file)
-
-            # 重出只把本次平台置回 pending，另一个平台与 published 都不受影响。
-            reloaded = build.load_version_state(version_file)
-            self.assertEqual(reloaded["platforms"]["macos"]["status"], "pending")
-            self.assertEqual(reloaded["platforms"]["windows"]["status"], "passed")
-            self.assertTrue(reloaded["published"])
-
-            installer.write_bytes(b"second-dmg")
-            final_state = build.record_platform_passed(
-                "1.0.1",
-                "macos",
-                [installer],
-                version_file,
-                project_dir,
-                macos_archive,
-                "arm64",
-            )
-
-            # 不会多出第二条发布记录，但产物快照要换成新的那份。
-            self.assertTrue(final_state["published"])
-            self.assertEqual(len(final_state["releases"]), 1)
-            self.assertEqual(final_state["releases"][0]["version"], "1.0.1")
-            self.assertEqual(
-                final_state["releases"][0]["platforms"]["macos"]["artifacts"][0]["path"],
-                (macos_archive / installer.name).relative_to(project_dir).as_posix(),
-            )
-            self.assertEqual((macos_archive / installer.name).read_bytes(), b"second-dmg")
-            # 首次发布时间是历史，重出不该改写它。
-            self.assertEqual(
-                final_state["releases"][0]["publishedAt"], "2026-09-25T08:03:41+08:00"
-            )
-
-    def test_explicit_repeat_version_keeps_the_other_platform_record(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            self.write_project_files(project_dir)
-            version_file = project_dir / "version.json"
-            state = build.default_version_state()
-            state["currentVersion"] = "1.0.1"
-            state["published"] = True
-            state["platforms"]["macos"] = self.passed_platform("macos.dmg", "arm64")
-            build.save_version_state(state, version_file)
-
-            version, prepared_state = build.prepare_build_version(
-                "1.0.1", version_file, project_dir, platform_key="windows"
-            )
-
-            self.assertEqual(version, "1.0.1")
-            self.assertTrue(prepared_state["published"])
-            self.assertEqual(prepared_state["platforms"]["macos"]["status"], "passed")
-
     def test_macos_never_prompts_for_version(self) -> None:
         state = build.default_version_state()
         # macOS 不提问，任何状态下都返回 None（不经过 input）。
         self.assertIsNone(build.prompt_build_version(state, "macos"))
-        state["published"] = True
-        self.assertIsNone(build.prompt_build_version(state, "macos"))
-
-    def test_macos_published_state_still_uses_current_version(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            self.write_project_files(project_dir)
-            version_file = project_dir / "version.json"
-            state = build.default_version_state()
-            # 模拟 Windows 刚发完 1.0.0：published=True，平台记录齐。
-            state["published"] = True
-            state["platforms"]["windows"] = self.passed_platform("windows.exe", "x64")
-            state["platforms"]["macos"] = self.passed_platform("macos.dmg", "arm64")
-            state["releases"] = [{"version": "1.0.0"}]
-            build.save_version_state(state, version_file)
-
-            version, prepared_state = build.prepare_build_version(
-                None, version_file, project_dir, platform_key="macos"
-            )
-
-            # macOS 端即使看到 published 也不递增：它要补的就是 1.0.0 的 mac 半边。
-            self.assertEqual(version, "1.0.0")
-            self.assertTrue(prepared_state["published"])
-            self.assert_project_versions(project_dir, "1.0.0")
 
     @staticmethod
     def passed_platform(path: str, architecture: str) -> dict[str, object]:

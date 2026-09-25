@@ -57,13 +57,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "currentVersion": "1.0.0",
-  "published": false,
-  "requiredPlatforms": [
-    "windows",
-    "macos"
-  ],
   "platforms": {
     "windows": {
       "status": "pending",
@@ -86,13 +81,11 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 - `pending`：该平台尚未完成一次打包。
 - `passed`：该平台安装包已成功构建并归档。
-- 只有 `requiredPlatforms` 中的所有平台均为 `passed`，整个版本的 `published` 才会变为 `true`。
+- 平台各记各的，**互不为前提**：任一台打包成功即记录，不需要另一个平台先通过。
 - 任一平台重新运行打包时，只会把该平台重置为 `pending`，其它平台状态保持不变。
-- **同一版本号可以反复出包，发布之后也一样**：重出时 `published` 与另一平台的记录都保留（否则重出 mac 会顺手抹掉 windows 的 `passed`）；打包成功后刷新 `releases[]` 里那条记录的平台快照，产物换成新的，但 `publishedAt` 仍是首次发布的时间，也不会追加第二条发布记录。
-- **版本号只由 Windows 端推进**：已发布版本在 Windows 下一次打包时才递增（或打包开始时手动输入更高版本号），并同时重置所有平台状态；macOS 端始终沿用仓库里的当前版本号，不提问、不递增。
-- 旧版 `schemaVersion: 1` 会由 `build.py` 自动迁移为平台级状态。
-
-如果某个版本明确只发布一个平台，可以在开始打包前调整 `requiredPlatforms`。已经开始双平台测试后不要临时删除平台要求。
+- **同一版本号可以反复出包**：打包成功后刷新 `releases[]` 里那条记录的平台快照（产物换成新的），`recordedAt` 仍是首次记录的时间，也不会追加第二条。
+- **版本号只有一个控制点：打包开始时的输入。** 直接回车沿用 `currentVersion`；输入更高的版本号则改用新版本，并把两个平台记录重置为 `pending`（开新版本）。没有基于隐藏状态的自动递增。
+- 旧版 `schemaVersion: 1` / `2` 会由 `build.py` 自动迁移；迁移会丢弃已废弃的 `published` 与 `requiredPlatforms`。
 
 ## 使用 build.py 打包
 
@@ -110,7 +103,9 @@ Mac 用户也可以在 Finder 中双击根目录的 `build-macos.command`。该�
 
 脚本会自动识别当前系统：
 
-- Windows：生成 NSIS `.exe` 安装包。**打包开始时会询问版本号**：输入更高的新版本号则本次使用它，直接回车则沿用 `currentVersion`（若上一版本已发布则自动递增）。
+- Windows：生成 NSIS `.exe` 安装包。**打包开始时会询问版本号**，两种输入：
+  - 输入**更高**的版本号 → 本次使用它，两个平台记录都重置为 `pending`（开新版本）；
+  - 输入**与当前相同**的版本号、或**直接回车** → 沿用该版本，另一个平台的记录保持不变（重出）。
 - macOS：生成 `.app` 和 `.dmg`，版本记录使用 `.dmg`。**不询问版本号**，始终跟随仓库里 Windows 已定好的 `currentVersion`——因此 Mac 打包前必须先 `git pull` 到 Windows 打包并提交后的提交。
 - 其它系统：拒绝正式打包。
 
@@ -130,7 +125,6 @@ Mac 用户也可以在 Finder 中双击根目录的 `build-macos.command`。该�
 currentVersion: 1.0.0
 windows: passed
 macos: pending
-published: false
 ```
 
 之后 Mac 使用相同版本完成打包：
@@ -139,10 +133,9 @@ published: false
 currentVersion: 1.0.0
 windows: passed
 macos: passed
-published: true
 ```
 
-下次在 Windows 上打包才会变成 `1.0.1`。版本进位规则为：
+版本号由打包开始时的输入决定，不会自行递增。输入更高版本号时，上一档的进位规则为：
 
 ```text
 1.0.0 -> 1.0.1
@@ -150,7 +143,7 @@ published: true
 1.0.9 -> 1.1.0
 ```
 
-注意：`version.json` 中的 `published: true` 表示“所有必需平台均已测试通过，可以进行远程发布”。`build.py` 和 `build-macos.command` 不会自动创建 Git Tag，也不会自动上传 GitHub Release；远程发布仍需执行本文后面的 Git 和 `gh` 命令。
+注意：`build.py` 与 `build-macos.command` 不会自动创建 Git Tag，也不会自动上传 GitHub Release；远程发布仍需执行本文后面的 Git 和 `gh` 命令。
 
 ## 平台操作速查
 
@@ -184,19 +177,18 @@ git pull --ff-only
 检查当前版本和两个平台的状态：
 
 ```bash
-python3 -c 'import json; s=json.load(open("version.json")); print("version:", s["currentVersion"]); print("published:", s["published"]); print("windows:", s["platforms"]["windows"]["status"]); print("macos:", s["platforms"]["macos"]["status"])'
+python3 -c 'import json; s=json.load(open("version.json")); print("version:", s["currentVersion"]); print("windows:", s["platforms"]["windows"]["status"]); print("macos:", s["platforms"]["macos"]["status"])'
 ```
 
 正常的接力状态通常应为：
 
 ```text
 version: 1.0.0
-published: False
 windows: passed
 macos: pending
 ```
 
-如果 Windows 不是 `passed`，Mac 仍可构建和记录自己的结果，但整个版本不会发布。
+Mac 可以独立构建并记录自己的结果，不需要 Windows 先通过。
 
 ### 2. 运行 Mac 打包入口
 
@@ -223,15 +215,14 @@ macos: pending
 ### 4. 核对最终状态
 
 ```bash
-python3 -c 'import json; s=json.load(open("version.json")); print(json.dumps({"version": s["currentVersion"], "published": s["published"], "platforms": s["platforms"]}, ensure_ascii=False, indent=2))'
+python3 -c 'import json; s=json.load(open("version.json")); print(json.dumps({"version": s["currentVersion"], "platforms": s["platforms"]}, ensure_ascii=False, indent=2))'
 ```
 
-如果 Windows 和 macOS 均已通过，应该看到：
+两个平台都打过包后，应该看到：
 
 ```text
 windows.status = passed
 macos.status = passed
-published = true
 ```
 
 同时应存在归档后的 DMG：
@@ -303,19 +294,18 @@ Agents Launcher_1.0.0_aarch64.dmg
 3. 提交并推送 Windows 平台在 `version.json` 中的记录。
 4. Mac 拉取最新提交，确认仍是同一版本号（Mac 端不会询问也不会修改版本号）。
 5. Mac 运行 `python build.py` 或 `build-macos.command`，打包成功即记录通过。
-6. 此时 `published` 自动变为 `true`；提交最终发布记录。
+6. 提交版本记录。
 7. 创建唯一的版本 Tag，并将 Windows、macOS 安装包上传到同一个 GitHub Release。
 
 平台状态提交只改变版本记录，不应夹带业务源码修改。如果平台测试期间修改了业务源码，两个平台都应重新打包和测试。
 
 ## 使用 Git 标记版本
 
-确认 `version.json` 中所有必需平台均为 `passed`，且 `published` 为 `true`：
+确认 `version.json` 中两个平台均为 `passed`：
 
 ```powershell
 $versionState = Get-Content version.json -Raw | ConvertFrom-Json
 $versionState.currentVersion
-$versionState.published
 $versionState.platforms
 ```
 

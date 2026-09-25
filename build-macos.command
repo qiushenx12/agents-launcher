@@ -78,7 +78,6 @@ echo "接下来由 build.py 统一处理："
 echo "  - 沿用 Windows 已定的版本号（mac 端不升版本，请先 git pull）"
 echo "  - 生成 macOS .app 和 .dmg"
 echo "  - 打包成功即记录 macOS 通过状态与产物"
-echo "  - Windows、macOS 均通过后发布当前版本"
 echo
 
 # build.py normally pauses on errors. The wrapper owns the final pause so a

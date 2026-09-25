@@ -99,23 +99,41 @@ def new_platform_records() -> dict[str, dict[str, Any]]:
 
 def default_version_state() -> dict[str, Any]:
     return {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "currentVersion": DEFAULT_VERSION,
-        "published": False,
-        "requiredPlatforms": list(SUPPORTED_PLATFORMS),
         "platforms": new_platform_records(),
         "releases": [],
     }
 
 
 def migrate_version_state(state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    if state.get("schemaVersion") != 1:
+    """把旧结构升到 schemaVersion 3。
+
+    schema 3 去掉了 `published` 与 `requiredPlatforms`：它们让「回车」的含义取决
+    于隐藏状态（已发布就自动升版），同一个按键在不同时刻做不同的事。现在版本号
+    只有一个控制点 —— 打包开始时的输入。旧字段直接丢弃，`releases` 保留为历史。
+    """
+    if state.get("schemaVersion") == 3:
         return state, False
+    if state.get("schemaVersion") not in (1, 2):
+        return state, False
+
     migrated = copy.deepcopy(state)
-    migrated["schemaVersion"] = 2
-    migrated["requiredPlatforms"] = list(SUPPORTED_PLATFORMS)
-    migrated["platforms"] = new_platform_records()
-    migrated.setdefault("releases", [])
+    migrated["schemaVersion"] = 3
+    platforms = migrated.get("platforms")
+    migrated["platforms"] = platforms if isinstance(platforms, dict) else new_platform_records()
+    migrated.pop("published", None)
+    migrated.pop("requiredPlatforms", None)
+
+    releases = []
+    for release in migrated.get("releases") or []:
+        if not isinstance(release, dict):
+            continue
+        entry = {key: value for key, value in release.items() if key != "published"}
+        if "publishedAt" in entry:
+            entry["recordedAt"] = entry.pop("publishedAt")
+        releases.append(entry)
+    migrated["releases"] = releases
     return migrated, True
 
 
@@ -148,25 +166,12 @@ def validate_platform_record(record: Any, platform_key: str) -> None:
 
 
 def validate_version_state(state: dict[str, Any]) -> None:
-    if state.get("schemaVersion") != 2:
-        raise VersionStateError("version.json 的 schemaVersion 必须为 2")
+    if state.get("schemaVersion") != 3:
+        raise VersionStateError("version.json 的 schemaVersion 必须为 3")
     current_version = state.get("currentVersion")
     if not isinstance(current_version, str):
         raise VersionStateError("version.json 缺少 currentVersion")
     parse_version(current_version)
-    if not isinstance(state.get("published"), bool):
-        raise VersionStateError("version.json 的 published 必须是布尔值")
-
-    required_platforms = state.get("requiredPlatforms")
-    if not isinstance(required_platforms, list) or not required_platforms:
-        raise VersionStateError("version.json 的 requiredPlatforms 必须是非空数组")
-    if any(not isinstance(item, str) for item in required_platforms):
-        raise VersionStateError("version.json 的 requiredPlatforms 只能包含字符串")
-    if len(required_platforms) != len(set(required_platforms)):
-        raise VersionStateError("version.json 的 requiredPlatforms 不能重复")
-    unsupported = [item for item in required_platforms if item not in SUPPORTED_PLATFORMS]
-    if unsupported:
-        raise VersionStateError(f"version.json 包含不支持的平台：{', '.join(unsupported)}")
 
     platforms = state.get("platforms")
     if not isinstance(platforms, dict):
@@ -180,11 +185,11 @@ def validate_version_state(state: dict[str, Any]) -> None:
     seen_versions: set[str] = set()
     for release in releases:
         if not isinstance(release, dict) or not isinstance(release.get("version"), str):
-            raise VersionStateError("version.json 中存在无效的发布记录")
+            raise VersionStateError("version.json 中存在无效的打包记录")
         release_version = release["version"]
         parse_version(release_version)
         if release_version in seen_versions:
-            raise VersionStateError(f"version.json 中存在重复发布版本：{release_version}")
+            raise VersionStateError(f"version.json 中存在重复打包版本：{release_version}")
         seen_versions.add(release_version)
 
 
@@ -275,11 +280,11 @@ def reset_platform_records(state: dict[str, Any]) -> None:
 
 
 def validate_new_version(version: str, state: dict[str, Any]) -> None:
-    """拒绝发布历史无法接受的手动版本号。
+    """拒绝历史无法接受的手动版本号。
 
     **等于** `currentVersion` 是允许的 —— 那正是「重出当前版本」：一个需要重新
-    构建的 dmg 不该被迫升版本号。只有**低于**当前版本（或低于任何已发布版本）
-    才拒绝。
+    构建的 dmg 不该被迫升版本号。只有**低于**当前版本（或低于历史记录里的最高
+    版本）才拒绝。
     """
     candidate = parse_version(version)
     current = parse_version(state["currentVersion"])
@@ -288,7 +293,7 @@ def validate_new_version(version: str, state: dict[str, Any]) -> None:
     if state["releases"] and candidate < max(
         parse_version(release["version"]) for release in state["releases"]
     ):
-        raise VersionStateError("版本号不能低于已发布的版本")
+        raise VersionStateError("版本号不能低于历史记录中的版本")
 
 
 def prompt_build_version(state: dict[str, Any], platform_key: str) -> str | None:
@@ -299,9 +304,8 @@ def prompt_build_version(state: dict[str, Any], platform_key: str) -> str | None
     current = state["currentVersion"]
     while True:
         version = input(
-            f"\n当前版本 {current}。升版本请输入更高的版本号（x.y.z，修订号 0–9）；"
-            f"重出当前版本请输入 {current}；"
-            "直接回车沿用当前版本（若该版本已发布，则自动升一版）："
+            f"\n当前版本 {current}。直接回车沿用该版本；"
+            "输入更高的版本号（x.y.z，修订号 0–9）则改用新版本："
         ).strip()
         if not version:
             return None
@@ -317,32 +321,28 @@ def prepare_build_version(
     requested_version: str | None = None,
     version_file: Path = VERSION_FILE,
     project_dir: Path = PROJECT_DIR,
-    platform_key: str = "windows",
 ) -> tuple[str, dict[str, Any]]:
+    """确定本次打包的版本号。
+
+    版本号只有一个来源：`requested_version`（打包开始时由用户输入）。没有输入
+    就沿用 `currentVersion`。这里曾经还有第二条路径 —— `published` 为真时自动
+    递增 —— 那让「直接回车」在同一份 version.json 上做两件不同的事，取决于一个
+    用户看不见的标志。已移除。
+    """
     state = load_version_state(version_file)
     version = state["currentVersion"]
     if requested_version is not None:
         validate_new_version(requested_version, state)
         version = requested_version
         if requested_version != state["currentVersion"]:
-            # 换了新版本号：两个平台的记录都作废，published 也要清掉。
+            # 换了版本号：两个平台的记录都作废，从 pending 重新开始。
             state["currentVersion"] = version
-            state["published"] = False
             reset_platform_records(state)
-            print(f"本次打包使用手动指定版本 {version}。")
+            print(f"本次打包使用版本 {version}。")
         else:
-            # 与当前版本相同 = 重出同一版本。保留 published 与另一平台的记录，
-            # 本次要出的那个平台由 begin_platform_build 单独置回 pending。
-            # 这里若照搬新版本分支，重出 mac 会顺手把 windows 的 passed 抹掉。
-            print(f"本次打包重出当前版本 {version}。")
-    elif state["published"] and platform_key == "windows":
-        # 只有 Windows 端推进版本号；macOS 端即使看到 published 也沿用当前版本
-        # （那是 Windows 刚发完的版本，本次 macOS 打包就是在补它的 macOS 半边）。
-        version = next_version(version)
-        state["currentVersion"] = version
-        state["published"] = False
-        reset_platform_records(state)
-        print(f"上一个版本已发布，本次打包版本自动更新为 {version}。")
+            # 与当前版本相同 = 重出同一版本。保留另一平台的记录，本次要出的那个
+            # 平台由 begin_platform_build 单独置回 pending。
+            print(f"本次打包沿用版本 {version}。")
 
     sync_project_versions(version, project_dir)
     save_version_state(state, version_file)
@@ -373,9 +373,8 @@ def begin_platform_build(
 ) -> None:
     if platform_key not in SUPPORTED_PLATFORMS:
         raise VersionStateError(f"不支持的平台：{platform_key}")
-    # 已发布的版本同样可以重出包 —— 同一版本号必须能反复打包，坏掉的 dmg 是
-    # 重打，不是升版本。这里只把这一个平台的记录置回 pending，另一个平台的
-    # 结果与 `published` 都保留，所以重出 mac 不会波及 windows。
+    # 同一版本号可以反复打包：坏掉的 dmg 是重打，不是升版本。这里只把本次要出的
+    # 那个平台置回 pending，另一个平台的结果保留 —— 重出 mac 不会波及 windows。
     state["platforms"][platform_key] = pending_platform_record()
     save_version_state(state, version_file)
 
@@ -592,14 +591,6 @@ def find_built_artifacts(
     )
 
 
-def remaining_required_platforms(state: dict[str, Any]) -> list[str]:
-    return [
-        platform_key
-        for platform_key in state["requiredPlatforms"]
-        if state["platforms"][platform_key]["status"] != "passed"
-    ]
-
-
 def record_platform_passed(
     version: str,
     platform_key: str,
@@ -636,28 +627,26 @@ def record_platform_passed(
         "artifacts": artifact_records,
     }
 
-    remaining = remaining_required_platforms(state)
-    if not remaining:
-        state["published"] = True
-        record = {
-            "version": version,
-            "published": True,
-            "publishedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "platforms": {
-                required_platform: copy.deepcopy(state["platforms"][required_platform])
-                for required_platform in state["requiredPlatforms"]
-            },
-        }
-        # 重出一个已发布的版本：刷新那条记录，而不是报「已存在」。否则 release
-        # 清单里会留着刚被替换掉的旧产物信息。原始 publishedAt 保留 —— 那是这个
-        # 版本首次发布的时间，重出不该改写它。
-        for index, release in enumerate(state["releases"]):
-            if release.get("version") == version:
-                record["publishedAt"] = release.get("publishedAt", record["publishedAt"])
-                state["releases"][index] = record
-                break
-        else:
-            state["releases"].append(record)
+    # 打包历史：一条流水账，不驱动任何决策。版本号由打包开始时的输入决定，产物
+    # 能否归档也不取决于别的平台有没有打过包。这里曾经挂着一个隐式门禁 —— 两个
+    # 必需平台都 passed 才置 `published`，并让下一次「回车」自动升版 —— 已移除。
+    record = {
+        "version": version,
+        "recordedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "platforms": {
+            key: copy.deepcopy(value)
+            for key, value in state["platforms"].items()
+            if value["status"] == "passed"
+        },
+    }
+    for index, release in enumerate(state["releases"]):
+        if release.get("version") == version:
+            # 同一版本重出：产物快照换成新的，首次记录时间保留。
+            record["recordedAt"] = release.get("recordedAt", record["recordedAt"])
+            state["releases"][index] = record
+            break
+    else:
+        state["releases"].append(record)
 
     save_version_state(state, version_file)
     return state
@@ -711,7 +700,7 @@ def main() -> int:
         return 1
 
     try:
-        version, state = prepare_build_version(requested_version, platform_key=platform_key)
+        version, state = prepare_build_version(requested_version)
         begin_platform_build(state, platform_key)
         product_name = load_product_name()
     except (OSError, VersionStateError) as error:
@@ -734,22 +723,13 @@ def main() -> int:
         print(f"  {artifact}")
 
     try:
-        updated_state = record_platform_passed(version, platform_key, artifacts)
+        record_platform_passed(version, platform_key, artifacts)
     except (OSError, VersionStateError) as error:
-        print(f"平台测试记录写入失败：{error}")
+        print(f"平台打包记录写入失败：{error}")
         pause_on_error()
         return 1
 
-    remaining = remaining_required_platforms(updated_state)
-    if remaining:
-        labels = "、".join(PLATFORM_LABELS[item] for item in remaining)
-        print(f"已记录 {platform_label} {version} 测试通过；仍需完成：{labels}。")
-        print("所有必需平台通过前，版本号不会递增。")
-        pause_on_success()
-        return 0
-
-    print(f"版本 {version} 的所有必需平台均已通过，已记录为发布。")
-    print(f"下一次在 Windows 上打包时将自动使用 {next_version(version)}。")
+    print(f"已记录 {platform_label} {version} 打包通过，产物已归档。")
     pause_on_success()
     return 0
 
