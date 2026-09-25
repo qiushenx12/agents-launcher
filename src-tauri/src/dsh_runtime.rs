@@ -1359,9 +1359,24 @@ fn process_name(pid: u32) -> String {
     }
 }
 
-/// Terminate a process tree by PID (`taskkill /T /F` on Windows, a process
-/// group SIGTERM → SIGKILL escalation on Unix). `npx` spawns `cmd.exe` → `node`,
-/// so killing only the owner PID would leave a live listener behind.
+/// Terminate a process tree by PID (`taskkill /T /F` on Windows, SIGTERM →
+/// SIGKILL escalation on Unix). `npx` spawns `cmd.exe` → `node`, so killing only
+/// the owner PID would leave a live listener behind — but **which** PID that is
+/// depends on the caller, and the Unix side has to handle both shapes:
+///
+/// - the launcher's own child, spawned through `configure_process_tree` with
+///   `process_group(0)`, so it *leads* its group and signalling the group is what
+///   reaches `node`;
+/// - a listener discovered through `lsof`/`netstat`, which is whoever holds the
+///   socket. In the dsh tree that is a **descendant** of `npm`/`npx`, so its PID
+///   names a group led by an ancestor this launcher never spawned. Signalling
+///   `-pid` there reached nothing at all, and the `ESRCH` that came back was read
+///   as "already gone" — which is why 「一键清理占用」 and the listener fallback
+///   in `terminate_managed_process` quietly did nothing on macOS.
+///
+/// Escalating over the ancestor's real group would be the wrong repair: that
+/// group can contain processes which are none of our business. So escalate over
+/// the group only when the PID leads one, and otherwise signal the PID alone.
 fn terminate_pid(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -1383,26 +1398,41 @@ fn terminate_pid(pid: u32) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let group = pid as i32;
-        let term_result = unsafe { libc::kill(-group, libc::SIGTERM) };
-        if term_result != 0 {
+        let pid = pid as libc::pid_t;
+        // `getpgid(pid) == pid` is exactly "this PID leads its own process
+        // group". It reports -1 for a PID that no longer exists, which lands on
+        // the `else` arm and then fails with ESRCH — the same "already gone"
+        // outcome as before, reached without pretending to have killed a group.
+        let leads_group = unsafe { libc::getpgid(pid) } == pid;
+        let target = if leads_group { -pid } else { pid };
+        let label = if leads_group {
+            format!("进程组 {pid}")
+        } else {
+            format!("PID {pid}")
+        };
+
+        // SAFETY: `kill` is handed a PID/PGID and a signal number; a negative
+        // target means "the process group with this id".
+        let send = |signal: libc::c_int| unsafe { libc::kill(target, signal) };
+
+        if send(libc::SIGTERM) != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(format!("无法结束进程组 {group}: {error}"));
+                return Err(format!("无法结束{label}: {error}"));
             }
             return Ok(());
         }
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(25));
-            if unsafe { libc::kill(-group, 0) } != 0 {
+            // Signal 0 only probes for existence.
+            if unsafe { libc::kill(target, 0) } != 0 {
                 return Ok(());
             }
         }
-        let kill_result = unsafe { libc::kill(-group, libc::SIGKILL) };
-        if kill_result != 0 {
+        if send(libc::SIGKILL) != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(format!("无法强制结束进程组 {group}: {error}"));
+                return Err(format!("无法强制结束{label}: {error}"));
             }
         }
         Ok(())
@@ -1536,12 +1566,13 @@ fn release_port(port: u16) -> DshPortReleaseReport {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    let names = killed
+        .iter()
+        .map(|process| format!("{}（PID {}）", process.name, process.pid))
+        .collect::<Vec<_>>()
+        .join("、");
+
     let message = if released && failed.is_empty() {
-        let names = killed
-            .iter()
-            .map(|process| format!("{}（PID {}）", process.name, process.pid))
-            .collect::<Vec<_>>()
-            .join("、");
         format!("已结束占用端口 {port} 的进程：{names}。端口已释放。")
     } else if released {
         format!(
@@ -1554,14 +1585,17 @@ fn release_port(port: u16) -> DshPortReleaseReport {
             "已跳过启动器自身进程，端口 {port} 仍被占用。请手动关闭占用它的程序。"
         )
     } else {
-        format!(
-            "端口 {port} 仍被占用。{}",
-            if failed.is_empty() {
-                "占用者可能被其它程序自动重启。".to_string()
-            } else {
-                failed.join("；")
-            }
-        )
+        // Name what actually happened. The old wording blamed an external
+        // restart even when no signal had been delivered at all, which is
+        // exactly the silent no-op the `-pid` bug produced on macOS.
+        let detail = if !killed.is_empty() {
+            format!("已向 {names} 发送终止信号但进程未退出，或被其它程序立即重新占用。")
+        } else if failed.is_empty() {
+            "未能确定占用者，请手动关闭占用它的程序。".to_string()
+        } else {
+            failed.join("；")
+        };
+        format!("端口 {port} 仍被占用。{detail}")
     };
 
     DshPortReleaseReport {
@@ -4704,6 +4738,74 @@ mod tests {
             !port_is_occupied(DshAccess::Remote.probe_host(), port),
             "tree listener survived a successful stop"
         );
+    }
+
+    /// The other shape `terminate_pid` has to survive: the caller hands it the
+    /// PID that `lsof`/`netstat` reported for the socket, which in this tree is
+    /// the **descendant**, not the `process_group(0)` leader.
+    ///
+    /// That PID names a group led by its parent, so the old `kill(-pid)` reached
+    /// nothing and the `ESRCH` it returned was read as success — 「一键清理占用」
+    /// claimed nothing had happened and released nothing. The test above cannot
+    /// catch this: it terminates `server.child`, which *is* the leader.
+    #[test]
+    fn the_socket_holder_is_released_without_being_a_group_leader() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--exact", "dsh_runtime::tests::process_tree_test_helper"])
+            .env(PROCESS_TREE_ROLE, "parent")
+            .env(PROCESS_TREE_PORT, port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_tree(&mut command);
+        let mut leader = command.spawn().expect("parent helper");
+
+        let start_deadline = Instant::now() + Duration::from_secs(5);
+        while !port_is_occupied(DshAccess::Local.probe_host(), port)
+            && Instant::now() < start_deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            port_is_occupied(DshAccess::Local.probe_host(), port),
+            "listener helper did not become ready"
+        );
+
+        // Same graceful degradation as `the_listening_process_of_a_test_listener_is_identified`.
+        let holders = listening_pids(port);
+        if holders.is_empty() {
+            let _ = terminate_pid(leader.id());
+            let _ = leader.wait();
+            eprintln!("[dsh] occupant lookup unavailable on this host; skipping assertion");
+            return;
+        }
+        // The premise of the test: what discovery reports is not the leader.
+        assert!(
+            !holders.contains(&leader.id()),
+            "expected the socket to be held by the spawned listener, found the leader"
+        );
+
+        let outcome = terminate_pid(holders[0]);
+        assert!(
+            outcome.is_ok(),
+            "terminating the socket holder failed: {outcome:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while port_is_occupied(DshAccess::Local.probe_host(), port) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !port_is_occupied(DshAccess::Local.probe_host(), port),
+            "socket holder survived termination"
+        );
+
+        let _ = leader.wait();
     }
 
     // ── first-download progress vs. the readiness deadline ───────────────────
