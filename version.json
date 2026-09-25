@@ -16,11 +16,11 @@
     "macos": {
       "status": "passed",
       "architecture": "arm64",
-      "testedAt": "2026-09-25T08:26:02+08:00",
+      "testedAt": "2026-09-25T22:52:57+08:00",
       "artifacts": [
         {
           "path": "src-tauri/release-bundle/dmg/Agents Launcher_1.0.1_aarch64.dmg",
-          "size": 13841269
+          "size": 13836990
         }
       ]
     }
@@ -28,6 +28,7 @@
   "releases": [
     {
       "version": "1.0.1",
+      "recordedAt": "2026-09-25T08:03:41+08:00",
       "platforms": {
         "windows": {
           "status": "passed",
@@ -43,16 +44,15 @@
         "macos": {
           "status": "passed",
           "architecture": "arm64",
-          "testedAt": "2026-09-25T08:26:02+08:00",
+          "testedAt": "2026-09-25T22:52:57+08:00",
           "artifacts": [
             {
               "path": "src-tauri/release-bundle/dmg/Agents Launcher_1.0.1_aarch64.dmg",
-              "size": 13841269
+              "size": 13836990
             }
           ]
         }
-      },
-      "recordedAt": "2026-09-25T08:03:41+08:00"
+      }
     }
   ]
 }
