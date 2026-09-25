@@ -74,7 +74,11 @@ mod window_theme {
 }
 
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("main") {
+    // 必须用 get_window 而不是 get_webview_window：后者带
+    // `window.is_webview_window()` 校验，要求窗口的所有 webview 都与窗口同名；
+    // dsh 内嵌界面（child webview "dsh-embed"）存在时校验失败返回 None,
+    // 恢复入口会静默失效——这正是"dsh 界面才无法恢复"的根因。
+    if let Some(window) = app.get_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         // tao 的 set_focus 通过 activateIgnoringOtherApps: 激活应用，该 API 在
@@ -82,6 +86,9 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         // 不会成为 key window，托盘/Dock 点击看起来“毫无反应”。先显式激活，
         // 再 set_focus 让窗口成为 key。
         macos_window::activate_application();
+        // 窗口 show 走 tao 事件循环消息，是异步生效；这里直调 AppKit 把窗口
+        // 排回屏幕，保证恢复不依赖消息队列的处理时序。
+        macos_window::order_window_front(&window);
         let _ = window.set_focus();
     }
 }
@@ -180,7 +187,7 @@ pub fn run() {
             ));
             record_startup_duration("claude-observer", observer_started_at);
 
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_window("main") {
                 #[cfg(target_os = "macos")]
                 {
                     // macOS always uses native traffic lights and AppKit's

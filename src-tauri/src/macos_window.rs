@@ -20,7 +20,9 @@ mod native {
                 let Some(app) = APP_HANDLE.get() else {
                     return;
                 };
-                let Some(window) = app.get_webview_window("main") else {
+                // get_window 而非 get_webview_window：dsh 内嵌 child webview
+                // 存在时后者的 is_webview_window 校验会失败返回 None。
+                let Some(window) = app.get_window("main") else {
                     return;
                 };
                 let fullscreen = window.is_fullscreen().unwrap_or(false);
@@ -31,7 +33,7 @@ mod native {
 
     pub fn install(
         app_handle: &tauri::AppHandle,
-        window: &tauri::WebviewWindow,
+        window: &tauri::Window,
     ) -> Result<(), String> {
         let _ = APP_HANDLE.set(app_handle.clone());
 
@@ -80,11 +82,23 @@ mod native {
             }
         }
     }
+
+    /// Order the window in by talking to AppKit directly, bypassing the tao
+    /// dispatcher message queue: `Window::show()` only posts a message that the
+    /// event loop applies later, while `orderFrontRegardless` puts the window
+    /// back on screen immediately, even before `activate()` takes effect.
+    pub fn order_window_front<R: tauri::Runtime>(window: &tauri::Window<R>) {
+        let Ok(ns_window_ptr) = window.ns_window() else {
+            return;
+        };
+        let ns_window = unsafe { &*(ns_window_ptr as *const NSWindow) };
+        ns_window.orderFrontRegardless();
+    }
 }
 
 pub fn install_animated_fullscreen_button(
     app_handle: &tauri::AppHandle,
-    window: &tauri::WebviewWindow,
+    window: &tauri::Window,
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -102,6 +116,15 @@ pub fn install_animated_fullscreen_button(
 pub fn activate_application() {
     #[cfg(target_os = "macos")]
     native::activate_application();
+}
+
+/// Order the window to the front regardless of activation state. No-op
+/// outside macOS.
+pub fn order_window_front<R: tauri::Runtime>(window: &tauri::Window<R>) {
+    #[cfg(target_os = "macos")]
+    native::order_window_front(window);
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
 }
 
 /// Toggles the native macOS fullscreen mode.
