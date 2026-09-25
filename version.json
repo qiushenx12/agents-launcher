@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "currentVersion": "1.0.1",
-  "published": false,
+  "published": true,
   "requiredPlatforms": [
     "windows",
     "macos"
@@ -19,11 +19,46 @@
       ]
     },
     "macos": {
-      "status": "pending",
-      "architecture": null,
-      "testedAt": null,
-      "artifacts": []
+      "status": "passed",
+      "architecture": "arm64",
+      "testedAt": "2026-09-25T08:26:02+08:00",
+      "artifacts": [
+        {
+          "path": "src-tauri/release-bundle/dmg/Agents Launcher_1.0.1_aarch64.dmg",
+          "size": 13841269
+        }
+      ]
     }
   },
-  "releases": []
+  "releases": [
+    {
+      "version": "1.0.1",
+      "published": true,
+      "publishedAt": "2026-09-25T08:03:41+08:00",
+      "platforms": {
+        "windows": {
+          "status": "passed",
+          "architecture": "x64",
+          "testedAt": "2026-09-25T00:32:13+08:00",
+          "artifacts": [
+            {
+              "path": "src-tauri/release-bundle/nsis/Agents Launcher_1.0.1_x64-setup.exe",
+              "size": 7424938
+            }
+          ]
+        },
+        "macos": {
+          "status": "passed",
+          "architecture": "arm64",
+          "testedAt": "2026-09-25T08:26:02+08:00",
+          "artifacts": [
+            {
+              "path": "src-tauri/release-bundle/dmg/Agents Launcher_1.0.1_aarch64.dmg",
+              "size": 13841269
+            }
+          ]
+        }
+      }
+    }
+  ]
 }
