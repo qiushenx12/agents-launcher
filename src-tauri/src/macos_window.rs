@@ -53,6 +53,33 @@ mod native {
         let _ = Retained::into_raw(target);
         Ok(())
     }
+
+    /// Activates the application so a restored window can come forward.
+    ///
+    /// tao's `Window::set_focus` relies on `activateIgnoringOtherApps:`,
+    /// which Apple deprecated in macOS 14 (Sonoma): it no longer activates
+    /// the app, so a window shown after `hide()` stays on its old Space,
+    /// never becomes key, and looks "unrestorable" from the tray or Dock.
+    /// Use `-[NSApplication activate]` on macOS 14+ and fall back to the
+    /// legacy selector on macOS 13 (the bundle's minimum system version).
+    pub fn activate_application() {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSApplication;
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        unsafe {
+            let supports_activate: bool =
+                msg_send![NSApplication::class(), instancesRespondToSelector: sel!(activate)];
+            if supports_activate {
+                let _: () = msg_send![&app, activate];
+            } else {
+                let _: () = msg_send![&app, activateIgnoringOtherApps: true];
+            }
+        }
+    }
 }
 
 pub fn install_animated_fullscreen_button(
@@ -68,6 +95,13 @@ pub fn install_animated_fullscreen_button(
         let _ = (app_handle, window);
         Ok(())
     }
+}
+
+/// Activates the application before focusing a restored window. No-op outside
+/// macOS, where `Window::set_focus` already activates the app correctly.
+pub fn activate_application() {
+    #[cfg(target_os = "macos")]
+    native::activate_application();
 }
 
 /// Toggles the native macOS fullscreen mode.

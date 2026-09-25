@@ -77,6 +77,11 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
+        // tao 的 set_focus 通过 activateIgnoringOtherApps: 激活应用，该 API 在
+        // macOS 14 起被废弃且失效：不激活应用时，恢复出的窗口停留在旧 Space、
+        // 不会成为 key window，托盘/Dock 点击看起来“毫无反应”。先显式激活，
+        // 再 set_focus 让窗口成为 key。
+        macos_window::activate_application();
         let _ = window.set_focus();
     }
 }
@@ -385,6 +390,13 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        // macOS：窗口隐藏到托盘后点击 Dock 图标会触发
+        // applicationShouldHandleReopen:，即这里的 Reopen 事件。不处理它，
+        // Dock 图标（带运行黑点）点击后窗口不会出现。
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            show_main_window(app_handle);
+        }
         if let tauri::RunEvent::ExitRequested { .. } = event {
             pty::cleanup_all_sessions(app_handle);
             // 应用退出：恢复全局 CodeX 配置中的真实地址并停止代理。
