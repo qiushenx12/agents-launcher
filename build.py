@@ -275,16 +275,20 @@ def reset_platform_records(state: dict[str, Any]) -> None:
 
 
 def validate_new_version(version: str, state: dict[str, Any]) -> None:
+    """拒绝发布历史无法接受的手动版本号。
+
+    **等于** `currentVersion` 是允许的 —— 那正是「重出当前版本」：一个需要重新
+    构建的 dmg 不该被迫升版本号。只有**低于**当前版本（或低于任何已发布版本）
+    才拒绝。
+    """
     candidate = parse_version(version)
     current = parse_version(state["currentVersion"])
-    if candidate <= current:
-        raise VersionStateError(f"新版本号必须高于当前版本 {state['currentVersion']}")
-    if any(release.get("version") == version for release in state["releases"]):
-        raise VersionStateError(f"版本 {version} 已有发布记录")
-    if state["releases"] and candidate <= max(
+    if candidate < current:
+        raise VersionStateError(f"版本号不能低于当前版本 {state['currentVersion']}")
+    if state["releases"] and candidate < max(
         parse_version(release["version"]) for release in state["releases"]
     ):
-        raise VersionStateError("新版本号必须高于所有已发布版本")
+        raise VersionStateError("版本号不能低于已发布的版本")
 
 
 def prompt_build_version(state: dict[str, Any], platform_key: str) -> str | None:
@@ -295,8 +299,9 @@ def prompt_build_version(state: dict[str, Any], platform_key: str) -> str | None
     current = state["currentVersion"]
     while True:
         version = input(
-            f"\n当前版本 {current}。升版本请输入新版本号（x.y.z，修订号 0–9）；"
-            "不升版本号直接回车："
+            f"\n当前版本 {current}。升版本请输入更高的版本号（x.y.z，修订号 0–9）；"
+            f"重出当前版本请输入 {current}；"
+            "直接回车沿用当前版本（若该版本已发布，则自动升一版）："
         ).strip()
         if not version:
             return None
@@ -319,10 +324,17 @@ def prepare_build_version(
     if requested_version is not None:
         validate_new_version(requested_version, state)
         version = requested_version
-        state["currentVersion"] = version
-        state["published"] = False
-        reset_platform_records(state)
-        print(f"本次打包使用手动指定版本 {version}。")
+        if requested_version != state["currentVersion"]:
+            # 换了新版本号：两个平台的记录都作废，published 也要清掉。
+            state["currentVersion"] = version
+            state["published"] = False
+            reset_platform_records(state)
+            print(f"本次打包使用手动指定版本 {version}。")
+        else:
+            # 与当前版本相同 = 重出同一版本。保留 published 与另一平台的记录，
+            # 本次要出的那个平台由 begin_platform_build 单独置回 pending。
+            # 这里若照搬新版本分支，重出 mac 会顺手把 windows 的 passed 抹掉。
+            print(f"本次打包重出当前版本 {version}。")
     elif state["published"] and platform_key == "windows":
         # 只有 Windows 端推进版本号；macOS 端即使看到 published 也沿用当前版本
         # （那是 Windows 刚发完的版本，本次 macOS 打包就是在补它的 macOS 半边）。
@@ -361,8 +373,9 @@ def begin_platform_build(
 ) -> None:
     if platform_key not in SUPPORTED_PLATFORMS:
         raise VersionStateError(f"不支持的平台：{platform_key}")
-    if state["published"]:
-        raise VersionStateError("已发布版本不能重新开始平台打包")
+    # 已发布的版本同样可以重出包 —— 同一版本号必须能反复打包，坏掉的 dmg 是
+    # 重打，不是升版本。这里只把这一个平台的记录置回 pending，另一个平台的
+    # 结果与 `published` 都保留，所以重出 mac 不会波及 windows。
     state["platforms"][platform_key] = pending_platform_record()
     save_version_state(state, version_file)
 
@@ -601,8 +614,6 @@ def record_platform_passed(
         raise VersionStateError(
             f"待记录版本 {version} 与 version.json 中的 {state['currentVersion']} 不一致"
         )
-    if state["published"]:
-        raise VersionStateError(f"版本 {version} 已经发布")
     if platform_key not in SUPPORTED_PLATFORMS:
         raise VersionStateError(f"不支持的平台：{platform_key}")
     if not artifacts:
@@ -627,20 +638,26 @@ def record_platform_passed(
 
     remaining = remaining_required_platforms(state)
     if not remaining:
-        if any(release.get("version") == version for release in state["releases"]):
-            raise VersionStateError(f"版本 {version} 已存在发布记录")
         state["published"] = True
-        state["releases"].append(
-            {
-                "version": version,
-                "published": True,
-                "publishedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
-                "platforms": {
-                    required_platform: copy.deepcopy(state["platforms"][required_platform])
-                    for required_platform in state["requiredPlatforms"]
-                },
-            }
-        )
+        record = {
+            "version": version,
+            "published": True,
+            "publishedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "platforms": {
+                required_platform: copy.deepcopy(state["platforms"][required_platform])
+                for required_platform in state["requiredPlatforms"]
+            },
+        }
+        # 重出一个已发布的版本：刷新那条记录，而不是报「已存在」。否则 release
+        # 清单里会留着刚被替换掉的旧产物信息。原始 publishedAt 保留 —— 那是这个
+        # 版本首次发布的时间，重出不该改写它。
+        for index, release in enumerate(state["releases"]):
+            if release.get("version") == version:
+                record["publishedAt"] = release.get("publishedAt", record["publishedAt"])
+                state["releases"][index] = record
+                break
+        else:
+            state["releases"].append(record)
 
     save_version_state(state, version_file)
     return state

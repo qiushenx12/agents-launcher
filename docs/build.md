@@ -88,6 +88,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - `passed`：该平台安装包已成功构建并归档。
 - 只有 `requiredPlatforms` 中的所有平台均为 `passed`，整个版本的 `published` 才会变为 `true`。
 - 任一平台重新运行打包时，只会把该平台重置为 `pending`，其它平台状态保持不变。
+- **同一版本号可以反复出包，发布之后也一样**：重出时 `published` 与另一平台的记录都保留（否则重出 mac 会顺手抹掉 windows 的 `passed`）；打包成功后刷新 `releases[]` 里那条记录的平台快照，产物换成新的，但 `publishedAt` 仍是首次发布的时间，也不会追加第二条发布记录。
 - **版本号只由 Windows 端推进**：已发布版本在 Windows 下一次打包时才递增（或打包开始时手动输入更高版本号），并同时重置所有平台状态；macOS 端始终沿用仓库里的当前版本号，不提问、不递增。
 - 旧版 `schemaVersion: 1` 会由 `build.py` 自动迁移为平台级状态。
 
