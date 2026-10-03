@@ -62,6 +62,9 @@ node --test tests/dshRuntime.test.ts
 # Top-bar surface invariants (single owner of the app background)
 node --test tests/topBarSurface.test.ts
 
+# NSIS installer template still a handlebars source (not the bundler's output)
+node --test tests/nsisTemplate.test.ts
+
 # dsh save-token flow. Requires `--experimental-test-module-mocks` and Node 22.15+:
 # the file stubs `@tauri-apps/api/core` with `mock.module()`, and without the flag
 # it fails at import time rather than on an assertion.
@@ -164,6 +167,25 @@ Shortcuts are defined in `src/App.vue`:
 - NSIS installer: `src-tauri/target/release/bundle/nsis/`
 
 These paths and `node_modules/` are ignored by Git. Do not add generated build output or local CLI credentials to commits.
+
+### NSIS installer template
+
+`bundle.windows.nsis.template` points at `src-tauri/nsis/installer.nsi`, which must
+stay a **Handlebars source** — a copy of `tauri-bundler`'s own
+`installer.nsi` with `{{...}}` in place of every value the bundler supplies.
+
+Do not copy from `src-tauri/target/release/nsis/x64/installer.nsi`: that is the
+rendered output, not the source. It has the placeholders already replaced, so an
+icon path, the main binary path and the language `!include` get frozen to whatever
+checkout produced it. The Rust build still succeeds and only `makensis` fails,
+a full build later, with `Error while loading icon from ...: can't open file`.
+
+When the tauri CLI is upgraded, refresh the template from the matching tag of
+`tauri-apps/tauri`, path
+`crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi`, then re-apply the
+local customization: on upgrade the reinstall page offers **in-place install** as
+the default and leaves "uninstall first" as a manual choice. `tests/nsisTemplate.test.ts`
+guards both the placeholders and that customization.
 
 ## Workflow Guidelines
 
