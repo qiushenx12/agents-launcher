@@ -14,15 +14,10 @@
       ]
     },
     "macos": {
-      "status": "passed",
-      "architecture": "arm64",
-      "testedAt": "2026-10-05T10:22:01+08:00",
-      "artifacts": [
-        {
-          "path": "src-tauri/release-bundle/dmg/Agents Launcher_1.0.1_aarch64.dmg",
-          "size": 13854914
-        }
-      ]
+      "status": "pending",
+      "architecture": null,
+      "testedAt": null,
+      "artifacts": []
     }
   },
   "releases": [
