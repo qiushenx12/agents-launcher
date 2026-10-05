@@ -210,6 +210,15 @@
           <span aria-hidden="true">✎</span>
           重命名
         </button>
+        <button
+          v-if="openSessionMenuSession.cliKind === 'claude'"
+          type="button"
+          class="session-actions-menu__item session-actions-menu__item--danger"
+          @click="deleteSession(openSessionMenuSession.id)"
+        >
+          <span aria-hidden="true">⌫</span>
+          删除会话
+        </button>
       </div>
     </Teleport>
 
@@ -681,8 +690,26 @@ async function removeProject(projectId: string) {
   openMenuProjectId.value = null
   const project = store.projects.find((item) => item.id === projectId)
   if (!project) return
-  if (window.confirm(`确定删除项目“${project.name}”吗？会先关闭该项目下运行中的终端。`)) {
-    await store.removeProject(projectId)
+  // Claude 项目的删除是不可逆的原生数据删除（对齐官方 claude project purge），
+  // 确认文案必须讲清楚；其他 CLI 项目只是从列表移除。
+  const message = project.cliKind === 'claude'
+    ? `确定删除项目“${project.name}”吗？\n\n会先关闭该项目下运行中的终端，然后永久删除 Claude Code 原生数据：全部会话转写、prompt 历史、项目配置条目。删除后在官方 Claude CLI 中也无法恢复（--resume 和历史回忆都会消失）。\n\n不会删除项目目录里的代码文件。`
+    : `确定删除项目“${project.name}”吗？会先关闭该项目下运行中的终端。`
+  if (window.confirm(message)) {
+    await store.deleteProject(projectId)
+  }
+}
+
+async function deleteSession(sessionId: string) {
+  openSessionMenuId.value = null
+  const session = store.sessions.find((item) => item.id === sessionId)
+  if (!session) return
+  const hasNativeData = !!(session.nativeSessionId ?? session.claudeSessionId)
+  const message = hasNativeData
+    ? `确定删除会话“${session.name}”吗？\n\n会永久删除该会话的 Claude Code 原生数据（会话转写与 prompt 历史），官方 Claude CLI 中也无法再 --resume 恢复。`
+    : `确定删除会话“${session.name}”吗？`
+  if (window.confirm(message)) {
+    await store.deleteSession(sessionId)
   }
 }
 
@@ -1080,6 +1107,11 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
 .session-actions-menu__item:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+.session-actions-menu__item--danger,
+.session-actions-menu__item--danger span {
+  color: var(--danger);
 }
 
 .session-list-enter-from,

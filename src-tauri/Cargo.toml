@@ -69,6 +69,9 @@ windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Security_Cryptography",
   "Win32_System_Environment",
+  # Process liveness check (OpenProcess) for the native-delete live-session
+  # guard in session_manager.
+  "Win32_System_Threading",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Graphics_Dwm",
   # Interface address enumeration for the dsh access list: one URL per way into

@@ -27,7 +27,7 @@ use tokio::io::AsyncWriteExt;
 #[cfg(windows)]
 use tokio::process::Command;
 
-use crate::session_manager::{ClaudeHistorySnapshot, SessionEntry};
+use crate::session_manager::{ClaudeHistorySnapshot, NativeDeleteReport, SessionEntry};
 
 #[cfg(windows)]
 const WSL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -67,6 +67,260 @@ const LIST_PROJECTS_SCRIPT: &str = r#"printf '%s\n' "$WSL_DISTRO_NAME"; printf '
 const TITLES_MARKER: &str = "__CL_LAUNCHER_TITLES__";
 #[cfg(windows)]
 const READ_HISTORY_SCRIPT: &str = r#"if [ -f "$HOME/.claude/history.jsonl" ]; then cat "$HOME/.claude/history.jsonl"; fi; printf '\n%s\n' "__CL_LAUNCHER_TITLES__"; find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' -print0 2>/dev/null | xargs -0 -r awk 'FNR == 1 { if (last != "") print last; last = "" } /"type":"ai-title"/ { last = $0 } END { if (last != "") print last }'"#;
+
+// Deletes every piece of Claude Code state for one project inside the distro,
+// mirroring the official `claude project purge` plan: transcripts dir,
+// per-session file-history, the projects["<path>"] entry in ~/.claude.json and
+// the project's lines in history.jsonl. Progress is reported as `DELETED:` /
+// `WARN:` lines on stdout; hard failures exit non-zero with stderr text.
+// Placeholders __CL_PROJ__ / __CL_ENC__ / __CL_SIDS__ are shell-quoted before
+// substitution, so paths can contain spaces and non-ASCII characters.
+#[cfg_attr(not(windows), allow(dead_code))]
+const DELETE_PROJECT_SCRIPT: &str = r##"set -u
+CLAUDE="$HOME/.claude"
+HIST="$CLAUDE/history.jsonl"
+CJSON="$HOME/.claude.json"
+PROJ=__CL_PROJ__
+ENC=__CL_ENC__
+PDIR="$CLAUDE/projects/$ENC"
+
+SIDS=__CL_SIDS__
+if [ -d "$PDIR" ]; then
+  for f in "$PDIR"/*.jsonl; do
+    [ -e "$f" ] || continue
+    SIDS="$SIDS $(basename "$f" .jsonl)"
+  done
+fi
+
+attempt=0
+blocked=""
+while [ "$attempt" -lt 3 ]; do
+  blocked=""
+  if [ -d "$CLAUDE/sessions" ]; then
+    for sid in $SIDS; do
+      [ -n "$sid" ] || continue
+      for jf in "$CLAUDE/sessions"/*.json; do
+        [ -e "$jf" ] || continue
+        grep -qF "$sid" "$jf" 2>/dev/null || continue
+        p=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$jf" | head -n 1)
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then blocked="$sid"; break 2; fi
+      done
+    done
+  fi
+  [ -z "$blocked" ] && break
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 3 ] && sleep 0.3
+done
+if [ -n "$blocked" ]; then
+  # ${blocked} 的花括号不能省：变量名后紧跟全角括号（）时，单字节 locale
+  # （如 Latin-1）会把 0xEF 当作字母并入变量名，set -u 下直接报 unbound variable。
+  echo "会话仍在运行中（${blocked}），请先关闭对应的 Claude 进程再删除" >&2
+  exit 1
+fi
+
+if [ -d "$PDIR" ]; then
+  rm -rf "$PDIR" || { echo "删除 $PDIR 失败" >&2; exit 1; }
+  echo "DELETED:$PDIR"
+fi
+for sid in $SIDS; do
+  [ -n "$sid" ] || continue
+  fh="$CLAUDE/file-history/$sid"
+  if [ -e "$fh" ]; then
+    rm -rf "$fh" || { echo "删除 $fh 失败" >&2; exit 1; }
+    echo "DELETED:$fh"
+  fi
+done
+
+if [ -f "$HIST" ]; then
+  TMP="$HIST.cl-launcher.tmp"
+  before=$(wc -l < "$HIST")
+  grep -vF "\"project\":\"$PROJ\"" "$HIST" > "$TMP"; rc=$?
+  if [ "$rc" -ge 2 ]; then rm -f "$TMP"; echo "过滤 history.jsonl 失败" >&2; exit 1; fi
+  after=$(wc -l < "$TMP")
+  dropped=$((before - after))
+  if [ "$dropped" -gt 0 ]; then
+    cp "$HIST" "$HIST.cl-launcher.bak"
+    chmod 600 "$TMP"
+    mv "$TMP" "$HIST" || { rm -f "$TMP"; echo "写回 history.jsonl 失败" >&2; exit 1; }
+    echo "DELETED:history.jsonl 中的 $dropped 行 prompt 历史"
+  else
+    rm -f "$TMP"
+  fi
+fi
+
+if [ -f "$CJSON" ]; then
+  if command -v jq >/dev/null 2>&1; then
+    if jq -e --arg p "$PROJ" '.projects | has($p)' "$CJSON" >/dev/null 2>&1; then
+      cp "$CJSON" "$CJSON.cl-launcher.bak"
+      if jq -c --arg p "$PROJ" 'del(.projects[$p])' "$CJSON" > "$CJSON.cl-launcher.tmp" 2>/dev/null; then
+        chmod 600 "$CJSON.cl-launcher.tmp"
+        if mv "$CJSON.cl-launcher.tmp" "$CJSON"; then
+          echo "DELETED:.claude.json 项目条目 projects[\"$PROJ\"]"
+        else
+          rm -f "$CJSON.cl-launcher.tmp"; echo "WARN:.claude.json 写回失败，项目条目未删除"
+        fi
+      else
+        rm -f "$CJSON.cl-launcher.tmp"; echo "WARN:jq 处理 .claude.json 失败，项目条目未删除"
+      fi
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    if result=$(python3 - "$CJSON" "$PROJ" <<'PYEOF'
+import json, sys
+path, proj = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(1)
+if data.get("projects", {}).pop(proj, None) is not None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+    print("removed")
+PYEOF
+    ); then
+      [ "$result" = "removed" ] && echo "DELETED:.claude.json 项目条目 projects[\"$PROJ\"]"
+    else
+      echo "WARN:python3 处理 .claude.json 失败，项目条目未删除"
+    fi
+  else
+    echo "WARN:发行版内没有 jq/python3，.claude.json 项目条目未删除"
+  fi
+fi
+"##;
+
+// Single-session variant. history.jsonl filtering is anchored on the session
+// id (the launcher sidebar is driven by history.jsonl, so dropping those
+// lines is what keeps the deleted session from reappearing).
+#[cfg_attr(not(windows), allow(dead_code))]
+const DELETE_SESSION_SCRIPT: &str = r##"set -u
+CLAUDE="$HOME/.claude"
+HIST="$CLAUDE/history.jsonl"
+CJSON="$HOME/.claude.json"
+SID=__CL_SID__
+ENC=__CL_ENC__
+PROJ=__CL_PROJ__
+PDIR="$CLAUDE/projects/$ENC"
+
+attempt=0
+blocked=""
+while [ "$attempt" -lt 3 ]; do
+  blocked=""
+  if [ -d "$CLAUDE/sessions" ]; then
+    for jf in "$CLAUDE/sessions"/*.json; do
+      [ -e "$jf" ] || continue
+      grep -qF "$SID" "$jf" 2>/dev/null || continue
+      p=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$jf" | head -n 1)
+      if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then blocked="$SID"; break; fi
+    done
+  fi
+  [ -z "$blocked" ] && break
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 3 ] && sleep 0.3
+done
+if [ -n "$blocked" ]; then
+  # ${blocked} 的花括号不能省：变量名后紧跟全角括号（）时，单字节 locale
+  # （如 Latin-1）会把 0xEF 当作字母并入变量名，set -u 下直接报 unbound variable。
+  echo "会话仍在运行中（${blocked}），请先关闭对应的 Claude 进程再删除" >&2
+  exit 1
+fi
+
+T="$PDIR/$SID.jsonl"
+if [ -e "$T" ]; then
+  rm -f "$T" || { echo "删除 $T 失败" >&2; exit 1; }
+  echo "DELETED:$T"
+fi
+D="$PDIR/$SID"
+if [ -e "$D" ]; then
+  rm -rf "$D" || { echo "删除 $D 失败" >&2; exit 1; }
+  echo "DELETED:$D"
+fi
+FH="$CLAUDE/file-history/$SID"
+if [ -e "$FH" ]; then
+  rm -rf "$FH" || { echo "删除 $FH 失败" >&2; exit 1; }
+  echo "DELETED:$FH"
+fi
+
+if [ -f "$HIST" ]; then
+  TMP="$HIST.cl-launcher.tmp"
+  before=$(wc -l < "$HIST")
+  grep -vF "\"sessionId\":\"$SID\"" "$HIST" > "$TMP"; rc=$?
+  if [ "$rc" -ge 2 ]; then rm -f "$TMP"; echo "过滤 history.jsonl 失败" >&2; exit 1; fi
+  after=$(wc -l < "$TMP")
+  dropped=$((before - after))
+  if [ "$dropped" -gt 0 ]; then
+    cp "$HIST" "$HIST.cl-launcher.bak"
+    chmod 600 "$TMP"
+    mv "$TMP" "$HIST" || { rm -f "$TMP"; echo "写回 history.jsonl 失败" >&2; exit 1; }
+    echo "DELETED:history.jsonl 中的 $dropped 行 prompt 历史"
+  else
+    rm -f "$TMP"
+  fi
+fi
+
+if [ -f "$CJSON" ]; then
+  if command -v jq >/dev/null 2>&1; then
+    if jq -e --arg p "$PROJ" --arg s "$SID" '.projects[$p].lastSessionId == $s' "$CJSON" >/dev/null 2>&1; then
+      cp "$CJSON" "$CJSON.cl-launcher.bak"
+      if jq -c --arg p "$PROJ" 'del(.projects[$p].lastSessionId)' "$CJSON" > "$CJSON.cl-launcher.tmp" 2>/dev/null; then
+        chmod 600 "$CJSON.cl-launcher.tmp"
+        if mv "$CJSON.cl-launcher.tmp" "$CJSON"; then
+          echo "DELETED:.claude.json lastSessionId"
+        else
+          rm -f "$CJSON.cl-launcher.tmp"; echo "WARN:.claude.json 写回失败，lastSessionId 未清理"
+        fi
+      else
+        rm -f "$CJSON.cl-launcher.tmp"; echo "WARN:jq 处理 .claude.json 失败，lastSessionId 未清理"
+      fi
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    if result=$(python3 - "$CJSON" "$PROJ" "$SID" <<'PYEOF'
+import json, sys
+path, proj, sid = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(1)
+entry = data.get("projects", {}).get(proj)
+if isinstance(entry, dict) and entry.get("lastSessionId") == sid:
+    del entry["lastSessionId"]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+    print("cleared")
+PYEOF
+    ); then
+      [ "$result" = "cleared" ] && echo "DELETED:.claude.json lastSessionId"
+    else
+      echo "WARN:python3 处理 .claude.json 失败，lastSessionId 未清理"
+    fi
+  else
+    echo "WARN:发行版内没有 jq/python3，.claude.json lastSessionId 未清理"
+  fi
+fi
+"##;
+
+/// Single-quotes a value for safe interpolation into the delete scripts.
+/// (The bashrc `shell_quote` below escapes an embedded `'` as `''`, which bash
+/// reads as two adjacent strings and silently drops the quote; paths in `rm`
+/// commands must not lose characters, so the delete scripts escape as `'\''`.)
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shell_quote_delete(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Turns the delete scripts' `DELETED:`/`WARN:` stdout lines into a report.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_wsl_delete_report(stdout: &str) -> NativeDeleteReport {
+    let mut report = NativeDeleteReport::default();
+    for line in stdout.lines() {
+        if let Some(text) = line.strip_prefix("DELETED:") {
+            report.deleted.push(text.to_string());
+        } else if let Some(text) = line.strip_prefix("WARN:") {
+            report.warnings.push(text.to_string());
+        }
+    }
+    report
+}
 
 // ---------------------------------------------------------------------------
 // wsl.exe helper
@@ -306,6 +560,87 @@ pub fn invalidate_wsl_history_cache() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *cache = None;
+}
+
+// ---------------------------------------------------------------------------
+// WSL native deletion of Claude Code project/session data
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+async fn run_wsl_delete(script: String) -> Result<NativeDeleteReport, String> {
+    let (ok, stdout, stderr) = run_wsl_bash(&script, None)
+        .await
+        .map_err(|e| wsl_error("删除 WSL 原生数据", e))?;
+    if !ok {
+        return Err(wsl_error_text("删除 WSL 原生数据", &stderr));
+    }
+    Ok(parse_wsl_delete_report(&stdout))
+}
+
+/// Session ids the distro's history attributes to `distro_path`. A missing or
+/// unreadable history is not fatal: the delete script also collects ids from
+/// transcript file names, and all file deletions work without the history.
+#[cfg(windows)]
+async fn wsl_project_session_ids(distro_path: &str) -> Vec<String> {
+    load_wsl_history_snapshot()
+        .await
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .sessions_by_project
+                .get(distro_path)
+                .map(|entries| entries.iter().map(|entry| entry.id.clone()).collect())
+        })
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn delete_wsl_claude_project_native(
+    distro_path: String,
+) -> Result<NativeDeleteReport, String> {
+    #[cfg(windows)]
+    {
+        let distro_path = crate::session_manager::validate_native_project_path(&distro_path)?;
+        let session_ids = wsl_project_session_ids(&distro_path).await;
+        let encoded = crate::session_manager::encode_project_dir(&distro_path);
+        let script = DELETE_PROJECT_SCRIPT
+            .replace("__CL_PROJ__", &shell_quote_delete(&distro_path))
+            .replace("__CL_ENC__", &shell_quote_delete(&encoded))
+            .replace("__CL_SIDS__", &shell_quote_delete(&session_ids.join(" ")));
+        let report = run_wsl_delete(script).await?;
+        invalidate_wsl_history_cache();
+        Ok(report)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = distro_path;
+        Err("仅 Windows 支持 WSL 会话".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn delete_wsl_claude_session_native(
+    distro_path: String,
+    session_id: String,
+) -> Result<NativeDeleteReport, String> {
+    #[cfg(windows)]
+    {
+        let distro_path = crate::session_manager::validate_native_project_path(&distro_path)?;
+        crate::session_manager::validate_native_session_id(&session_id)?;
+        let encoded = crate::session_manager::encode_project_dir(&distro_path);
+        let script = DELETE_SESSION_SCRIPT
+            .replace("__CL_SID__", &shell_quote_delete(&session_id))
+            .replace("__CL_ENC__", &shell_quote_delete(&encoded))
+            .replace("__CL_PROJ__", &shell_quote_delete(&distro_path));
+        let report = run_wsl_delete(script).await?;
+        invalidate_wsl_history_cache();
+        Ok(report)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (distro_path, session_id);
+        Err("仅 Windows 支持 WSL 会话".to_string())
+    }
 }
 
 #[cfg(windows)]
@@ -619,5 +954,44 @@ mod tests {
         let block = render_block(&vars(&[("A", "1")]));
         let out = splice_block(&existing, &block);
         assert_eq!(out, format!("odd\n{BLOCK_END}\ntail\n\n{block}\n"));
+    }
+
+    #[test]
+    fn shell_quote_delete_escapes_embedded_single_quotes() {
+        assert_eq!(shell_quote_delete("/home/paul/foo"), "'/home/paul/foo'");
+        assert_eq!(shell_quote_delete("/home/paul/it's"), "'/home/paul/it'\\''s'");
+        assert_eq!(shell_quote_delete(""), "''");
+    }
+
+    #[test]
+    fn parse_wsl_delete_report_collects_deleted_and_warnings() {
+        let stdout = concat!(
+            "DELETED:/home/paul/.claude/projects/-home-paul-foo\n",
+            "some other output\n",
+            "WARN:发行版内没有 jq/python3，.claude.json 项目条目未删除\n",
+            "DELETED:history.jsonl 中的 3 行 prompt 历史\n",
+        );
+        let report = parse_wsl_delete_report(stdout);
+        assert_eq!(report.deleted.len(), 2);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.deleted[1].contains("history.jsonl"));
+    }
+
+    #[test]
+    fn delete_scripts_have_no_unsubstituted_placeholders_after_replace() {
+        let project = DELETE_PROJECT_SCRIPT
+            .replace("__CL_PROJ__", &shell_quote_delete("/home/paul/foo"))
+            .replace("__CL_ENC__", &shell_quote_delete("-home-paul-foo"))
+            .replace("__CL_SIDS__", &shell_quote_delete("id1 id2"));
+        assert!(!project.contains("__CL_"), "{project}");
+        assert!(project.contains("PROJ='/home/paul/foo'"));
+        assert!(project.contains("SIDS='id1 id2'"));
+
+        let session = DELETE_SESSION_SCRIPT
+            .replace("__CL_SID__", &shell_quote_delete("92d153c1-9855-4c08-b2ce-c9f6b67a88df"))
+            .replace("__CL_ENC__", &shell_quote_delete("-home-paul-foo"))
+            .replace("__CL_PROJ__", &shell_quote_delete("/home/paul/foo"));
+        assert!(!session.contains("__CL_"), "{session}");
+        assert!(session.contains("SID='92d153c1-9855-4c08-b2ce-c9f6b67a88df'"));
     }
 }

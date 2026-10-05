@@ -158,6 +158,13 @@ interface WslClaudeProjectList {
   projects: string[]
 }
 
+// 后端原生删除命令的返回：已删除条目 + 非致命残留（如 WSL 发行版内缺少
+// jq/python3 导致 .claude.json 条目未清）。
+interface NativeDeleteReport {
+  deleted: string[]
+  warnings: string[]
+}
+
 // A project path lives inside WSL when it is a distro-local absolute path or
 // already a \\wsl… UNC path picked from the distro share. Windows-only
 // heuristic: on macOS every absolute path starts with `/`, so a leading
@@ -1948,6 +1955,76 @@ export const useProjectStore = defineStore('project', () => {
     await persist()
   }
 
+  // 删除 Claude 项目 = 删 Claude Code 原生数据（转写目录、file-history、
+  // history.jsonl 行、.claude.json 条目，语义对齐官方 `claude project purge`）
+  // + 应用内记录。原生数据删干净后刷新不会再从历史里复活。原生删除失败时
+  // 本地记录保持不动，用户可以排查后重试。
+  async function deleteProject(projectId: string) {
+    const project = projects.value.find((p) => p.id === projectId)
+    if (!project) return
+    if (project.cliKind !== 'claude') {
+      await removeProject(projectId)
+      return
+    }
+    // 先关闭应用内终端：它们承载的 claude 进程会触发后端的活会话守卫。
+    const terminalStore = useTerminalStore()
+    const relatedSessionIds = sessions.value.filter((s) => s.projectId === projectId).map((s) => s.id)
+    for (const id of relatedSessionIds) {
+      const tabId = sessionTerminalIds.value[id]
+      if (tabId) await terminalStore.closeTab(tabId)
+    }
+    try {
+      const report = project.wsl
+        ? await invoke<NativeDeleteReport>('delete_wsl_claude_project_native', {
+          distroPath: wslDistroPath(project.path),
+        })
+        : await invoke<NativeDeleteReport>('delete_claude_project_native', {
+          projectPath: project.path,
+        })
+      await removeProject(projectId)
+      await invoke('invalidate_claude_history_cache').catch(() => {})
+      if (project.wsl) await invoke('invalidate_wsl_history_cache').catch(() => {})
+      statusMessage.value = report.warnings.length > 0
+        ? `项目「${project.name}」已删除，部分残留：${report.warnings.join('；')}`
+        : `已删除项目「${project.name}」及其 Claude 原生数据（${report.deleted.length} 项）`
+    } catch (error) {
+      statusMessage.value = `删除项目原生数据失败：${String(error)}`
+    }
+  }
+
+  // 删除 Claude 会话：原生转写 + history.jsonl 行一并删除（history 是侧边栏
+  // 会话列表的数据源，不删会复活）。从未写入原生历史的纯本地会话只清应用内记录。
+  async function deleteSession(sessionId: string) {
+    const session = sessions.value.find((s) => s.id === sessionId)
+    if (!session) return
+    const nativeSessionId = session.nativeSessionId ?? session.claudeSessionId
+    const project = projects.value.find((p) => p.id === session.projectId)
+    if (session.cliKind !== 'claude' || !nativeSessionId || !project) {
+      await removeSession(sessionId)
+      return
+    }
+    await closeSessionTerminal(sessionId)
+    try {
+      const report = project.wsl
+        ? await invoke<NativeDeleteReport>('delete_wsl_claude_session_native', {
+          distroPath: wslDistroPath(project.path),
+          sessionId: nativeSessionId,
+        })
+        : await invoke<NativeDeleteReport>('delete_claude_session_native', {
+          projectPath: project.path,
+          sessionId: nativeSessionId,
+        })
+      await removeSession(sessionId)
+      await invoke('invalidate_claude_history_cache').catch(() => {})
+      if (project.wsl) await invoke('invalidate_wsl_history_cache').catch(() => {})
+      statusMessage.value = report.warnings.length > 0
+        ? `会话已删除，部分残留：${report.warnings.join('；')}`
+        : `已删除会话「${session.name}」及其 Claude 原生数据`
+    } catch (error) {
+      statusMessage.value = `删除会话原生数据失败：${String(error)}`
+    }
+  }
+
   function getSessionStatus(sessionId: string): TerminalStatus {
     const terminalStore = useTerminalStore()
     const tabId = sessionTerminalIds.value[sessionId]
@@ -2516,6 +2593,8 @@ export const useProjectStore = defineStore('project', () => {
     activateSession,
     renameSession,
     removeSession,
+    deleteProject,
+    deleteSession,
     getSessionStatus,
     ensureSessionTerminal,
     closeSessionTerminal,

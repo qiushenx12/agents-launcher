@@ -264,6 +264,8 @@ pub fn run() {
             wsl_env::list_wsl_claude_projects,
             wsl_env::load_wsl_claude_sessions,
             wsl_env::invalidate_wsl_history_cache,
+            wsl_env::delete_wsl_claude_project_native,
+            wsl_env::delete_wsl_claude_session_native,
             // settings_manager commands
             settings_manager::load_claude_settings,
             settings_manager::save_claude_settings,
@@ -347,6 +349,8 @@ pub fn run() {
             session_manager::load_claude_sessions,
             session_manager::load_claude_recent_projects,
             session_manager::invalidate_claude_history_cache,
+            session_manager::delete_claude_project_native,
+            session_manager::delete_claude_session_native,
             // claude_launcher commands
             claude_launcher::launch_claude,
             claude_launcher::find_claude_executable,
