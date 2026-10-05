@@ -18,15 +18,16 @@ import { DSH_THINKING_LEVELS, deriveDshCredentialRef } from '@/types/config'
  * （`src-tauri/src/dsh_settings.rs`），前端拿到的是已经结构化的数据，回写时也只送
  * 结构化数据。两条边界：
  *
- * 1. **settings.yaml 只存引用名。** 令牌的**值**在 `$DSH_HOME/.credentials.yaml`
+ * 1. **设置文件只存引用名。** 令牌的**值**在 `$DSH_HOME/.credentials.yaml`
  *    的 `refs` 分节，由「认证令牌」栏经后端写入（对齐 dsh 自己的文件格式）；这条
- *    settings 侧的 `apiKeyEnv` 只是引用，从来不是密钥。引用名沿用文件里已有的，
+ *    设置侧的 `apiKeyEnv` 只是引用，从来不是密钥。引用名沿用文件里已有的，
  *    没有时按 dsh 的派生规则生成并自动补写。
  * 2. **只编辑声明，不改 dsh 不认识的字段。** 供应商下的 `compat`、`headers`、
  *    `retryPolicy` 等字段会被原样保留，界面上只标注它们的存在。
  *
- * dsh 仍在快速迭代：这份结构对齐 v0.1.5-rc.1，字段若变动，见
- * `src-tauri/src/dsh_settings.rs` 顶部注释里的排查路径。
+ * dsh 在 0.2.0 换了设置文件的形态（见 `DshSettingsLayout`），后端按检测到的
+ * dsh 版本分派两种布局；这一层只根据 `layout` 调文案与提示，数据形状不变。
+ * 字段若再变动，见 `src-tauri/src/dsh_settings.rs` 顶部注释里的排查路径。
  */
 
 /** 界面上的供应商草稿：比落盘结构多一个「文件里原来的键」。 */
@@ -137,6 +138,20 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
   const selectedProvider = computed(() => selectedDraft.value)
   const settingsPath = computed(() => document.value?.path ?? '')
   const supportedVersion = computed(() => document.value?.supportedVersion ?? '')
+  /** 当前布局：读取完成前按「新」算（现在装的 dsh 都是 0.2.0 起）。 */
+  const layout = computed(() => document.value?.layout ?? 'profile-patch')
+  /** 界面文案里的设置文件名（两种布局各一个）。 */
+  const settingsFileName = computed(() =>
+    layout.value === 'profile-patch' ? 'cordis.patch.yml' : 'settings.yaml')
+  /**
+   * 0.2.0 起 dsh 不再热重载设置文件（loader 不 watch cordis.patch.yml），
+   * 写入/删除要重启 dsh 服务才生效。凭据文件的值仍热重载，但「补写 apiKeyEnv
+   * 引用名」动的是设置文件，同样要重启才被 dsh 看到。
+   */
+  const needsRestartToApply = computed(() => layout.value === 'profile-patch')
+  /** 写删成功消息的布局后缀。 */
+  const applyHint = computed(() =>
+    needsRestartToApply.value ? '重启 dsh 服务后生效。' : '')
 
   /** 单个供应商是否有未写入的改动。新草稿一律算有。 */
   function isProviderDirty(draft: DshProviderDraft): boolean {
@@ -356,7 +371,7 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
       })
       document.value = { ...current, revision: result.revision }
       await load(true)
-      setStatus('success', `已从设置文件删除供应商「${draft.originalId}」。`)
+      setStatus('success', `已从设置文件删除供应商「${draft.originalId}」。${applyHint.value}`)
       return true
     } catch (error) {
       setStatus('error', `删除失败：${error}`)
@@ -454,7 +469,7 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
       // 是异步的，直接读 credentialStored/credentialErrors 会拿到上一轮的陈旧值。
       await load(true)
       await refreshCredentials()
-      const baseMessage = `已写入供应商「${draft.id}」。写入前的内容已备份为 ${result.backupPath}。`
+      const baseMessage = `已写入供应商「${draft.id}」。写入前的内容已备份为 ${result.backupPath}。${applyHint.value}`
 
       // load 重建了 drafts，找回同一条草稿再判断令牌。按**写入文件的路由键**
       // （draft.id）匹配：这次写入就是按它落盘的，新草稿的 originalId 即它。
@@ -579,7 +594,7 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
    */
   async function saveCredential(draft: DshProviderDraft, quiet = false): Promise<boolean> {
     if (draft.originalId === null) {
-      setStatus('error', '请先把这个供应商写入 settings.yaml，再保存令牌。')
+      setStatus('error', `请先把这个供应商写入 ${settingsFileName.value}，再保存令牌。`)
       return false
     }
     if (!document.value) {
@@ -605,11 +620,17 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
       credentialErrors.delete(draft)
       credentialVersion.value++
       if (!quiet) {
+        // 令牌的**值** dsh 热重载（下一次请求就用上）；但补写进设置文件的
+        // apiKeyEnv 引用名在 0.2.0 起要等重启才被 dsh 看到——两种情况分开说。
+        const refLineNeedsRestart = result.settingsRevision !== null && needsRestartToApply.value
         setStatus(
           'success',
           removed
             ? `已移除「${draft.id}」的认证令牌。`
-            : `已保存「${draft.id}」的认证令牌（引用名 ${result.refName}），dsh 下一次请求就会用上它。`,
+            : `已保存「${draft.id}」的认证令牌（引用名 ${result.refName}），` +
+              (refLineNeedsRestart
+                ? '设置文件里补写的引用名要重启 dsh 服务后才被看到。'
+                : 'dsh 下一次请求就会用上它。'),
         )
       }
       return true
@@ -746,6 +767,9 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     status,
     settingsPath,
     supportedVersion,
+    layout,
+    settingsFileName,
+    needsRestartToApply,
     toast,
     toastSeq,
     isSelectedDirty,

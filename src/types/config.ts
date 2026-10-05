@@ -276,9 +276,11 @@ export interface WindowState {
 /*
  * ── DeepSeek Harness 设置文档里的「供应商与模型」 ──────────────────────────
  *
- * 对齐 dsh **v0.1.5-rc.1** 的 `$DSH_HOME/settings.yaml`（`llm-pi-ai:` 分区）。
- * dsh 仍在快速迭代（官方自述 developer preview、会有 breaking changes），
- * 字段名与层级都可能随版本变动。
+ * dsh 在 **0.2.0** 换了设置文件的形态（`DshSettingsLayout`），两种布局这套类型
+ * 都覆盖：0.1.x 是 `$DSH_HOME/settings.yaml`（`llm-pi-ai:` 分区），0.2.0 起是
+ * `$DSH_HOME/profiles/web/cordis.patch.yml`（`- id: llm-pi-ai` entry 的
+ * `config.providers`）。dsh 仍在快速迭代（官方自述 developer preview、会有
+ * breaking changes），字段名与层级都可能随版本变动。
  *
  * **如果这里失效了**（新增供应商报错、写出的字段 dsh 不认、读不到已有供应商），
  * 去官方仓库 https://github.com/deepseek-ai/deepseek-harness 看
@@ -390,12 +392,29 @@ export interface DshProviderProfile {
   custom: boolean
 }
 
+/**
+ * dsh 设置文档的布局。dsh 在 0.2.0 把 `settings.yaml` 换成了一次性导入 +
+ * profile patch，两种布局后端都会读写，按检测到的 dsh 版本分派。
+ */
+export type DshSettingsLayout =
+  /** dsh 0.1.x：`$DSH_HOME/settings.yaml`（dsh 热重载它）。 */
+  | 'legacy-yaml'
+  /**
+   * dsh 0.2.0 起：`$DSH_HOME/profiles/web/cordis.patch.yml`（dsh **不**热重载
+   * 它，写入要重启 dsh 才生效；自定义路由必须声明 `api`）。
+   */
+  | 'profile-patch'
+
 export interface DshSettingsDocument {
+  /** 设置文件的绝对路径（哪种布局指哪个文件）。 */
   path: string
   exists: boolean
   /** 文件内容的 sha256，写回时必须原样带回。 */
   revision: string
+  /** 当前布局对齐的 dsh 版本。 */
   supportedVersion: string
+  /** 本次读写按哪种布局进行（由检测到的 dsh 版本决定）。 */
+  layout: DshSettingsLayout
   providers: DshProviderProfile[]
 }
 

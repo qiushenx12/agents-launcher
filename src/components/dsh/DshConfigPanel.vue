@@ -14,7 +14,7 @@
           <div class="provider-sidebar__body">
             <div v-if="store.loading && !store.loaded" class="provider-sidebar__empty">正在读取…</div>
             <div v-else-if="store.providers.length === 0" class="provider-sidebar__empty">
-              settings.yaml 里还没有供应商。
+              {{ store.settingsFileName }} 里还没有供应商。
             </div>
             <!--
               文件里有供应商、但一条自定义的都没有：清单会空着。这里必须解释一句，
@@ -22,7 +22,7 @@
               提供全部字段，本页没有可编辑的内容）。
             -->
             <div v-else-if="store.visibleProviders.length === 0" class="provider-sidebar__empty">
-              本页只显示自定义供应商；settings.yaml 里剩下的都是 dsh 自带的目录路由。
+              本页只显示自定义供应商；{{ store.settingsFileName }} 里剩下的都是 dsh 自带的目录路由。
             </div>
             <div v-else class="provider-list">
               <button
@@ -114,12 +114,21 @@
           <div class="card-title">说明</div>
           <p>只显示自定义供应商。</p>
           <p>
-            写入只改你正在编辑的这一个供应商，settings.yaml 里的其他内容（其他供应商、
+            写入只改你正在编辑的这一个供应商，{{ store.settingsFileName }} 里的其他内容（其他供应商、
             未列出的字段）原样保留。
           </p>
           <p>
-            写入前会把原文件备份为同目录的 <code>settings.yaml.bak</code>；
+            写入前会把原文件备份为同目录的 <code>{{ store.settingsFileName }}.bak</code>；
             被改动的那个字段会按规范格式重排，它内部的注释不会保留。
+          </p>
+          <!--
+            0.2.0 起 dsh 不再热重载设置文件（0.1.x 的 settings.yaml 是热重载的），
+            不说明这一点用户会以为写入坏了。
+          -->
+          <p v-if="store.needsRestartToApply">
+            从 dsh 0.2.0 起，这份配置（<code>cordis.patch.yml</code>）**不再被热重载**：
+            写入或删除后要<strong>重启 dsh 服务</strong>才会生效（「启动设置」页可重启）。
+            认证令牌的值仍即时生效。
           </p>
           <p class="source-note__version">
             本页面的字段对应 dsh <strong>v{{ supportedVersionLabel }}</strong>（开发者预览版，字段可能随版本变动）
@@ -171,8 +180,8 @@ import DshStartupSettingsPane from './DshStartupSettingsPane.vue'
  * dsh 配置工作台的外壳。
  *
  * 布局与其它三个 CLI 对齐：左边一列清单、右边是选中项的内容。dsh 的清单是
- * **供应商**（settings.yaml 的 `llm-pi-ai.providers`），页脚两个入口——
- * 「启动设置」（原来的整张卡片）在「设置」上方。
+ * **供应商**（设置文件里的 `llm-pi-ai.providers`；0.2.0 起在 profile patch 的
+ * entry config 里），页脚两个入口——「启动设置」（原来的整张卡片）在「设置」上方。
  *
  * 供应商与模型的读写全部交给 Rust（`src-tauri/src/dsh_settings.rs`）：前端只拿
  * 结构化的供应商列表、也只回写结构化数据，YAML 的解析与最小化改写都在后端。
@@ -234,7 +243,7 @@ watch(
   },
 )
 
-const supportedVersionLabel = computed(() => store.supportedVersion || '0.1.5-rc.1')
+const supportedVersionLabel = computed(() => store.supportedVersion || '—')
 
 const { draggingIndex, overIndex, justDragged, onPointerDown } = useDragReorder(
   () => store.visibleProviders.map((item) => item.id),
@@ -270,7 +279,7 @@ function selectStartup() {
   pane.value = 'startup'
 }
 
-/** 打开 settings.yaml 所在目录，方便用户直接手改（dsh 也支持热重载这份文件）。 */
+/** 打开设置文件所在目录，方便用户直接查看（手改请谨慎：两种布局都不热重载时见上方说明）。 */
 async function openSettingsDirectory() {
   const path = store.settingsPath
   const separator = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'))

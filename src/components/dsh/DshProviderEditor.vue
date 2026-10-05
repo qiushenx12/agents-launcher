@@ -46,11 +46,13 @@
         <option v-for="protocol in DSH_API_PROTOCOLS" :key="protocol" :value="protocol">
           {{ protocol }}
         </option>
-        <!-- 手写进 settings.yaml 的协议：列出来，免得下拉空白、一保存就把它改掉。 -->
+        <!-- 手写进设置文件的协议：列出来，免得下拉空白、一保存就把它改掉。 -->
         <option v-if="unlistedApi" :value="unlistedApi">{{ unlistedApi }}（dsh 不支持）</option>
       </select>
     </div>
-    <p class="field-help">手工声明的网关必须填。</p>
+    <p class="field-help">
+      手工声明的网关必须填。<template v-if="store.needsRestartToApply">dsh 0.2.0 起缺了它，dsh 装配时会拒绝整个 llm-pi-ai 配置（只留一条日志，界面上无声无息），后端在写盘前会拦下。</template>
+    </p>
 
     <div class="field-row">
       <label class="field-label">API 地址</label>
@@ -65,7 +67,7 @@
         <!--
           「获取模型」与 Claude Code 配置页同一个形状：按当前 API 地址（和「认证
           令牌」栏的值）去网关拉模型清单，拉到的结果填进下方「添加模型」右侧的
-          下拉。清单只进内存，不写进 settings.yaml。
+          下拉。清单只进内存，不写进设置文件。
         -->
         <button
           class="btn btn-secondary"
@@ -79,13 +81,15 @@
     </div>
 
     <!--
-      认证令牌：**值**存 `$DSH_HOME/.credentials.yaml` 的 refs 分节，settings.yaml
+      认证令牌：**值**存 `$DSH_HOME/.credentials.yaml` 的 refs 分节，设置文件
       里只有引用名 `apiKeyEnv`。引用名不设输入框：文件里已有就沿用，没有就按 dsh
       的派生规则（路由键大写、连续非字母数字折叠成 `_`、后缀 `_API_KEY`，即
       `deriveKeyRef`）生成并自动补写一行——dsh 自己的模型页录入密钥时也是这么做的
       （`schema.setPath(draft, ["apiKeyEnv"], keyRef)`）。
-      dsh 每次请求按引用名现读现用，保存即生效，不需要重启。启动 dsh 的环境里若有
-      同名变量，dsh 会优先用那个只读的值——界面里存的值要等那层清掉才会被看到。
+      令牌的**值** dsh 每次请求现读现用，保存即生效，不需要重启；但 0.2.0 起补写
+      进 cordis.patch.yml 的引用名要重启才被 dsh 看到（store 的成功消息会说）。
+      启动 dsh 的环境里若有同名变量，dsh 会优先用那个只读的值——界面里存的值要等
+      那层清掉才会被看到。
 
       保存路径（2026-09-18 起）：普通的令牌修改随「写入当前修改」一起保存，不再
       有独立的保存按钮。这一行只在两种必须显式动作的情形出现：
@@ -107,7 +111,7 @@
       >
         移除令牌
       </button>
-      <span v-if="provider.originalId === null">令牌随「写入 settings.yaml」一起保存。</span>
+      <span v-if="provider.originalId === null">令牌随「写入 {{ store.settingsFileName }}」一起保存。</span>
       <span v-else-if="store.credentialErrorOf(provider)">{{ store.credentialErrorOf(provider) }}</span>
     </div>
     <div class="field-row">
@@ -128,7 +132,7 @@
     </div>
 
     <p v-if="provider.unmanagedFields.length" class="unmanaged-note">
-      另有 {{ provider.unmanagedFields.length }} 个字段由 settings.yaml 直接管理：
+      另有 {{ provider.unmanagedFields.length }} 个字段由 {{ store.settingsFileName }} 直接管理：
       <code v-for="field in provider.unmanagedFields" :key="field">{{ field }}</code>
     </p>
 
@@ -264,7 +268,7 @@
             </div>
 
             <p v-if="model.unmanagedFields.length" class="unmanaged-note unmanaged-note--model">
-              另有字段由 settings.yaml 管理：
+              另有字段由 {{ store.settingsFileName }} 管理：
               <code v-for="field in model.unmanagedFields" :key="field">{{ field }}</code>
             </p>
           </div>
@@ -279,7 +283,7 @@
         :disabled="store.saving"
         @click="store.writeSelectedProvider()"
       >
-        {{ store.saving ? '处理中…' : provider.originalId ? '保存' : '写入 settings.yaml' }}
+        {{ store.saving ? '处理中…' : provider.originalId ? '保存' : `写入 ${store.settingsFileName}` }}
       </button>
       <button
         class="btn btn-secondary danger-button"
@@ -287,7 +291,7 @@
         :disabled="store.saving"
         @click="removeProvider"
       >
-        {{ provider.originalId ? '从 settings.yaml 删除' : '删除草稿' }}
+        {{ provider.originalId ? `从 ${store.settingsFileName} 删除` : '删除草稿' }}
       </button>
     </div>
   </section>
@@ -315,12 +319,13 @@ import SecretField from '@/components/config/SecretField.vue'
  *
  * 字段集合是照着 dsh 自己的「设置 → 模型」页定的（`@deepseek-ai/dsh-client-ui-settings-models`
  * 的 `ProviderEditor`）：它同样只暴露 凭据 / `baseURL` / 显示名 / wire 协议，
- * 其余留在 settings.yaml。那里有一句设计说明值得照抄——**思考强度是 per-MODEL
+ * 其余留在设置文件。那里有一句设计说明值得照抄——**思考强度是 per-MODEL
  * 的能力**，同一个供应商下的模型对它并不一致，所以做成供应商级开关只会「设成
  * 某个值、然后被一部分模型拒绝」。因此档位编辑跟着每个模型走。
  *
- * ⚠️ dsh 仍是 developer preview，字段与层级会变。这里对齐 v0.1.5-rc.1；一旦
- * 失效，按 `src-tauri/src/dsh_settings.rs` 顶部注释里的路径去查官方文档
+ * ⚠️ dsh 仍是 developer preview，字段与层级会变。这里覆盖 0.1.x 与 0.2.0 两种
+ * 布局（哪份文件、api 是否必填由后端按 dsh 版本分派）；一旦失效，按
+ * `src-tauri/src/dsh_settings.rs` 顶部注释里的路径去查官方文档
  * （仓库 `deepseek-ai/deepseek-harness` 的 docs/config-catalog.zh.md 与
  * docs/user/guide/providers.zh.md），再同步两侧。
  */
@@ -414,7 +419,7 @@ async function removeProvider() {
   if (!target) return
     if (target.originalId !== null) {
       const accepted = await confirm(
-        `将从 settings.yaml 中移除供应商「${target.originalId}」的整块配置。\n\n`
+        `将从 ${store.settingsFileName} 中移除供应商「${target.originalId}」的整块配置。\n\n`
         + '其它供应商与所有未展示的字段都会保留。'
         + '认证令牌保存在 dsh 的凭据文件里，本次删除不会动它。\n\n是否继续？',
         { title: '删除供应商', kind: 'warning' },

@@ -128,6 +128,7 @@ function makeBackend() {
           exists: true,
           revision,
           supportedVersion: '0.1.5-rc.1',
+          layout: 'legacy-yaml',
           providers: Object.values(providers).map((p) => deepClone(p)),
         }
       }

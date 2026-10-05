@@ -1618,7 +1618,8 @@ fn supervised_listens_on(port: u16) -> bool {
 // npm cache sampling (first-download progress)
 // ---------------------------------------------------------------------------
 
-fn npm_cache_dir() -> Option<PathBuf> {
+// `dsh_settings` 也用它定位 0.2.0 起随 dsh 包安装的 pi-ai 目录清单。
+pub(crate) fn npm_cache_dir() -> Option<PathBuf> {
     // Resolve npm the same way the dsh launch resolves npx — by full path via
     // `locate_executable`, which honours PATHEXT (`npm.cmd`). `Command::new("npm")`
     // alone fails in a GUI process whose PATH does not resolve bare names.
@@ -1682,7 +1683,8 @@ fn cached_dsh_version(entry: &Path) -> Option<String> {
     is_version_key(version).then(|| version.to_string())
 }
 
-fn cached_dsh_entries(cache_dir: &Path) -> Result<BTreeMap<String, Vec<PathBuf>>, String> {
+// `dsh_settings` 也用它按版本找 0.2.0 起 dsh 包的安装位置（pi-ai 目录清单在那里）。
+pub(crate) fn cached_dsh_entries(cache_dir: &Path) -> Result<BTreeMap<String, Vec<PathBuf>>, String> {
     let root = cache_dir.join("_npx");
     let metadata = match std::fs::symlink_metadata(&root) {
         Ok(metadata) => metadata,

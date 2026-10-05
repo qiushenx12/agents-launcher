@@ -319,9 +319,10 @@ pub fn run() {
             dsh_runtime::dsh_list_cached_versions,
             dsh_runtime::dsh_delete_cached_version,
             dsh_runtime::dsh_update_version,
-            // dsh 用户设置文档（`$DSH_HOME/settings.yaml`）里的供应方与模型，
-            // 以及凭据文件（`.credentials.yaml`）里的认证令牌值。
-            // 对齐 dsh v0.1.5-rc.1；dsh 仍在迭代，字段若变动见 dsh_settings.rs 顶部注释。
+            // dsh 用户设置（0.1.x 的 `$DSH_HOME/settings.yaml` 与 0.2.0 起的
+            // `profiles/web/cordis.patch.yml`，按检测到的 dsh 版本分派）里的供应方
+            // 与模型，以及凭据文件（`.credentials.yaml`）里的认证令牌值。
+            // dsh 仍在迭代，字段若变动见 dsh_settings.rs 顶部注释。
             dsh_settings::dsh_read_settings,
             dsh_settings::dsh_write_provider,
             dsh_settings::dsh_delete_provider,

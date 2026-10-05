@@ -1,15 +1,31 @@
-//! dsh 用户设置文档（`$DSH_HOME/settings.yaml`）里「模型与供应商」部分的读写，
-//! 以及 dsh 凭据文件（`$DSH_HOME/.credentials.yaml`）里认证令牌值的读写。
+//! dsh 用户设置里「模型与供应商」部分的读写，以及 dsh 凭据文件
+//! （`$DSH_HOME/.credentials.yaml`）里认证令牌值的读写。
 //!
-//! # 这块代码对齐的是哪个版本
+//! # 两种布局，按 dsh 版本分派
 //!
-//! 对齐 **DeepSeek Harness v0.1.5-rc.1**（见 [`DSH_SETTINGS_SUPPORTED_VERSION`]）。
+//! dsh 在 **0.2.0** 把用户设置文档换掉了（[`DshSettingsLayout`]）：
+//!
+//! - **0.1.x（`LegacyYaml`，对齐 v0.1.5-rc.1）**：`$DSH_HOME/settings.yaml`，
+//!   顶层是映射，供应商在 `llm-pi-ai.providers` 下；dsh 热重载这份文件。
+//! - **0.2.0 起（`ProfilePatch`，对齐 v0.2.0-rc.2）**：dsh 启动时把
+//!   `settings.yaml` 一次性改名为 `settings.yaml.imported` 并导入 profile
+//!   （`@deepseek-ai/dsh-settings` 的 `importLegacyDocument`），之后的真源是
+//!   `$DSH_HOME/profiles/web/cordis.patch.yml`——顶层是 loader patch **序列**，
+//!   供应商在 `- id: llm-pi-ai` 那条 entry 的 `config.providers` 下，与其它
+//!   entry（`ui-theme`、`permission` …）混排。0.2.0 **不再热重载**这份文件
+//!   （loader 不 watch 它），写入要重启 dsh 才生效。
+//!
+//! 另一个 0.2.0 的硬约束：自定义路由**必须声明 `api`**（`openai-completions` /
+//! `openai-responses` / `anthropic-messages`）。缺了它 dsh 装配 llm-pi-ai 时抛
+//! `PiAiCatalogError`，整条配置被拒——包括一次性导入在内——且只在日志里留一句
+//! warn（2026-10-05「strata 导入后消失」的根因）。所以 patch 布局下写盘前就把
+//! 这条挡住（[`enforce_patch_route_rules`]）。
+//!
+//! # 如果哪天读写失效了
+//!
 //! dsh 官方自述仍是 developer preview、会有 breaking changes，设置的层级、
-//! 字段名与语义都可能随版本变动 —— 所以这里的解析**只认它需要的字段**，遇到不
-//! 认识的语法一律报错而不是猜（fail loud），避免把用户的文件改坏。
-//!
-//! **如果哪天这里的读写失效了**（新增供应商报「无法解析」、写出来的字段 dsh 不
-//! 认、面板里读不到已有的供应商），按这个顺序去查当前版本的实现：
+//! 字段名与语义都可能随版本变动——所以这里的解析**只认它需要的字段**，遇到不
+//! 认识的语法一律报错而不是猜（fail loud）。按这个顺序去查当前版本的实现：
 //!
 //! 1. 官方仓库 <https://github.com/deepseek-ai/deepseek-harness> 的
 //!    `docs/user/guide/providers.zh.md`（用户指南）与 `docs/config-catalog.zh.md`
@@ -17,15 +33,16 @@
 //! 2. 包内第一手文档：`npx --yes @deepseek-ai/dsh -V` 拿到版本后，到
 //!    `%LOCALAPPDATA%\npm-cache\_npx\*\node_modules\@deepseek-ai\` 下读
 //!    `dsh-llm-pi-ai/README.zh.md`（供应方路由与模型条目的字段表就在这里），
-//!    以及 `dsh-llm-pi-ai/lib/types/catalog.d.ts`（`reasoningEfforts` 等类型）。
+//!    以及 `dsh-llm-pi-ai/lib/types/catalog.d.ts`（`reasoningEfforts` 等类型）；
+//!    patch 布局本身看 `dsh-settings/lib/index.js` 与 `dsh-config-editor/lib/index.js`。
 //! 3. 运行时真源：`npx --yes @deepseek-ai/dsh web --dump-config`。
 //!
 //! # 为什么不用 YAML 库
 //!
-//! `settings.yaml` 是用户手改、可版本化的文件（dsh 自己也支持在 UI 里直接打开
-//! 它），注释和字段顺序都有价值。为一个文件引入 YAML 解析依赖并不划算，所以这里
-//! 的做法是**按行做最小手术**：只重写启动器负责的那几个字段，块内其它字段、
-//! 其它供应商、以及整个文件里与 `llm-pi-ai` 无关的部分都**逐字节保留**。
+//! 两份文档都是用户手改、可版本化的文件，注释和字段顺序都有价值。为一个文件
+//! 引入 YAML 解析依赖并不划算，所以这里的做法是**按行做最小手术**：只重写启动
+//! 器负责的那几个字段，块内其它字段、其它供应商、其它 entry（patch 布局里可能
+//! 带 `!!js` 表达式，定位边界即可、**不解析内容**）都**逐字节保留**。
 //!
 //! 代价是：被启动器改写过的那个字段（连同它更深的子行）会按规范形式重排，
 //! 它**内部**的注释不保留。没有改动过的供应商整块原样保留，注释不受影响。
@@ -37,19 +54,30 @@ use sha2::{Digest, Sha256};
 
 use crate::file_transaction::{write_private_text_atomic, write_text_atomic};
 
-/// 本模块对齐的 dsh 版本。前端把它显示在配置界面上，让用户知道这套字段是照哪
-/// 一版写的；升级 dsh 后如果设置页出现异常，第一件事就是核对这个版本号。
-pub const DSH_SETTINGS_SUPPORTED_VERSION: &str = "0.1.5-rc.1";
+/// 旧布局（0.1.x）对齐的 dsh 版本。前端把它显示在配置界面上，让用户知道这套
+/// 字段是照哪一版写的；升级 dsh 后如果设置页出现异常，第一件事就是核对这个
+/// 版本号。
+pub const DSH_SETTINGS_SUPPORTED_VERSION_LEGACY: &str = "0.1.5-rc.1";
+/// 新布局（0.2.0 起的 profile patch）对齐的 dsh 版本。
+pub const DSH_SETTINGS_SUPPORTED_VERSION_PATCH: &str = "0.2.0-rc.2";
 
 /// dsh 用户数据目录名（与 `@deepseek-ai/dsh-home-paths` 的 `DSH_HOME_DIR_NAME` 一致）。
 const DSH_HOME_DIR_NAME: &str = ".dsh";
 /// 覆盖 dsh 用户数据目录的环境变量（与 `dsh-home-paths` 的 `DSH_HOME_ENV` 一致）。
 const DSH_HOME_ENV: &str = "DSH_HOME";
-/// 设置文档文件名（与 `@deepseek-ai/dsh-settings-file` 一致）。
+/// 旧布局的设置文档文件名（0.1.x；0.2.0 起 dsh 启动时会把它改名导入）。
 const DSH_SETTINGS_FILE_NAME: &str = "settings.yaml";
+/// 新布局的 profile patch 文件名（0.2.0 起）。
+const DSH_PROFILE_PATCH_FILE_NAME: &str = "cordis.patch.yml";
+/// `dsh web` 固定 boot 的 profile 名（等价于 `dsh --profile web`）。
+const DSH_WEB_PROFILE_NAME: &str = "web";
 
-/// pi-ai 适配器的设置分区名。
+/// pi-ai 适配器的设置分区名（旧布局的顶层键、新布局的 entry id）。
 const PI_AI_SECTION: &str = "llm-pi-ai";
+/// patch entry 里携带配置的字段名。
+const CONFIG_KEY: &str = "config";
+/// llm-pi-ai entry 的包名（新增 entry 时按 dsh 自己写出的形状带上）。
+const PI_AI_ENTRY_NAME: &str = "@deepseek-ai/dsh-llm-pi-ai";
 /// 分区里的供应方字典名。
 const PROVIDERS_KEY: &str = "providers";
 
@@ -82,19 +110,45 @@ const MANAGED_MODEL_KEYS: [&str; 6] = [
 // 对外数据结构
 // ---------------------------------------------------------------------------
 
+/// 设置文档的布局。dsh 在 0.2.0 换了配置文件（见模块头），两种布局的读写
+/// 都保留，按检测到的 dsh 版本分派（[`settings_layout`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DshSettingsLayout {
+    /// dsh 0.1.x：`$DSH_HOME/settings.yaml`，顶层 `llm-pi-ai:` 映射。
+    #[serde(rename = "legacy-yaml")]
+    LegacyYaml,
+    /// dsh 0.2.0 起：`$DSH_HOME/profiles/web/cordis.patch.yml`，顶层是 loader
+    /// patch 序列，供应商在 `- id: llm-pi-ai` 那条 entry 的 `config.providers` 下。
+    #[serde(rename = "profile-patch")]
+    ProfilePatch,
+}
+
+impl DshSettingsLayout {
+    /// 该布局对齐的 dsh 版本（界面展示用）。
+    fn supported_version(self) -> &'static str {
+        match self {
+            DshSettingsLayout::LegacyYaml => DSH_SETTINGS_SUPPORTED_VERSION_LEGACY,
+            DshSettingsLayout::ProfilePatch => DSH_SETTINGS_SUPPORTED_VERSION_PATCH,
+        }
+    }
+}
+
 /// 设置文档的读取结果。`providers` 是已经解析好的结构化数据；前端不再自己解析
 /// YAML，因此这里也是「文件里现在到底有什么」的唯一来源。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DshSettingsDocument {
-    /// `settings.yaml` 的绝对路径。
+    /// 设置文件的绝对路径（哪种布局指哪个文件）。
     pub path: String,
     /// 文件是否已存在。不存在时 `providers` 为空，仍然可以正常写入（会创建文件）。
     pub exists: bool,
     /// 文件内容的 sha256。写回时必须原样带回，用于检测「读之后被别人改过」。
     pub revision: String,
-    /// 本模块对齐的 dsh 版本。
+    /// 当前布局对齐的 dsh 版本。
     pub supported_version: String,
+    /// 本次读写按哪种布局进行（由检测到的 dsh 版本决定）。
+    pub layout: DshSettingsLayout,
     /// 解析出的 pi-ai 供应方，顺序与文件中的顺序一致。
     pub providers: Vec<DshProviderProfile>,
 }
@@ -239,37 +293,134 @@ pub fn dsh_home() -> Result<PathBuf, String> {
     Ok(home.join(DSH_HOME_DIR_NAME))
 }
 
-/// `settings.yaml` 的完整路径。
+/// 旧布局设置文件（`settings.yaml`）的完整路径。
 pub fn dsh_settings_path() -> Result<PathBuf, String> {
     Ok(dsh_home()?.join(DSH_SETTINGS_FILE_NAME))
 }
 
-/// dsh profile 的依赖目录（`$DSH_HOME/profiles/node_modules`），web profile 首次
-/// 启动时由 dsh 自己安装。
+/// 新布局设置文件（`profiles/web/cordis.patch.yml`）的完整路径。
+/// `dsh web` 固定 boot `web` profile，所以路径不含变量。
+pub fn dsh_profile_patch_path() -> Result<PathBuf, String> {
+    Ok(dsh_home()?
+        .join(DSH_PROFILES_DIR)
+        .join(DSH_WEB_PROFILE_NAME)
+        .join(DSH_PROFILE_PATCH_FILE_NAME))
+}
+
+/// 布局对应的设置文件路径。
+fn document_path(layout: DshSettingsLayout) -> Result<PathBuf, String> {
+    match layout {
+        DshSettingsLayout::LegacyYaml => dsh_settings_path(),
+        DshSettingsLayout::ProfilePatch => dsh_profile_patch_path(),
+    }
+}
+
+/// 从版本号判定布局：0.2.0 起是 profile patch。解析不了（不是数字开头的
+/// major.minor）返回 None，调用方走嗅探兜底。
+fn layout_for_version(version: &str) -> Option<DshSettingsLayout> {
+    let mut parts = version.trim().split(['.', '-']);
+    let major: u64 = parts.next()?.parse().ok()?;
+    let minor: u64 = parts.next()?.parse().ok()?;
+    Some(if major > 0 || minor >= 2 {
+        DshSettingsLayout::ProfilePatch
+    } else {
+        DshSettingsLayout::LegacyYaml
+    })
+}
+
+/// 当前应按哪种布局读写。
+///
+/// 优先跟着「启动器会启动的 dsh 版本」走（pin 的版本就是启动用的版本）；没 pin
+/// 过时按文件系统嗅探：patch 文件在 → 新布局；只有 settings.yaml → 旧布局；都
+/// 没有 → 新布局（现在 npx 装的都是 0.2.0 起，新机器不该再写一份 dsh 启动时还要
+/// 一次性导入的旧文件）。
+fn settings_layout() -> DshSettingsLayout {
+    if let Some(version) = crate::persistent_state::load_dsh_pinned_version() {
+        if let Some(layout) = layout_for_version(&version) {
+            return layout;
+        }
+    }
+    if let Ok(path) = dsh_profile_patch_path() {
+        if path.is_file() {
+            return DshSettingsLayout::ProfilePatch;
+        }
+    }
+    match dsh_settings_path() {
+        Ok(path) if path.is_file() => DshSettingsLayout::LegacyYaml,
+        _ => DshSettingsLayout::ProfilePatch,
+    }
+}
+
+/// dsh profile 的依赖目录名（0.1.x 里 pi-ai 目录装在 `profiles/node_modules`）。
 const DSH_PROFILES_DIR: &str = "profiles";
 const DSH_PROFILE_MODULES_DIR: &str = "node_modules";
 /// 提供内置供应商目录的包（`dsh-llm-pi-ai` 从它取 `getBuiltinProviders()`）。
 const PI_AI_SCOPE_DIR: &str = "@earendil-works";
 const PI_AI_PACKAGE_DIR: &str = "pi-ai";
 
-/// 已安装的 pi-ai 生成的目录清单：`dist/providers/data/.manifest.json` 的 `files`
+/// pi-ai 目录清单（`dist/providers/data/.manifest.json`）的相对路径；`files`
 /// 键就是每个目录路由（`<路由键>.json`），与上游 `getBuiltinProviders()`
 /// （即生成表 `MODELS` 的键）逐项一致。
-fn pi_ai_catalog_manifest_path() -> Result<PathBuf, String> {
-    Ok(dsh_home()?
-        .join(DSH_PROFILES_DIR)
-        .join(DSH_PROFILE_MODULES_DIR)
-        .join(PI_AI_SCOPE_DIR)
+fn pi_ai_manifest_relative() -> PathBuf {
+    PathBuf::from(PI_AI_SCOPE_DIR)
         .join(PI_AI_PACKAGE_DIR)
         .join("dist")
         .join("providers")
         .join("data")
-        .join(".manifest.json"))
+        .join(".manifest.json")
 }
 
-/// dsh 自带的目录路由集合；`None` 表示读不到（profile 还没装过，或上游换了布局）。
-fn installed_catalog_routes() -> Option<std::collections::HashSet<String>> {
-    let raw = std::fs::read_to_string(pi_ai_catalog_manifest_path().ok()?).ok()?;
+/// 0.2.0 起 pi-ai 目录随 dsh 包一起装在 npx 缓存条目里（`profiles/node_modules`
+/// 不再安装，旧机器上那里可能只剩指向失效缓存的符号链接）。按 pin 的版本找对应
+/// 缓存条目；没 pin 或 pin 的条目里读不到清单时，从新到旧找第一个带清单的条目。
+fn patch_layout_catalog_manifest() -> Option<PathBuf> {
+    let cache = crate::dsh_runtime::npm_cache_dir()?;
+    let entries = crate::dsh_runtime::cached_dsh_entries(&cache).ok()?;
+    let pinned = crate::persistent_state::load_dsh_pinned_version();
+    let pinned = pinned.as_deref();
+    // BTreeMap 按版本字符串排序；.rev() 从最新开始。pin 的版本最先试。
+    let mut versions: Vec<&str> = Vec::new();
+    if let Some(pinned) = pinned {
+        versions.push(pinned);
+    }
+    versions.extend(entries.keys().map(String::as_str).rev());
+    let mut tried = std::collections::HashSet::new();
+    for version in versions {
+        if !tried.insert(version) {
+            continue;
+        }
+        let Some(dirs) = entries.get(version) else {
+            continue;
+        };
+        for dir in dirs {
+            let manifest = dir.join(DSH_PROFILE_MODULES_DIR).join(pi_ai_manifest_relative());
+            // is_file 跟随符号链接：失效链接（旧缓存已删）自然落空。
+            if manifest.is_file() {
+                return Some(manifest);
+            }
+        }
+    }
+    None
+}
+
+/// 布局对应的 pi-ai 目录清单路径；`None` 表示读不到（profile 还没装过、缓存
+/// 条目缺失，或上游换了布局）。
+fn pi_ai_catalog_manifest_path(layout: DshSettingsLayout) -> Option<PathBuf> {
+    match layout {
+        DshSettingsLayout::LegacyYaml => Some(
+            dsh_home()
+                .ok()?
+                .join(DSH_PROFILES_DIR)
+                .join(DSH_PROFILE_MODULES_DIR)
+                .join(pi_ai_manifest_relative()),
+        ),
+        DshSettingsLayout::ProfilePatch => patch_layout_catalog_manifest(),
+    }
+}
+
+/// dsh 自带的目录路由集合；`None` 表示读不到（见 [`pi_ai_catalog_manifest_path`]）。
+fn installed_catalog_routes(layout: DshSettingsLayout) -> Option<std::collections::HashSet<String>> {
+    let raw = std::fs::read_to_string(pi_ai_catalog_manifest_path(layout)?).ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let files = manifest.get("files")?.as_object()?;
     let routes: std::collections::HashSet<String> = files
@@ -286,8 +437,8 @@ fn installed_catalog_routes() -> Option<std::collections::HashSet<String>> {
 /// 所以两处对同一条路由的判断必然一致。目录清单读不到时**全部按自定义处理**：
 /// 界面退化成「全都列出来」，这比把用户自己声明的路由藏起来安全——藏起来的东西
 /// 在这个界面里既看不见也改不了。
-fn mark_custom_routes(providers: &mut [DshProviderProfile]) {
-    let catalog = installed_catalog_routes();
+fn mark_custom_routes(providers: &mut [DshProviderProfile], layout: DshSettingsLayout) {
+    let catalog = installed_catalog_routes(layout);
     for provider in providers {
         provider.custom = is_custom_route(&provider.id, catalog.as_ref());
     }
@@ -596,6 +747,288 @@ fn find_block(
 }
 
 // ---------------------------------------------------------------------------
+// profile patch 的序列定位（0.2.0 布局）
+//
+// patch 文件顶层是 loader patch 序列（`- id: …`）。这里只提取定位所需的最低
+// 信息——id、有没有 insert、块边界——**不解析 entry 的内容**：别的 entry 可能带
+// `!!js` 表达式（dsh 的合法写法），不归启动器管，既不必读懂也一个字节不能动。
+// ---------------------------------------------------------------------------
+
+/// patch 顶层序列的一项。
+#[derive(Debug, Clone)]
+struct SeqEntry {
+    /// entry 的 id（`id:` 的值，去掉成对引号）。提取不出时为 None——这种 entry
+    /// 只参与边界与守卫，永远不会被当成 llm-pi-ai。
+    id: Option<String>,
+    /// 带 `insert` 的是插入清单条目，不是 config 的归属行（dsh 的 configEditor
+    /// 找归属行时也跳过它）。
+    has_insert: bool,
+    /// `- ` 行的下标。
+    #[allow(dead_code)]
+    start: usize,
+    /// entry 内容的起始行（= dash 行 + 1）。
+    content_start: usize,
+    /// 块结束行（不含）：下一个顶层 `- ` 行，或文件尾。
+    end: usize,
+    /// entry 字段的缩进（dsh 写出来是 2）。
+    child_indent: usize,
+}
+
+/// 去掉成对引号。序列 entry 头里 id 的写法就这几种，不做完整的标量反转义。
+fn unquote_simple(raw: &str) -> String {
+    let text = raw.trim();
+    if text.len() >= 2
+        && ((text.starts_with('\'') && text.ends_with('\''))
+            || (text.starts_with('"') && text.ends_with('"')))
+    {
+        return text[1..text.len() - 1].to_string();
+    }
+    text.to_string()
+}
+
+/// `- key: value` 行内写法里指定 key 的值文本（去引号）。dash 行不是这个 key、
+/// 或值是块级（空）时返回 None。
+fn dash_inline_value(line: &str, key: &str) -> Option<String> {
+    let content = content_of(line);
+    let after_dash = content.strip_prefix('-')?.trim_start();
+    let (found, value) = split_key_value(after_dash)?;
+    if found != key || value.is_empty() {
+        return None;
+    }
+    Some(unquote_simple(&value))
+}
+
+/// entry 字段区里指定 key 的「行存在性 + 行内值」。只看不解析：`!!js` 带标签的
+/// 值原样返回文本，不会因为读不懂而报错。
+fn entry_field(lines: &[String], start: usize, end: usize, indent: usize, key: &str) -> Option<Option<String>> {
+    for probe in start..end {
+        let raw = &lines[probe];
+        if is_blank_or_comment(raw) {
+            continue;
+        }
+        if indentation(raw).ok()? != indent {
+            continue;
+        }
+        let content = content_of(raw);
+        let (found, value) = split_key_value(&content)?;
+        if found != key {
+            continue;
+        }
+        return Some(if value.is_empty() {
+            None
+        } else {
+            Some(unquote_simple(&value))
+        });
+    }
+    None
+}
+
+/// 把 patch 顶层切成序列项。顶层出现非 `- `、非 `[]` 的内容行说明这不是 dsh
+/// 认识的 patch（dsh 自己也要求顶层是序列），直接报错而不是猜。
+fn sequence_entries(lines: &[String]) -> Result<Vec<SeqEntry>, String> {
+    let mut starts = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if is_blank_or_comment(line) {
+            continue;
+        }
+        if indentation(line)? != 0 {
+            continue;
+        }
+        let content = content_of(line);
+        // dsh 初始化 profile 时用 `[]` 占位空序列。
+        if content == "[]" {
+            continue;
+        }
+        if !content.starts_with('-') {
+            return Err(format!(
+                "profile patch 顶层第 {} 行不是 `- ` 序列项（`{content}`）。\
+                 dsh 要求这份文件是 loader patch 序列，请手工修正后再试。",
+                index + 1
+            ));
+        }
+        starts.push(index);
+    }
+    let mut entries = Vec::new();
+    for (position, &start) in starts.iter().enumerate() {
+        let end = starts.get(position + 1).copied().unwrap_or(lines.len());
+        // 字段缩进：dash 行之后第一个非空行；entry 只有 dash 行时按 dsh 的 2 算。
+        let child_indent = (start + 1..end)
+            .find(|probe| !is_blank_or_comment(&lines[*probe]))
+            .map(|probe| indentation(&lines[probe]))
+            .transpose()?
+            .filter(|indent| *indent > 0)
+            .unwrap_or(2);
+        // id 的两种写法：`- id: x` 行内，或 `-` 独占一行、字段区里写 `id: x`。
+        let id = dash_inline_value(&lines[start], "id").or_else(|| {
+            entry_field(lines, start + 1, end, child_indent, "id").flatten()
+        });
+        let has_insert = dash_inline_value(&lines[start], "insert").is_some()
+            || entry_field(lines, start + 1, end, child_indent, "insert").is_some();
+        entries.push(SeqEntry {
+            id,
+            has_insert,
+            start,
+            content_start: start + 1,
+            end,
+            child_indent,
+        });
+    }
+    Ok(entries)
+}
+
+/// `providers` 字典在文件里的定位结果，含「还缺哪几层」。
+#[derive(Debug, Clone)]
+enum ProvidersSite {
+    /// 两种布局各自的「连容器都没有」：旧布局缺 `llm-pi-ai:` 分区，新布局缺
+    /// llm-pi-ai entry。插入时按布局补齐整个外层。
+    MissingEntry,
+    /// 仅新布局：有 entry 但没有 `config:` 块。记录 entry 的内容边界与字段缩进。
+    MissingConfig {
+        content_start: usize,
+        end: usize,
+        child_indent: usize,
+    },
+    /// 旧布局：有分区没有 `providers:`；新布局：有 `config:` 没有 `providers:`。
+    /// 记录待补 `providers:` 的那个块的内容边界与子缩进。
+    MissingProviders {
+        content_start: usize,
+        end: usize,
+        child_indent: usize,
+    },
+    /// 完整定位：`providers:` 的内容边界与供应方 key 的缩进。
+    Present {
+        content_start: usize,
+        end: usize,
+        child_indent: usize,
+    },
+}
+
+/// 定位 `providers` 字典。新布局与 dsh 的 configEditor 一致：取**最后一个**
+/// 不带 `insert` 的 llm-pi-ai entry（findLastIndex 语义）。
+fn resolve_providers_site(lines: &[String], layout: DshSettingsLayout) -> Result<ProvidersSite, String> {
+    let total = lines.len();
+    match layout {
+        DshSettingsLayout::LegacyYaml => {
+            let Some(section) = find_block(lines, 0, total, 0, PI_AI_SECTION)? else {
+                return Ok(ProvidersSite::MissingEntry);
+            };
+            let Some(providers) = find_block(
+                lines,
+                section.content_start,
+                section.end,
+                section.child_indent,
+                PROVIDERS_KEY,
+            )?
+            else {
+                return Ok(ProvidersSite::MissingProviders {
+                    content_start: section.content_start,
+                    end: section.end,
+                    child_indent: section.child_indent,
+                });
+            };
+            Ok(ProvidersSite::Present {
+                content_start: providers.content_start,
+                end: providers.end,
+                child_indent: providers.child_indent,
+            })
+        }
+        DshSettingsLayout::ProfilePatch => {
+            let entries = sequence_entries(lines)?;
+            let Some(entry) = entries
+                .iter()
+                .rev()
+                .find(|entry| entry.id.as_deref() == Some(PI_AI_SECTION) && !entry.has_insert)
+            else {
+                return Ok(ProvidersSite::MissingEntry);
+            };
+            let Some(config) = find_block(
+                lines,
+                entry.content_start,
+                entry.end,
+                entry.child_indent,
+                CONFIG_KEY,
+            )?
+            else {
+                return Ok(ProvidersSite::MissingConfig {
+                    content_start: entry.content_start,
+                    end: entry.end,
+                    child_indent: entry.child_indent,
+                });
+            };
+            let Some(providers) = find_block(
+                lines,
+                config.content_start,
+                config.end,
+                config.child_indent,
+                PROVIDERS_KEY,
+            )?
+            else {
+                return Ok(ProvidersSite::MissingProviders {
+                    content_start: config.content_start,
+                    end: config.end,
+                    child_indent: config.child_indent,
+                });
+            };
+            Ok(ProvidersSite::Present {
+                content_start: providers.content_start,
+                end: providers.end,
+                child_indent: providers.child_indent,
+            })
+        }
+    }
+}
+
+/// 「写入没把文件改瘦」的守卫。旧布局查顶层分区名一个不少；新布局查顶层
+/// entry 数不减少、且每个有 id 的 entry 都还在（无名 entry 由数量兜住）。
+fn assert_top_level_kept(
+    before: &[String],
+    after: &[String],
+    layout: DshSettingsLayout,
+) -> Result<(), String> {
+    match layout {
+        DshSettingsLayout::LegacyYaml => {
+            let before_keys = top_level_keys(before);
+            let after_keys = top_level_keys(after);
+            for key in &before_keys {
+                if !after_keys.contains(key) {
+                    return Err(format!(
+                        "写入结果丢失了顶层分区 `{key}`，已中止写入（原文件未被修改）。\
+                         这通常意味着设置文件里有启动器不认识的写法，请手动编辑或反馈。"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        DshSettingsLayout::ProfilePatch => {
+            let before_entries = sequence_entries(before)?;
+            let after_entries = sequence_entries(after)?;
+            if after_entries.len() < before_entries.len() {
+                return Err(
+                    "写入结果让 profile patch 的顶层 entry 变少了，已中止写入（原文件未被修改）。"
+                        .to_string(),
+                );
+            }
+            let after_ids: Vec<&str> = after_entries
+                .iter()
+                .filter_map(|entry| entry.id.as_deref())
+                .collect();
+            for entry in &before_entries {
+                if let Some(id) = entry.id.as_deref() {
+                    if !after_ids.contains(&id) {
+                        return Err(format!(
+                            "写入结果丢失了 profile patch 的顶层 entry `{id}`，已中止写入\
+                             （原文件未被修改）。这通常意味着文件里有启动器不认识的写法，\
+                             请手动编辑或反馈。"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 读取
 // ---------------------------------------------------------------------------
 
@@ -605,29 +1038,19 @@ fn text_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// 解析 `llm-pi-ai.providers` 下的全部供应方。
-fn parse_providers(lines: &[String]) -> Result<Vec<DshProviderProfile>, String> {
-    let total = lines.len();
-    let Some(section) = find_block(lines, 0, total, 0, PI_AI_SECTION)? else {
-        return Ok(Vec::new());
-    };
-    let Some(providers) = find_block(
-        lines,
-        section.content_start,
-        section.end,
-        section.child_indent,
-        PROVIDERS_KEY,
-    )?
+/// 解析 `llm-pi-ai.providers` 下的全部供应方（两种布局共用——定位差异都在
+/// [`resolve_providers_site`] 里，块内解析是同一份）。
+fn parse_providers(lines: &[String], layout: DshSettingsLayout) -> Result<Vec<DshProviderProfile>, String> {
+    let ProvidersSite::Present {
+        content_start,
+        end,
+        child_indent,
+    } = resolve_providers_site(lines, layout)?
     else {
         return Ok(Vec::new());
     };
 
-    let items = field_items(
-        lines,
-        providers.content_start,
-        providers.end,
-        providers.child_indent,
-    )?;
+    let items = field_items(lines, content_start, end, child_indent)?;
     let mut result = Vec::new();
     for item in items {
         result.push(parse_provider(lines, &item)?);
@@ -1149,73 +1572,104 @@ fn provider_field_updates(provider: &DshProviderProfile, child_indent: usize) ->
     updates
 }
 
-/// 把一个新的供应方块插进 `providers:` 里（或连 `providers:` / `llm-pi-ai:` 一起补齐）。
-fn insert_provider(lines: &mut Vec<String>, provider: &DshProviderProfile) -> Result<(), String> {
-    let total = lines.len();
-    let section = find_block(lines, 0, total, 0, PI_AI_SECTION)?;
-    match section {
-        Some(section) => {
-            let providers = find_block(
-                lines,
-                section.content_start,
-                section.end,
-                section.child_indent,
-                PROVIDERS_KEY,
-            )?;
-            match providers {
-                Some(providers) => {
-                    let rendered = render_provider(provider, providers.child_indent);
-                    let insert_at = append_index(lines, providers.content_start, providers.end);
-                    lines.splice(insert_at..insert_at, rendered);
-                }
-                None => {
-                    let pad = " ".repeat(section.child_indent);
-                    let mut rendered = vec![format!("{pad}{PROVIDERS_KEY}:")];
-                    rendered.extend(render_provider(provider, section.child_indent + 2));
-                    let insert_at = append_index(lines, section.content_start, section.end);
-                    lines.splice(insert_at..insert_at, rendered);
-                }
+/// 把一个新的供应方块插进 `providers:` 里；外层容器（旧布局的分区/新布局的
+/// entry 与 config）缺哪层补哪层。
+fn insert_provider(
+    lines: &mut Vec<String>,
+    provider: &DshProviderProfile,
+    layout: DshSettingsLayout,
+) -> Result<(), String> {
+    match resolve_providers_site(lines, layout)? {
+        ProvidersSite::Present {
+            content_start,
+            end,
+            child_indent,
+        } => {
+            let rendered = render_provider(provider, child_indent);
+            let insert_at = append_index(lines, content_start, end);
+            lines.splice(insert_at..insert_at, rendered);
+        }
+        ProvidersSite::MissingProviders {
+            content_start,
+            end,
+            child_indent,
+        } => {
+            let pad = " ".repeat(child_indent);
+            let mut rendered = vec![format!("{pad}{PROVIDERS_KEY}:")];
+            rendered.extend(render_provider(provider, child_indent + 2));
+            let insert_at = append_index(lines, content_start, end);
+            lines.splice(insert_at..insert_at, rendered);
+        }
+        ProvidersSite::MissingConfig {
+            content_start,
+            end,
+            child_indent,
+        } => {
+            // 只有 patch 布局会走到这里：entry 还在，补 config 与 providers 两层。
+            let pad = " ".repeat(child_indent);
+            let mut rendered = vec![
+                format!("{pad}{CONFIG_KEY}:"),
+                format!("{pad}  {PROVIDERS_KEY}:"),
+            ];
+            rendered.extend(render_provider(provider, child_indent + 4));
+            let insert_at = append_index(lines, content_start, end);
+            lines.splice(insert_at..insert_at, rendered);
+        }
+        ProvidersSite::MissingEntry => match layout {
+            DshSettingsLayout::LegacyYaml => {
+                // 整个分区都不存在：在文件头补齐。dsh 对顶层顺序没有要求。
+                let mut rendered = vec![format!("{PI_AI_SECTION}:")];
+                rendered.push(format!("  {PROVIDERS_KEY}:"));
+                rendered.extend(render_provider(provider, 4));
+                rendered.push(String::new());
+                lines.splice(0..0, rendered);
             }
-        }
-        None => {
-            // 整个分区都不存在：在文件头补齐。dsh 对顶层顺序没有要求。
-            let mut rendered = vec![format!("{PI_AI_SECTION}:")];
-            rendered.push(format!("  {PROVIDERS_KEY}:"));
-            rendered.extend(render_provider(provider, 4));
-            rendered.push(String::new());
-            lines.splice(0..0, rendered);
-        }
+            DshSettingsLayout::ProfilePatch => {
+                // 连 entry 都没有：在文件尾追加一整条，形状照 dsh 自己的 configEditor
+                // 写出来的样子（id + name + config.providers）。dsh 初始化 profile
+                // 时用 `[]` 占位空序列——追加前把它收走，否则两份内容拼不出合法 YAML。
+                lines.retain(|line| !(indentation(line).unwrap_or(1) == 0 && content_of(line) == "[]"));
+                let mut rendered = vec![
+                    format!("- id: {PI_AI_SECTION}"),
+                    format!("  name: {}", render_scalar(PI_AI_ENTRY_NAME)),
+                    format!("  {CONFIG_KEY}:"),
+                    format!("    {PROVIDERS_KEY}:"),
+                ];
+                rendered.extend(render_provider(provider, 6));
+                // 落点：文件尾最后一个非空行之后。这里**不能**用 append_index——
+                // 它会跳过尾部注释，而顶层的尾部注释是文件头/文件级注释（比如 dsh
+                // 写的那段说明），被挤到新 entry 后面就错了。块级插入才跳注释。
+                let mut insert_at = lines.len();
+                while insert_at > 0 && lines[insert_at - 1].trim().is_empty() {
+                    insert_at -= 1;
+                }
+                lines.splice(insert_at..insert_at, rendered);
+            }
+        },
     }
     Ok(())
 }
 
 /// 删掉一个已存在的供应方块，连它前面的注释行一起（那些注释描述的就是它）。
-fn remove_provider(lines: &mut Vec<String>, provider_id: &str) -> Result<bool, String> {
-    let total = lines.len();
-    let Some(section) = find_block(lines, 0, total, 0, PI_AI_SECTION)? else {
-        return Ok(false);
-    };
-    let Some(providers) = find_block(
-        lines,
-        section.content_start,
-        section.end,
-        section.child_indent,
-        PROVIDERS_KEY,
-    )?
+fn remove_provider(
+    lines: &mut Vec<String>,
+    provider_id: &str,
+    layout: DshSettingsLayout,
+) -> Result<bool, String> {
+    let ProvidersSite::Present {
+        content_start,
+        end,
+        child_indent,
+    } = resolve_providers_site(lines, layout)?
     else {
         return Ok(false);
     };
-    let items = field_items(
-        lines,
-        providers.content_start,
-        providers.end,
-        providers.child_indent,
-    )?;
+    let items = field_items(lines, content_start, end, child_indent)?;
     let Some(item) = items.iter().find(|item| item.key == provider_id) else {
         return Ok(false);
     };
     let mut start = item.start;
-    while start > providers.content_start && is_blank_or_comment(&lines[start - 1]) {
+    while start > content_start && is_blank_or_comment(&lines[start - 1]) {
         start -= 1;
     }
     lines.drain(start..item.end);
@@ -1239,31 +1693,21 @@ fn append_index(lines: &[String], start: usize, end: usize) -> usize {
 fn locate_provider(
     lines: &[String],
     provider_id: &str,
+    layout: DshSettingsLayout,
 ) -> Result<Option<(usize, FieldItem)>, String> {
-    let total = lines.len();
-    let Some(section) = find_block(lines, 0, total, 0, PI_AI_SECTION)? else {
-        return Ok(None);
-    };
-    let Some(providers) = find_block(
-        lines,
-        section.content_start,
-        section.end,
-        section.child_indent,
-        PROVIDERS_KEY,
-    )?
+    let ProvidersSite::Present {
+        content_start,
+        end,
+        child_indent,
+    } = resolve_providers_site(lines, layout)?
     else {
         return Ok(None);
     };
-    let items = field_items(
-        lines,
-        providers.content_start,
-        providers.end,
-        providers.child_indent,
-    )?;
+    let items = field_items(lines, content_start, end, child_indent)?;
     Ok(items
         .into_iter()
         .find(|item| item.key == provider_id)
-        .map(|item| (providers.child_indent, item)))
+        .map(|item| (child_indent, item)))
 }
 
 fn join_lines(lines: &[String]) -> String {
@@ -1278,33 +1722,87 @@ fn join_lines(lines: &[String]) -> String {
 // 命令
 // ---------------------------------------------------------------------------
 
-fn read_document() -> Result<(PathBuf, String, bool), String> {
-    let path = dsh_settings_path()?;
+/// 读取当前布局的设置文件。布局由检测到的 dsh 版本决定（见 [`settings_layout`]）。
+fn read_document() -> Result<(PathBuf, String, bool, DshSettingsLayout), String> {
+    let layout = settings_layout();
+    let path = document_path(layout)?;
     match std::fs::read_to_string(&path) {
-        Ok(text) => Ok((path, text, true)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((path, String::new(), false)),
+        Ok(text) => Ok((path, text, true, layout)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((path, String::new(), false, layout))
+        }
         Err(error) => Err(format!("无法读取 dsh 设置文件 {}：{error}", path.display())),
     }
 }
 
-/// 读取 `settings.yaml` 里的供应方与模型。
+/// 写入结果的备份路径，与 `file_transaction` 的 sidecar 约定一致（`<原名>.bak`）。
+fn backup_path_of(path: &std::path::Path) -> PathBuf {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!("{value}.bak"))
+        .unwrap_or_else(|| "bak".to_string());
+    path.with_extension(extension)
+}
+
+/// 读取设置文件里的供应方与模型。
 #[tauri::command]
 pub fn dsh_read_settings() -> Result<DshSettingsDocument, String> {
-    let (path, text, exists) = read_document()?;
+    let (path, text, exists, layout) = read_document()?;
     let lines = text_lines(&text);
     let mut providers = if exists {
-        parse_providers(&lines)?
+        parse_providers(&lines, layout)?
     } else {
         Vec::new()
     };
-    mark_custom_routes(&mut providers);
+    mark_custom_routes(&mut providers, layout);
     Ok(DshSettingsDocument {
         path: path.display().to_string(),
         exists,
         revision: revision_of(&text),
-        supported_version: DSH_SETTINGS_SUPPORTED_VERSION.to_string(),
+        supported_version: layout.supported_version().to_string(),
+        layout,
         providers,
     })
+}
+
+/// 0.2.0 起 dsh 装配 llm-pi-ai 时对**自定义路由**的硬性要求（`resolveEntry`）：
+/// api、baseURL、至少一个模型，缺一个就抛 `PiAiCatalogError`，整条 llm-pi-ai
+/// 配置被拒——包括启动时的一次性导入在内——且只在日志里留一句 warn，界面上
+/// 无声无息（2026-10-05「strata 导入后消失」的根因）。写盘前就在这里挡住，
+/// 错误信息直接说人话。
+///
+/// 目录路由不查：缺的字段有内置目录兜底。目录清单读不到时也不替 dsh 执法
+/// （判不准自定义与否，误伤比漏过更糟）。
+fn enforce_patch_route_rules(provider: &DshProviderProfile) -> Result<(), String> {
+    let Some(catalog) = installed_catalog_routes(DshSettingsLayout::ProfilePatch) else {
+        return Ok(());
+    };
+    if catalog.contains(&provider.id) {
+        return Ok(());
+    }
+    if provider.api.as_deref().is_none_or(|value| value.trim().is_empty()) {
+        return Err(format!(
+            "供应方 `{}` 是自定义路由，dsh 0.2.0 起必须选择 wire 协议\
+             （openai-completions / openai-responses / anthropic-messages）。\
+             缺少协议的自定义路由会让 dsh 拒绝整个 llm-pi-ai 配置。",
+            provider.id
+        ));
+    }
+    if provider.base_url.as_deref().is_none_or(|value| value.trim().is_empty()) {
+        return Err(format!(
+            "供应方 `{}` 是自定义路由，dsh 0.2.0 起必须填写 API 地址（baseURL）。",
+            provider.id
+        ));
+    }
+    if provider.models.is_empty() {
+        return Err(format!(
+            "供应方 `{}` 是自定义路由，dsh 0.2.0 起至少要声明一个模型——\
+             内置目录里没有它的模型可兜底。",
+            provider.id
+        ));
+    }
+    Ok(())
 }
 
 /// 写入（新增或更新）一个供应方。只动这一个块，其余内容逐字节保留。
@@ -1314,7 +1812,7 @@ pub fn dsh_write_provider(
 ) -> Result<DshSettingsWriteResult, String> {
     validate_provider(&request.provider)?;
 
-    let (path, original, _) = read_document()?;
+    let (path, original, _, layout) = read_document()?;
     if revision_of(&original) != request.base_revision {
         return Err(
             "dsh 设置文件在读取之后被其它程序改过了，为避免覆盖对方的改动，本次写入已取消。\
@@ -1322,8 +1820,12 @@ pub fn dsh_write_provider(
                 .to_string(),
         );
     }
+    if layout == DshSettingsLayout::ProfilePatch {
+        enforce_patch_route_rules(&request.provider)?;
+    }
 
     let mut lines = text_lines(&original);
+    let before_lines = lines.clone();
 
     // 改名 = 先删旧块再按新增插入。同名更新走就地改字段，这样启动器不负责的
     // 字段（`compat` 等）与它们旁边的注释都留在原处。
@@ -1332,10 +1834,10 @@ pub fn dsh_write_provider(
         .as_deref()
         .filter(|original_id| *original_id != request.provider.id);
     if let Some(original_id) = renamed {
-        remove_provider(&mut lines, original_id)?;
+        remove_provider(&mut lines, original_id, layout)?;
     }
 
-    match locate_provider(&lines, &request.provider.id)? {
+    match locate_provider(&lines, &request.provider.id, layout)? {
         Some((dictionary_indent, item)) => {
             let field_indent = dictionary_indent + 2;
             let mut updates = provider_field_updates(&request.provider, field_indent);
@@ -1343,25 +1845,16 @@ pub fn dsh_write_provider(
             updates.reverse();
             apply_field_updates(&mut lines, &item, field_indent, updates)?;
         }
-        None => insert_provider(&mut lines, &request.provider)?,
+        None => insert_provider(&mut lines, &request.provider, layout)?,
     }
 
     let updated = join_lines(&lines);
-    // 兜底：写入没有把顶层分区弄丢。这是唯一能在没有 YAML 解析器的情况下做的
+    // 兜底：写入没有把顶层结构弄丢。这是唯一能在没有 YAML 解析器的情况下做的
     // 整体检查，它挡不住块内错误，但能挡住「整段被吃掉」这类致命失误。
-    let before = top_level_keys(&text_lines(&original));
-    let after = top_level_keys(&lines);
-    for key in &before {
-        if !after.contains(key) {
-            return Err(format!(
-                "写入结果丢失了顶层分区 `{key}`，已中止写入（原文件未被修改）。\
-                 这通常意味着设置文件里有启动器不认识的写法，请手动编辑或反馈。"
-            ));
-        }
-    }
+    assert_top_level_kept(&before_lines, &lines, layout)?;
 
     write_text_atomic(&path, updated.as_bytes(), "dsh 设置文件")?;
-    let backup = path.with_extension("yaml.bak");
+    let backup = backup_path_of(&path);
     Ok(DshSettingsWriteResult {
         path: path.display().to_string(),
         revision: revision_of(&updated),
@@ -1374,7 +1867,7 @@ pub fn dsh_write_provider(
 pub fn dsh_delete_provider(
     request: DshDeleteProviderRequest,
 ) -> Result<DshSettingsWriteResult, String> {
-    let (path, original, _) = read_document()?;
+    let (path, original, _, layout) = read_document()?;
     if revision_of(&original) != request.base_revision {
         return Err(
             "dsh 设置文件在读取之后被其它程序改过了，为避免覆盖对方的改动，本次删除已取消。\
@@ -1383,18 +1876,20 @@ pub fn dsh_delete_provider(
         );
     }
     let mut lines = text_lines(&original);
-    if !remove_provider(&mut lines, &request.provider_id)? {
+    let before_lines = lines.clone();
+    if !remove_provider(&mut lines, &request.provider_id, layout)? {
         return Err(format!(
             "设置文件里没有供应方 `{}`，可能已被其它程序删除，请重新读取。",
             request.provider_id
         ));
     }
     let updated = join_lines(&lines);
+    assert_top_level_kept(&before_lines, &lines, layout)?;
     write_text_atomic(&path, updated.as_bytes(), "dsh 设置文件")?;
     Ok(DshSettingsWriteResult {
         path: path.display().to_string(),
         revision: revision_of(&updated),
-        backup_path: path.with_extension("yaml.bak").display().to_string(),
+        backup_path: backup_path_of(&path).display().to_string(),
     })
 }
 
@@ -1630,11 +2125,15 @@ fn apply_credential_ref(
     Ok((join_lines(&lines), true))
 }
 
-/// settings.yaml 里某供应方当前的 `apiKeyEnv`（已去空白）。没有供应方块或这一行
+/// 设置文件里某供应方当前的 `apiKeyEnv`（已去空白）。没有供应方块或这一行
 /// 都返回 None——两种情况由调用方区分。
-fn existing_credential_ref(text: &str, provider_id: &str) -> Result<Option<String>, String> {
+fn existing_credential_ref(
+    text: &str,
+    provider_id: &str,
+    layout: DshSettingsLayout,
+) -> Result<Option<String>, String> {
     let lines = text_lines(text);
-    let Some((dict_indent, item)) = locate_provider(&lines, provider_id)? else {
+    let Some((dict_indent, item)) = locate_provider(&lines, provider_id, layout)? else {
         return Ok(None);
     };
     let fields = field_items(&lines, item.start + 1, item.end, dict_indent + 2)?;
@@ -1646,16 +2145,16 @@ fn existing_credential_ref(text: &str, provider_id: &str) -> Result<Option<Strin
         .filter(|value| !value.is_empty()))
 }
 
-/// 往 settings.yaml 的某供应方块里补一行 `apiKeyEnv`。已有这一行时不动
+/// 往设置文件的某供应方块里补一行 `apiKeyEnv`。已有这一行时不动
 /// （返回 None），供应方不存在时也返回 None——调用方负责先把这两种情况分清楚。
 fn patch_provider_credential_ref(
     text: &str,
     provider_id: &str,
     ref_name: &str,
+    layout: DshSettingsLayout,
 ) -> Result<Option<(String, String)>, String> {
     let lines = text_lines(text);
-    let before_keys = top_level_keys(&lines);
-    let Some((dict_indent, item)) = locate_provider(&lines, provider_id)? else {
+    let Some((dict_indent, item)) = locate_provider(&lines, provider_id, layout)? else {
         return Ok(None);
     };
     let field_indent = dict_indent + 2;
@@ -1671,14 +2170,7 @@ fn patch_provider_credential_ref(
         field_indent,
         vec![("apiKeyEnv".to_string(), Some(vec![line]))],
     )?;
-    let after_keys = top_level_keys(&lines);
-    for key in &before_keys {
-        if !after_keys.contains(key) {
-            return Err(format!(
-                "补写 apiKeyEnv 会丢失顶层分区 `{key}`，已中止（文件未被修改）。"
-            ));
-        }
-    }
+    assert_top_level_kept(&text_lines(text), &lines, layout)?;
     let updated = join_lines(&lines);
     let revision = revision_of(&updated);
     Ok(Some((updated, revision)))
@@ -1714,28 +2206,28 @@ pub fn dsh_read_credential(request: DshCredentialReadRequest) -> Result<Option<S
 
 /// 保存（或移除）一个供应方的认证令牌。
 ///
-/// 值写入凭据文件的 `refs`，引用名沿用 settings.yaml 里已有的 `apiKeyEnv`；没有时
-/// 按 dsh 的派生规则从路由键生成，并把这一行补写进 settings.yaml（只补这一行，
-/// 其余逐字节保留）。先写凭据文件再动 settings.yaml：前者失败时后者原封不动。
+/// 值写入凭据文件的 `refs`，引用名沿用设置文件里已有的 `apiKeyEnv`；没有时
+/// 按 dsh 的派生规则从路由键生成，并把这一行补写进设置文件（只补这一行，
+/// 其余逐字节保留）。先写凭据文件再动设置文件：前者失败时后者原封不动。
 #[tauri::command]
 pub fn dsh_save_credential(
     request: DshCredentialSaveRequest,
 ) -> Result<DshCredentialSaveResult, String> {
     let value = request.value.trim().to_string();
 
-    // 1. 供应方必须已在 settings.yaml 里：令牌的引用名跟着路由键走，
+    // 1. 供应方必须已在设置文件里：令牌的引用名跟着路由键走，
     //    先有路由才谈得上令牌。
-    let (settings_path, settings_text, _) = read_document()?;
+    let (settings_path, settings_text, _, layout) = read_document()?;
     {
         let lines = text_lines(&settings_text);
-        if locate_provider(&lines, &request.provider_id)?.is_none() {
+        if locate_provider(&lines, &request.provider_id, layout)?.is_none() {
             return Err(format!(
-                "settings.yaml 里还没有供应方 `{}`；先写入供应商，再保存令牌。",
+                "设置文件里还没有供应方 `{}`；先写入供应商，再保存令牌。",
                 request.provider_id
             ));
         }
     }
-    let existing_ref = existing_credential_ref(&settings_text, &request.provider_id)?;
+    let existing_ref = existing_credential_ref(&settings_text, &request.provider_id, layout)?;
     let ref_name = match existing_ref.as_deref() {
         Some(name) => {
             if !is_credential_ref_name(name) {
@@ -1795,9 +2287,9 @@ pub fn dsh_save_credential(
         )?;
     }
 
-    // 3. settings.yaml 缺引用名时补一行（沿用现有引用名时不动）。
+    // 3. 设置文件缺引用名时补一行（沿用现有引用名时不动）。
     let settings_revision = if existing_ref.is_none() {
-        match patch_provider_credential_ref(&settings_text, &request.provider_id, &ref_name)? {
+        match patch_provider_credential_ref(&settings_text, &request.provider_id, &ref_name, layout)? {
             Some((updated, revision)) => {
                 write_text_atomic(&settings_path, updated.as_bytes(), "dsh 设置文件")?;
                 Some(revision)
@@ -1943,7 +2435,7 @@ agent-default-model:
 ";
 
     fn providers_of(text: &str) -> Vec<DshProviderProfile> {
-        parse_providers(&text_lines(text)).expect("parse")
+        parse_providers(&text_lines(text), DshSettingsLayout::LegacyYaml).expect("parse")
     }
 
     #[test]
@@ -1991,13 +2483,13 @@ agent-default-model:
     #[test]
     fn rejects_tabs_in_indentation() {
         let text = "llm-pi-ai:\n  providers:\n\tvllm:\n      apiKeyEnv: X\n";
-        assert!(parse_providers(&text_lines(text)).is_err());
+        assert!(parse_providers(&text_lines(text), DshSettingsLayout::LegacyYaml).is_err());
     }
 
     #[test]
     fn rejects_block_scalars_for_managed_fields() {
         let text = "llm-pi-ai:\n  providers:\n    vllm:\n      baseURL: |\n        https://x\n";
-        assert!(parse_providers(&text_lines(text)).is_err());
+        assert!(parse_providers(&text_lines(text), DshSettingsLayout::LegacyYaml).is_err());
     }
 
     /// 走真实的「读 → 改一个字段 → 写」链路，而不是在测试里复制一遍写入逻辑：
@@ -2005,7 +2497,7 @@ agent-default-model:
     #[test]
     fn rewriting_one_field_keeps_everything_else_byte_identical() {
         let mut lines = text_lines(SAMPLE);
-        let (dictionary_indent, item) = locate_provider(&lines, "vllm")
+        let (dictionary_indent, item) = locate_provider(&lines, "vllm", DshSettingsLayout::LegacyYaml)
             .expect("locate")
             .expect("vllm 应当存在于样例里");
         assert_eq!(dictionary_indent, 4);
@@ -2056,7 +2548,7 @@ agent-default-model:
             \x20       - id: three\n          name: three\n    \
             bbb:\n      apiKeyEnv: B\n      reasoning: high\n";
         let mut lines = text_lines(text);
-        let (dictionary_indent, item) = locate_provider(&lines, "aaa")
+        let (dictionary_indent, item) = locate_provider(&lines, "aaa", DshSettingsLayout::LegacyYaml)
             .expect("locate")
             .expect("aaa");
 
@@ -2094,6 +2586,7 @@ agent-default-model:
                 api_key_env: Some("B".into()),
                 ..Default::default()
             },
+            DshSettingsLayout::LegacyYaml,
         )
         .expect("insert");
         let updated = join_lines(&lines);
@@ -2113,6 +2606,7 @@ agent-default-model:
                 api_key_env: Some("VLLM_API_KEY".into()),
                 ..Default::default()
             },
+            DshSettingsLayout::LegacyYaml,
         )
         .expect("insert");
         let updated = join_lines(&lines);
@@ -2124,7 +2618,7 @@ agent-default-model:
     fn removing_a_provider_takes_its_leading_comment() {
         let text = "llm-pi-ai:\n  providers:\n    # 老网关\n    old:\n      apiKeyEnv: OLD\n    keep:\n      apiKeyEnv: KEEP\n";
         let mut lines = text_lines(text);
-        assert!(remove_provider(&mut lines, "old").expect("remove"));
+        assert!(remove_provider(&mut lines, "old", DshSettingsLayout::LegacyYaml).expect("remove"));
         assert_eq!(
             join_lines(&lines),
             "llm-pi-ai:\n  providers:\n    keep:\n      apiKeyEnv: KEEP\n"
@@ -2292,7 +2786,7 @@ agent-default-model:
     /// （profile 未安装）时跳过——那是正常状态，不是失败。
     #[test]
     fn the_installed_catalog_is_reachable_when_present() {
-        let Some(routes) = installed_catalog_routes() else {
+        let Some(routes) = installed_catalog_routes(DshSettingsLayout::LegacyYaml) else {
             return;
         };
         // 挑两个确认读到的确实是 pi-ai 的目录：一个是它自带的产品路由，一个是
@@ -2456,7 +2950,7 @@ refs:
     fn the_api_key_env_line_is_added_only_when_missing() {
         let settings = "llm-pi-ai:\n  providers:\n    vllm:\n      api: openai-completions\n";
         let (updated, revision) =
-            patch_provider_credential_ref(settings, "vllm", "VLLM_API_KEY")
+            patch_provider_credential_ref(settings, "vllm", "VLLM_API_KEY", DshSettingsLayout::LegacyYaml)
                 .expect("patch")
                 .expect("patched");
         assert!(updated.contains("apiKeyEnv: VLLM_API_KEY"));
@@ -2466,15 +2960,302 @@ refs:
         // 已有这一行（哪怕值不同）就不动——令牌会存进那个已有引用名下。
         let with_ref = "llm-pi-ai:\n  providers:\n    vllm:\n      apiKeyEnv: CUSTOM_KEY\n";
         assert!(
-            patch_provider_credential_ref(with_ref, "vllm", "VLLM_API_KEY")
+            patch_provider_credential_ref(with_ref, "vllm", "VLLM_API_KEY", DshSettingsLayout::LegacyYaml)
                 .expect("patch")
                 .is_none()
         );
         // 供应方不存在时同样不动。
         assert!(
-            patch_provider_credential_ref(settings, "nope", "X_API_KEY")
+            patch_provider_credential_ref(settings, "nope", "X_API_KEY", DshSettingsLayout::LegacyYaml)
                 .expect("patch")
                 .is_none()
         );
+    }
+
+    // -- profile patch 布局（dsh 0.2.0 起） ---------------------------------
+
+    /// 形状取真机的 `profiles/web/cordis.patch.yml`：dsh 设置页写出的若干 entry、
+    /// 文件头注释、以及一个带 `!!js` 表达式的 entry（dsh 的合法写法，启动器只定位
+    /// 边界、不解析内容）。
+    const PATCH_SAMPLE: &str = "\
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+- id: ui-theme
+  name: \"@deepseek-ai/dsh-client-ui-theme\"
+  config:
+    preference: dark
+- id: webserver
+  config:
+    port: !!js ctx.webStartup.port ?? 3080
+- id: llm-pi-ai
+  name: \"@deepseek-ai/dsh-llm-pi-ai\"
+  config:
+    providers:
+      kimi-coding:
+        apiKeyEnv: KIMI_CODING_API_KEY
+      vllm:
+        api: openai-completions
+        baseURL: https://example.test/v1
+        compat:
+          thinkingFormat: qwen
+        models:
+          - id: Qwen3.8-27B
+            reasoningEfforts:
+              max: max
+- id: agent-default-model
+  name: \"@deepseek-ai/dsh-agent-default-model\"
+  config:
+    provider: kimi-coding
+    model: k3-256k
+";
+
+    fn patch_providers_of(text: &str) -> Vec<DshProviderProfile> {
+        parse_providers(&text_lines(text), DshSettingsLayout::ProfilePatch).expect("parse")
+    }
+
+    #[test]
+    fn patch_layout_parses_providers_from_the_entry_config() {
+        let providers = patch_providers_of(PATCH_SAMPLE);
+        assert_eq!(
+            providers.iter().map(|provider| provider.id.as_str()).collect::<Vec<_>>(),
+            vec!["kimi-coding", "vllm"]
+        );
+        assert_eq!(providers[1].api.as_deref(), Some("openai-completions"));
+        assert_eq!(providers[1].unmanaged_fields, vec!["compat".to_string()]);
+        assert_eq!(providers[1].models[0].id, "Qwen3.8-27B");
+    }
+
+    #[test]
+    fn patch_layout_survives_js_expressions_in_other_entries() {
+        // `!!js` 在 webserver entry 里：解析 llm-pi-ai 时绝不能因为它报错。
+        assert_eq!(patch_providers_of(PATCH_SAMPLE).len(), 2);
+        // 顶层出现非序列内容才是真的坏文件，必须 fail loud。
+        let broken = "ui-theme:\n  preference: dark\n";
+        assert!(parse_providers(&text_lines(broken), DshSettingsLayout::ProfilePatch).is_err());
+    }
+
+    #[test]
+    fn patch_layout_empty_document_and_placeholder_have_no_providers() {
+        assert!(patch_providers_of("").is_empty());
+        // dsh 初始化 profile 时的空序列占位。
+        let placeholder = "# header comment\n[]\n";
+        assert!(patch_providers_of(placeholder).is_empty());
+    }
+
+    #[test]
+    fn patch_layout_insert_into_existing_providers_keeps_everything_else() {
+        let mut lines = text_lines(PATCH_SAMPLE);
+        let provider = DshProviderProfile {
+            id: "strata".into(),
+            api: Some("openai-completions".into()),
+            base_url: Some("http://100.106.72.126:8080/v1".into()),
+            reasoning: Some("max".into()),
+            models: vec![DshModelProfile {
+                id: "qwen3.8-flash-next-iq3_s".into(),
+                context_window: Some(262144),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        insert_provider(&mut lines, &provider, DshSettingsLayout::ProfilePatch).expect("insert");
+        let updated = join_lines(&lines);
+
+        // 新供应方落在 llm-pi-ai entry 的 providers 字典里、缩进与既有条目一致。
+        assert!(
+            updated.contains(
+                "      vllm:\n        api: openai-completions\n        baseURL: https://example.test/v1\n        compat:\n          thinkingFormat: qwen\n        models:\n          - id: Qwen3.8-27B\n            reasoningEfforts:\n              max: max\n      strata:\n        api: openai-completions\n        baseURL: http://100.106.72.126:8080/v1\n        reasoning: max\n        models:\n          - id: qwen3.8-flash-next-iq3_s\n            contextWindow: 262144\n"
+            ),
+            "实际：{updated}"
+        );
+        // 其它 entry（含 `!!js` 那条）与文件头注释逐字节保留。
+        assert!(updated.starts_with("# Your patch layer for this dsh profile"));
+        assert!(updated.contains("- id: webserver\n  config:\n    port: !!js ctx.webStartup.port ?? 3080\n"));
+        assert!(updated.contains("- id: agent-default-model\n  name: \"@deepseek-ai/dsh-agent-default-model\"\n  config:\n    provider: kimi-coding\n    model: k3-256k\n"));
+        // 守卫：entry 一个没少。
+        assert_top_level_kept(&text_lines(PATCH_SAMPLE), &lines, DshSettingsLayout::ProfilePatch)
+            .expect("guard");
+    }
+
+    #[test]
+    fn patch_layout_insert_creates_the_entry_when_missing() {
+        // 没有 llm-pi-ai entry：追加完整 entry 到文件尾，形状照 dsh configEditor 写的。
+        let text = "# header\n- id: ui-theme\n  config:\n    preference: dark\n";
+        let mut lines = text_lines(text);
+        let provider = DshProviderProfile {
+            id: "vllm".into(),
+            api_key_env: Some("VLLM_API_KEY".into()),
+            ..Default::default()
+        };
+        insert_provider(&mut lines, &provider, DshSettingsLayout::ProfilePatch).expect("insert");
+        let updated = join_lines(&lines);
+        assert!(updated.starts_with("# header\n- id: ui-theme\n  config:\n    preference: dark\n"));
+        assert!(
+            updated.contains(
+                "- id: llm-pi-ai\n  name: '@deepseek-ai/dsh-llm-pi-ai'\n  config:\n    providers:\n      vllm:\n        apiKeyEnv: VLLM_API_KEY\n"
+            ),
+            "实际：{updated}"
+        );
+        // 再读一次：新 entry 里的供应方能被解析回来。
+        let parsed = patch_providers_of(&updated);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "vllm");
+    }
+
+    #[test]
+    fn patch_layout_insert_replaces_the_empty_sequence_placeholder() {
+        let text = "# header\n[]\n";
+        let mut lines = text_lines(text);
+        let provider = DshProviderProfile {
+            id: "vllm".into(),
+            api: Some("openai-completions".into()),
+            ..Default::default()
+        };
+        insert_provider(&mut lines, &provider, DshSettingsLayout::ProfilePatch).expect("insert");
+        let updated = join_lines(&lines);
+        assert!(!updated.contains("[]"), "占位行必须被收走，实际：{updated}");
+        assert!(updated.starts_with("# header\n- id: llm-pi-ai\n"));
+    }
+
+    #[test]
+    fn patch_layout_insert_fills_a_configless_entry() {
+        // entry 在但只带过别的字段（不太可能，但要能补）：补 config 与 providers。
+        let text = "- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n";
+        let mut lines = text_lines(text);
+        let provider = DshProviderProfile {
+            id: "vllm".into(),
+            api_key_env: Some("VLLM_API_KEY".into()),
+            ..Default::default()
+        };
+        insert_provider(&mut lines, &provider, DshSettingsLayout::ProfilePatch).expect("insert");
+        let updated = join_lines(&lines);
+        assert_eq!(
+            updated,
+            "- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n      vllm:\n        apiKeyEnv: VLLM_API_KEY\n"
+        );
+    }
+
+    #[test]
+    fn patch_layout_insert_fills_providers_under_existing_config() {
+        let text = "- id: llm-pi-ai\n  config:\n    modelOverrides: {}\n";
+        let mut lines = text_lines(text);
+        let provider = DshProviderProfile {
+            id: "vllm".into(),
+            api_key_env: Some("VLLM_API_KEY".into()),
+            ..Default::default()
+        };
+        insert_provider(&mut lines, &provider, DshSettingsLayout::ProfilePatch).expect("insert");
+        let updated = join_lines(&lines);
+        assert!(updated.contains("    modelOverrides: {}\n    providers:\n      vllm:\n        apiKeyEnv: VLLM_API_KEY\n"), "实际：{updated}");
+    }
+
+    #[test]
+    fn patch_layout_uses_the_last_non_insert_entry() {
+        // 两条同名 entry：一条带 insert（插入清单，不是 config 归属行），一条是
+        // 正常的 config 行。定位必须与 dsh 的 findLastIndex 一致——落在后者。
+        let text = "\
+- id: llm-pi-ai
+  insert: before
+  config:
+    providers:
+      decoy:
+        apiKeyEnv: DECOY
+- id: llm-pi-ai
+  name: \"@deepseek-ai/dsh-llm-pi-ai\"
+  config:
+    providers:
+      real:
+        apiKeyEnv: REAL
+";
+        let providers = patch_providers_of(text);
+        assert_eq!(
+            providers.iter().map(|provider| provider.id.as_str()).collect::<Vec<_>>(),
+            vec!["real"]
+        );
+    }
+
+    #[test]
+    fn patch_layout_edit_keeps_other_entries_byte_identical() {
+        let mut lines = text_lines(PATCH_SAMPLE);
+        let (dictionary_indent, item) =
+            locate_provider(&lines, "vllm", DshSettingsLayout::ProfilePatch)
+                .expect("locate")
+                .expect("vllm");
+        assert_eq!(dictionary_indent, 6);
+
+        let mut provider = patch_providers_of(PATCH_SAMPLE)
+            .into_iter()
+            .find(|provider| provider.id == "vllm")
+            .expect("vllm");
+        provider.base_url = Some("https://changed.test/v1".into());
+
+        let mut updates = provider_field_updates(&provider, dictionary_indent + 2);
+        updates.reverse();
+        apply_field_updates(&mut lines, &item, dictionary_indent + 2, updates).expect("apply");
+        let updated = join_lines(&lines);
+
+        assert!(updated.contains("baseURL: https://changed.test/v1"));
+        // 没动的供应商与其它 entry 一字节不变。
+        assert!(updated.contains("      kimi-coding:\n        apiKeyEnv: KIMI_CODING_API_KEY\n"));
+        assert!(updated.contains("        compat:\n          thinkingFormat: qwen"));
+        assert!(updated.contains("- id: webserver\n  config:\n    port: !!js ctx.webStartup.port ?? 3080\n"));
+        assert_eq!(updated.lines().count(), PATCH_SAMPLE.lines().count());
+    }
+
+    #[test]
+    fn patch_layout_remove_takes_only_its_own_block() {
+        let mut lines = text_lines(PATCH_SAMPLE);
+        assert!(remove_provider(&mut lines, "vllm", DshSettingsLayout::ProfilePatch).expect("remove"));
+        let updated = join_lines(&lines);
+        assert!(!updated.contains("vllm"));
+        assert!(updated.contains("      kimi-coding:\n        apiKeyEnv: KIMI_CODING_API_KEY\n"));
+        assert!(updated.contains("- id: agent-default-model\n"));
+        assert_top_level_kept(&text_lines(PATCH_SAMPLE), &lines, DshSettingsLayout::ProfilePatch)
+            .expect("guard");
+    }
+
+    #[test]
+    fn patch_layout_guard_catches_a_lost_entry() {
+        let before = text_lines(PATCH_SAMPLE);
+        // 模拟一次把 agent-default-model entry 整个吃掉的错误写入。
+        let cut = before
+            .iter()
+            .position(|line| line == "- id: agent-default-model")
+            .expect("entry line");
+        let after: Vec<String> = before[..cut].to_vec();
+        assert!(assert_top_level_kept(&before, &after, DshSettingsLayout::ProfilePatch).is_err());
+    }
+
+    #[test]
+    fn patch_layout_credential_ref_patch_works_inside_the_entry() {
+        let (updated, _) = patch_provider_credential_ref(
+            PATCH_SAMPLE,
+            "vllm",
+            "VLLM_API_KEY",
+            DshSettingsLayout::ProfilePatch,
+        )
+        .expect("patch")
+        .expect("patched");
+        // 新字段追加在供应方块的尾部（与旧布局同一套 append 规则），块内其余不变。
+        assert!(updated.contains("        apiKeyEnv: VLLM_API_KEY\n"), "实际：{updated}");
+        assert!(updated.contains("      vllm:\n        api: openai-completions\n"));
+        assert!(updated.contains("            reasoningEfforts:\n              max: max\n"));
+        // 已有 apiKeyEnv 的不动。
+        assert!(
+            patch_provider_credential_ref(PATCH_SAMPLE, "kimi-coding", "X", DshSettingsLayout::ProfilePatch)
+                .expect("patch")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn layout_detection_parses_versions() {
+        assert_eq!(layout_for_version("0.1.5-rc.1"), Some(DshSettingsLayout::LegacyYaml));
+        assert_eq!(layout_for_version("0.1.9"), Some(DshSettingsLayout::LegacyYaml));
+        assert_eq!(layout_for_version("0.2.0-rc.2"), Some(DshSettingsLayout::ProfilePatch));
+        assert_eq!(layout_for_version("0.2.0"), Some(DshSettingsLayout::ProfilePatch));
+        assert_eq!(layout_for_version("1.0.0"), Some(DshSettingsLayout::ProfilePatch));
+        assert_eq!(layout_for_version("latest"), None);
+        assert_eq!(layout_for_version(""), None);
     }
 }

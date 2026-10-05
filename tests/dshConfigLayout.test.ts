@@ -183,7 +183,7 @@ test('the dsh config panels keep only the load-bearing help lines', () => {
   assert.match(note[1], /<div class="card-title">说明<\/div>/)
   assert.match(note[1], /<p>只显示自定义供应商。<\/p>/)
   assert.match(note[1], /写入只改你正在编辑的这一个供应商/)
-  assert.match(note[1], /settings\.yaml\.bak/)
+  assert.match(note[1], /\{\{ store\.settingsFileName \}\}\.bak/)
   assert.match(note[1], /被改动的那个字段会按规范格式重排，它内部的注释不会保留/)
   assert.doesNotMatch(note[1], /密钥不在这个文件里/, '令牌管理进了编辑器，说明卡不再指路')
   assert.doesNotMatch(note[1], /设置 → 模型/)
@@ -289,7 +289,8 @@ test('the dsh sidebar lists only custom routes', () => {
   assert.match(markup, /store\.visibleProviders\.map\(\(item\) => item\.id\)/)
   assert.match(markup, /store\.reorderVisible\(newOrder\)/)
   // 文件里有供应商、却一条自定义的都没有时，空状态要说清它们去哪了。
-  assert.match(markup, /本页只显示自定义供应商；settings\.yaml 里剩下的都是 dsh 自带的目录路由。/)
+  // （文件名按布局动态化：0.1.x 是 settings.yaml，0.2.0 起是 cordis.patch.yml。）
+  assert.match(markup, /本页只显示自定义供应商；\{\{ store\.settingsFileName \}\} 里剩下的都是 dsh 自带的目录路由。/)
 
   const types = readFileSync(resolve(repoRoot, 'src/types/config.ts'), 'utf8')
   assert.match(types, /custom: boolean/)
@@ -732,7 +733,7 @@ test('the dsh panel states the supported dsh version and where to look when it d
 
   // 版本号来自后端返回的 supportedVersion（单一真源在 dsh_settings.rs），
   // 组件只负责显示，不自己写死一份。
-  assert.match(shell, /store\.supportedVersion \|\| '0\.1\.5-rc\.1'/)
+  assert.match(shell, /store\.supportedVersion \|\| '—'/)
   assert.match(shell, /本页面的字段对应 dsh <strong>v\{\{ supportedVersionLabel \}\}<\/strong>/)
 
   // 界面上只留「对应哪一版 + 开发者预览版」这一句；文档路径只在注释里，
@@ -755,7 +756,9 @@ test('the dsh panel states the supported dsh version and where to look when it d
   assert.match(editor, /docs\/config-catalog\.zh\.md/)
 
   const rust = readFileSync(resolve(repoRoot, 'src-tauri/src/dsh_settings.rs'), 'utf8')
-  assert.match(rust, /DSH_SETTINGS_SUPPORTED_VERSION: &str = "0\.1\.5-rc\.1"/)
+  // 两种布局各有自己对齐的 dsh 版本（0.1.x 的 settings.yaml / 0.2.0 起的 patch）。
+  assert.match(rust, /DSH_SETTINGS_SUPPORTED_VERSION_LEGACY: &str = "0\.1\.5-rc\.1"/)
+  assert.match(rust, /DSH_SETTINGS_SUPPORTED_VERSION_PATCH: &str = "0\.2\.0-rc\.2"/)
   assert.match(rust, /developer preview/)
   assert.match(rust, /github\.com\/deepseek-ai\/deepseek-harness/)
   assert.match(rust, /docs\/config-catalog\.zh\.md/)
