@@ -160,6 +160,18 @@
         {{ visibleToast }}
       </div>
     </Transition>
+
+    <!-- 导入残留恢复：Teleport 浮层，避免被面板的滚动容器裁切（同版本选择器）。 -->
+    <Teleport to="body">
+      <div
+        v-if="store.showLegacyImportDialog"
+        class="dsh-import-overlay"
+        role="presentation"
+        @click.self="store.dismissLegacyImport()"
+      >
+        <DshLegacyImportDialog />
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -175,6 +187,7 @@ import { beginStartupMeasure } from '@/utils/startupMetrics'
 import ConfigStatusBanner from '@/components/config/ConfigStatusBanner.vue'
 import DshProviderEditor from './DshProviderEditor.vue'
 import DshStartupSettingsPane from './DshStartupSettingsPane.vue'
+import DshLegacyImportDialog from './DshLegacyImportDialog.vue'
 
 /**
  * dsh 配置工作台的外壳。
@@ -578,6 +591,16 @@ onBeforeUnmount(() => {
   height: 100%;
   padding: 12px 16px;
   overflow-y: auto;
+}
+
+.dsh-import-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--overlay);
 }
 
 .source-note {

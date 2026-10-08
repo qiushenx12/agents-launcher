@@ -5,6 +5,7 @@ import type {
   DshModelProfile,
   DshProviderProfile,
   DshReasoningLevel,
+  DshRestoreImportedResult,
   DshSettingsDocument,
   DshSettingsWriteResult,
   DshThinkingLevel,
@@ -152,6 +153,60 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
   /** 写删成功消息的布局后缀。 */
   const applyHint = computed(() =>
     needsRestartToApply.value ? '重启 dsh 服务后生效。' : '')
+
+  // 一次性导入残留（settings.yaml.imported）的一键恢复。dsh 0.2.0 导入时
+  // 被拒的供应商只留在残留文件里，后端在读取时一并扫描出来（legacyImport）。
+  /** 用户本次会话已关掉恢复弹窗。不持久化：重启应用后再检查一次是对的。 */
+  const legacyImportDismissed = ref(false)
+  const restoringImport = ref(false)
+  /** 残留信息（读取命令随文档一并返回）。 */
+  const legacyImport = computed(() => document.value?.legacyImport ?? null)
+  /** 弹窗显示条件：有候选或有可读性错误，且本次会话还没被关掉。 */
+  const showLegacyImportDialog = computed(() => {
+    const info = legacyImport.value
+    if (!info || legacyImportDismissed.value) return false
+    return info.parseError !== null || info.candidates.length > 0
+  })
+
+  function dismissLegacyImport() {
+    legacyImportDismissed.value = true
+  }
+
+  /**
+   * 一键恢复：后端把残留文件里当前文档缺失的供应商**原始块**移植进当前布局
+   * 文档（缩进平移，字段与注释逐字节保留）。恢复后静默重读，弹窗随候选清空
+   * 自然消失；仍有跳过的（问题没清零）时不再自动弹，原因转去常驻横幅。
+   */
+  async function restoreImportedProviders(): Promise<boolean> {
+    const current = document.value
+    if (!current || restoringImport.value) return false
+    restoringImport.value = true
+    try {
+      const result = await invoke<DshRestoreImportedResult>('dsh_restore_imported_providers', {
+        request: { baseRevision: current.revision },
+      })
+      legacyImportDismissed.value = true
+      await load(true)
+      if (result.restored.length > 0) {
+        setStatus(
+          'success',
+          `已恢复 ${result.restored.length} 个供应商：${result.restored.join('、')}。${applyHint.value}`,
+        )
+      }
+      if (result.skipped.length > 0) {
+        const detail = result.skipped
+          .map((item) => `${item.id}（${item.problems.join('；')}）`)
+          .join('、')
+        setStatus('warning', `有 ${result.skipped.length} 个供应商未能恢复：${detail}`)
+      }
+      return true
+    } catch (error) {
+      setStatus('error', `恢复供应商失败：${error}`)
+      return false
+    } finally {
+      restoringImport.value = false
+    }
+  }
 
   /** 单个供应商是否有未写入的改动。新草稿一律算有。 */
   function isProviderDirty(draft: DshProviderDraft): boolean {
@@ -772,6 +827,11 @@ export const useDshModelsStore = defineStore('dsh-models', () => {
     needsRestartToApply,
     toast,
     toastSeq,
+    legacyImport,
+    showLegacyImportDialog,
+    restoringImport,
+    dismissLegacyImport,
+    restoreImportedProviders,
     isSelectedDirty,
     isProviderDirty,
     dirtyCount,

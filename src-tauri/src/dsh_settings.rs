@@ -67,6 +67,8 @@ const DSH_HOME_DIR_NAME: &str = ".dsh";
 const DSH_HOME_ENV: &str = "DSH_HOME";
 /// 旧布局的设置文档文件名（0.1.x；0.2.0 起 dsh 启动时会把它改名导入）。
 const DSH_SETTINGS_FILE_NAME: &str = "settings.yaml";
+/// dsh 0.2.0 一次性导入后把 `settings.yaml` 改名成的残留文件。
+const DSH_IMPORTED_FILE_NAME: &str = "settings.yaml.imported";
 /// 新布局的 profile patch 文件名（0.2.0 起）。
 const DSH_PROFILE_PATCH_FILE_NAME: &str = "cordis.patch.yml";
 /// `dsh web` 固定 boot 的 profile 名（等价于 `dsh --profile web`）。
@@ -151,6 +153,36 @@ pub struct DshSettingsDocument {
     pub layout: DshSettingsLayout,
     /// 解析出的 pi-ai 供应方，顺序与文件中的顺序一致。
     pub providers: Vec<DshProviderProfile>,
+    /// `settings.yaml.imported` 里还没回到当前文档的供应商（dsh 0.2.0 一次性
+    /// 导入时丢弃的那些）。没有可恢复的（或文件不存在）时为 None。
+    pub legacy_import: Option<DshLegacyImport>,
+}
+
+/// `$DSH_HOME/settings.yaml.imported` 的可恢复内容。
+///
+/// dsh 0.2.0 的一次性导入是「先改名再逐节导入，某节被拒就只留在改名后的文件里」
+/// （`dsh-settings` 的 `importLegacyDocument`）——被拒的供应商不会丢数据，但也
+/// 不会自己回来。启动器据此提供一键恢复（见 [`dsh_restore_imported_providers`]）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshLegacyImport {
+    /// 导入残留文件的绝对路径。
+    pub path: String,
+    /// 文件在但解析失败时的原因（此时 `candidates` 为空，恢复按钮不可用）。
+    pub parse_error: Option<String>,
+    /// 还没回到当前文档的供应商，顺序与残留文件中的顺序一致。
+    pub candidates: Vec<DshImportedProvider>,
+}
+
+/// 一个可恢复的供应商：完整档案 + 恢复前必须先解决的问题。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshImportedProvider {
+    #[serde(flatten)]
+    pub provider: DshProviderProfile,
+    /// 空 = 可直接恢复；非空 = 每条是一句人话（多半是被 dsh 0.2.0 拒掉的原因，
+    /// 例如自定义路由缺 `api`），用户要先手工补上才能恢复。
+    pub problems: Vec<String>,
 }
 
 /// 一个 pi-ai 供应方路由（`llm-pi-ai.providers.<id>`）。
@@ -256,6 +288,26 @@ pub struct DshSettingsWriteResult {
     pub backup_path: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshRestoreImportedRequest {
+    /// 读取时拿到的 revision；与当前文件不一致就拒绝写入。
+    pub base_revision: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshRestoreImportedResult {
+    pub path: String,
+    pub revision: String,
+    pub backup_path: String,
+    /// 已恢复的供应商路由键，按残留文件中的顺序。
+    pub restored: Vec<String>,
+    /// 没能恢复的供应商：每条 problems 就是当初被 dsh 拒掉/校验不过的原因，
+    /// 需要手工补齐字段后再恢复。
+    pub skipped: Vec<DshImportedProvider>,
+}
+
 // ---------------------------------------------------------------------------
 // 路径
 // ---------------------------------------------------------------------------
@@ -296,6 +348,11 @@ pub fn dsh_home() -> Result<PathBuf, String> {
 /// 旧布局设置文件（`settings.yaml`）的完整路径。
 pub fn dsh_settings_path() -> Result<PathBuf, String> {
     Ok(dsh_home()?.join(DSH_SETTINGS_FILE_NAME))
+}
+
+/// 一次性导入残留文件（`settings.yaml.imported`）的完整路径。
+fn dsh_imported_settings_path() -> Result<PathBuf, String> {
+    Ok(dsh_home()?.join(DSH_IMPORTED_FILE_NAME))
 }
 
 /// 新布局设置文件（`profiles/web/cordis.patch.yml`）的完整路径。
@@ -1579,13 +1636,24 @@ fn insert_provider(
     provider: &DshProviderProfile,
     layout: DshSettingsLayout,
 ) -> Result<(), String> {
+    insert_provider_with(lines, layout, |indent| render_provider(provider, indent))
+}
+
+/// 插入一个供应商的**已渲染**块。`render` 接收供应商 key 的目标缩进，返回整块
+/// 的行——写入路径渲染结构化档案，恢复路径（[`restore_imported_from_text`]）
+/// 平移残留文件里的原始块；落位规则（缺哪层补哪层、落点跳注释）两条路共用。
+fn insert_provider_with(
+    lines: &mut Vec<String>,
+    layout: DshSettingsLayout,
+    render: impl FnOnce(usize) -> Vec<String>,
+) -> Result<(), String> {
     match resolve_providers_site(lines, layout)? {
         ProvidersSite::Present {
             content_start,
             end,
             child_indent,
         } => {
-            let rendered = render_provider(provider, child_indent);
+            let rendered = render(child_indent);
             let insert_at = append_index(lines, content_start, end);
             lines.splice(insert_at..insert_at, rendered);
         }
@@ -1596,7 +1664,7 @@ fn insert_provider(
         } => {
             let pad = " ".repeat(child_indent);
             let mut rendered = vec![format!("{pad}{PROVIDERS_KEY}:")];
-            rendered.extend(render_provider(provider, child_indent + 2));
+            rendered.extend(render(child_indent + 2));
             let insert_at = append_index(lines, content_start, end);
             lines.splice(insert_at..insert_at, rendered);
         }
@@ -1611,7 +1679,7 @@ fn insert_provider(
                 format!("{pad}{CONFIG_KEY}:"),
                 format!("{pad}  {PROVIDERS_KEY}:"),
             ];
-            rendered.extend(render_provider(provider, child_indent + 4));
+            rendered.extend(render(child_indent + 4));
             let insert_at = append_index(lines, content_start, end);
             lines.splice(insert_at..insert_at, rendered);
         }
@@ -1620,7 +1688,7 @@ fn insert_provider(
                 // 整个分区都不存在：在文件头补齐。dsh 对顶层顺序没有要求。
                 let mut rendered = vec![format!("{PI_AI_SECTION}:")];
                 rendered.push(format!("  {PROVIDERS_KEY}:"));
-                rendered.extend(render_provider(provider, 4));
+                rendered.extend(render(4));
                 rendered.push(String::new());
                 lines.splice(0..0, rendered);
             }
@@ -1635,7 +1703,7 @@ fn insert_provider(
                     format!("  {CONFIG_KEY}:"),
                     format!("    {PROVIDERS_KEY}:"),
                 ];
-                rendered.extend(render_provider(provider, 6));
+                rendered.extend(render(6));
                 // 落点：文件尾最后一个非空行之后。这里**不能**用 append_index——
                 // 它会跳过尾部注释，而顶层的尾部注释是文件头/文件级注释（比如 dsh
                 // 写的那段说明），被挤到新 entry 后面就错了。块级插入才跳注释。
@@ -1719,6 +1787,178 @@ fn join_lines(lines: &[String]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// 一次性导入残留（settings.yaml.imported）的检测与恢复
+//
+// dsh 0.2.0 的 importLegacyDocument 先改名、再逐节导入；被装配校验拒绝的节
+// （典型：自定义路由缺 api）只留在 .imported 里，界面上无声无息。恢复走
+// **原始块移植**而不是结构化重渲染：供应商块里启动器不编辑的字段（headers /
+// compat / retryPolicy …）与注释都逐字节带回，只把缩进平移到目标布局的深度。
+// ---------------------------------------------------------------------------
+
+/// 恢复前必须清零的问题清单（空 = 可恢复）。patch 布局下叠加 dsh 0.2.0 对
+/// 自定义路由的硬性要求——那正是当初导入被拒的原因，原样恢复回去会再丢一次。
+fn import_problems(provider: &DshProviderProfile, target_layout: DshSettingsLayout) -> Vec<String> {
+    let mut problems = Vec::new();
+    if let Err(reason) = validate_provider(provider) {
+        problems.push(reason);
+    }
+    if target_layout == DshSettingsLayout::ProfilePatch {
+        if let Err(reason) = enforce_patch_route_rules(provider) {
+            problems.push(reason);
+        }
+    }
+    problems
+}
+
+/// 从残留文件文本里挑出「当前文档里没有」的供应商（纯文本，方便测试）。
+fn scan_imported_text(
+    existing_ids: &std::collections::HashSet<&str>,
+    imported_text: &str,
+    target_layout: DshSettingsLayout,
+) -> Result<Vec<DshImportedProvider>, String> {
+    let imported_lines = text_lines(imported_text);
+    let mut imported = parse_providers(&imported_lines, DshSettingsLayout::LegacyYaml)?;
+    mark_custom_routes(&mut imported, target_layout);
+    Ok(imported
+        .into_iter()
+        .filter(|provider| !existing_ids.contains(provider.id.as_str()))
+        .map(|provider| {
+            let problems = import_problems(&provider, target_layout);
+            DshImportedProvider { provider, problems }
+        })
+        .collect())
+}
+
+/// 读取残留文件并扫描（读取命令的副作用位）。文件不存在 → None；读不了/解析
+/// 失败 → 仍有返回值，原因放在 parse_error 里让界面能说清，而不是静默吃掉。
+fn scan_legacy_import(
+    providers: &[DshProviderProfile],
+    layout: DshSettingsLayout,
+) -> Option<DshLegacyImport> {
+    let path = dsh_imported_settings_path().ok()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(DshLegacyImport {
+                path: path.display().to_string(),
+                parse_error: Some(format!("无法读取导入残留文件：{error}")),
+                candidates: Vec::new(),
+            });
+        }
+    };
+    let existing: std::collections::HashSet<&str> =
+        providers.iter().map(|provider| provider.id.as_str()).collect();
+    let path_display = path.display().to_string();
+    match scan_imported_text(&existing, &text, layout) {
+        Ok(candidates) if candidates.is_empty() => None,
+        Ok(candidates) => Some(DshLegacyImport {
+            path: path_display,
+            parse_error: None,
+            candidates,
+        }),
+        Err(reason) => Some(DshLegacyImport {
+            path: path_display,
+            parse_error: Some(reason),
+            candidates: Vec::new(),
+        }),
+    }
+}
+
+/// 取出残留文件里一个供应商的原始块：连块前的注释行一起（它们描述的就是它），
+/// 尾部空行/注释裁掉（那属于下一块的头部）。返回供应商 key 的缩进与行切片。
+fn provider_raw_block(
+    lines: &[String],
+    provider_id: &str,
+) -> Result<Option<(usize, Vec<String>)>, String> {
+    let ProvidersSite::Present {
+        content_start,
+        end,
+        child_indent,
+    } = resolve_providers_site(lines, DshSettingsLayout::LegacyYaml)?
+    else {
+        return Ok(None);
+    };
+    let items = field_items(lines, content_start, end, child_indent)?;
+    let Some(item) = items.iter().find(|item| item.key == provider_id) else {
+        return Ok(None);
+    };
+    let mut start = item.start;
+    while start > content_start && is_blank_or_comment(&lines[start - 1]) {
+        start -= 1;
+    }
+    let mut block_end = item.end;
+    while block_end > start + 1 && is_blank_or_comment(&lines[block_end - 1]) {
+        block_end -= 1;
+    }
+    Ok(Some((child_indent, lines[start..block_end].to_vec())))
+}
+
+/// 把取出的块从源缩进平移到目标缩进。空行原样；非空行加/减前导空格
+/// （减的时候以该行实际缩进为上限，不会裁到内容）。
+fn shift_block_lines(block: &[String], from_indent: usize, to_indent: usize) -> Vec<String> {
+    block
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                return line.clone();
+            }
+            if to_indent >= from_indent {
+                format!("{}{}", " ".repeat(to_indent - from_indent), line)
+            } else {
+                let leading = line.len() - line.trim_start().len();
+                let drop = (from_indent - to_indent).min(leading);
+                line[drop..].to_string()
+            }
+        })
+        .collect()
+}
+
+/// 恢复的核心（纯文本，方便测试）：把残留文件里当前文档缺失的供应商原始块
+/// 移植进当前文档文本。当前文档可以是空串（文件还不存在——插入路径会补层）。
+fn restore_imported_from_text(
+    original: &str,
+    imported_text: &str,
+    layout: DshSettingsLayout,
+) -> Result<(String, Vec<String>, Vec<DshImportedProvider>), String> {
+    let mut lines = text_lines(original);
+    let before_lines = lines.clone();
+    let imported_lines = text_lines(imported_text);
+    let imported = parse_providers(&imported_lines, DshSettingsLayout::LegacyYaml)?;
+    let current = parse_providers(&lines, layout)?;
+    let current_ids: std::collections::HashSet<&str> =
+        current.iter().map(|provider| provider.id.as_str()).collect();
+
+    let mut restored: Vec<String> = Vec::new();
+    let mut skipped: Vec<DshImportedProvider> = Vec::new();
+    for provider in imported {
+        if current_ids.contains(provider.id.as_str()) {
+            continue;
+        }
+        let problems = import_problems(&provider, layout);
+        if !problems.is_empty() {
+            skipped.push(DshImportedProvider { provider, problems });
+            continue;
+        }
+        let Some((source_indent, block)) = provider_raw_block(&imported_lines, &provider.id)?
+        else {
+            skipped.push(DshImportedProvider {
+                provider,
+                problems: vec!["在残留文件里定位不到它的配置块。".to_string()],
+            });
+            continue;
+        };
+        insert_provider_with(&mut lines, layout, |indent| {
+            shift_block_lines(&block, source_indent, indent)
+        })?;
+        restored.push(provider.id.clone());
+    }
+    let updated = join_lines(&lines);
+    assert_top_level_kept(&before_lines, &lines, layout)?;
+    Ok((updated, restored, skipped))
+}
+
+// ---------------------------------------------------------------------------
 // 命令
 // ---------------------------------------------------------------------------
 
@@ -1756,6 +1996,7 @@ pub fn dsh_read_settings() -> Result<DshSettingsDocument, String> {
         Vec::new()
     };
     mark_custom_routes(&mut providers, layout);
+    let legacy_import = scan_legacy_import(&providers, layout);
     Ok(DshSettingsDocument {
         path: path.display().to_string(),
         exists,
@@ -1763,6 +2004,7 @@ pub fn dsh_read_settings() -> Result<DshSettingsDocument, String> {
         supported_version: layout.supported_version().to_string(),
         layout,
         providers,
+        legacy_import,
     })
 }
 
@@ -1859,6 +2101,53 @@ pub fn dsh_write_provider(
         path: path.display().to_string(),
         revision: revision_of(&updated),
         backup_path: backup.display().to_string(),
+    })
+}
+
+/// 把 `settings.yaml.imported` 里还没回到当前文档的供应商恢复回去。
+/// 与单笔写入同一套纪律：revision 校验、顶层守卫、原子写、备份。恢复成功的
+/// 供应商按残留文件顺序追加进当前文档；仍有问题的留在 `skipped` 里并说明原因。
+#[tauri::command]
+pub fn dsh_restore_imported_providers(
+    request: DshRestoreImportedRequest,
+) -> Result<DshRestoreImportedResult, String> {
+    let (path, original, _exists, layout) = read_document()?;
+    if revision_of(&original) != request.base_revision {
+        return Err(
+            "dsh 设置文件在读取之后被其它程序改过了，为避免覆盖对方的改动，本次恢复已取消。\
+             请重新读取后再试。"
+                .to_string(),
+        );
+    }
+    let imported_path = dsh_imported_settings_path()?;
+    let imported_text = std::fs::read_to_string(&imported_path).map_err(|error| {
+        format!(
+            "无法读取导入残留文件 {}：{error}",
+            imported_path.display()
+        )
+    })?;
+    let (updated, restored, skipped) =
+        restore_imported_from_text(&original, &imported_text, layout)?;
+    if restored.is_empty() && skipped.is_empty() {
+        return Err("导入残留文件里没有可恢复的供应商（没有当前文档缺失的供应商）。".to_string());
+    }
+    if restored.is_empty() {
+        // 一个都恢复不了时不落盘，revision 维持原值。
+        return Ok(DshRestoreImportedResult {
+            path: path.display().to_string(),
+            revision: request.base_revision,
+            backup_path: String::new(),
+            restored,
+            skipped,
+        });
+    }
+    write_text_atomic(&path, updated.as_bytes(), "dsh 设置文件")?;
+    Ok(DshRestoreImportedResult {
+        path: path.display().to_string(),
+        revision: revision_of(&updated),
+        backup_path: backup_path_of(&path).display().to_string(),
+        restored,
+        skipped,
     })
 }
 
@@ -3257,5 +3546,202 @@ refs:
         assert_eq!(layout_for_version("1.0.0"), Some(DshSettingsLayout::ProfilePatch));
         assert_eq!(layout_for_version("latest"), None);
         assert_eq!(layout_for_version(""), None);
+    }
+
+    // -- 一次性导入残留（settings.yaml.imported）的恢复 -----------------------
+    //
+    // 2026-10-08 真实案例的形状：dsh 0.2.0 的一次性导入把 settings.yaml 改名后
+    // 逐节导入，strata 缺 api 导致整段 llm-pi-ai 被装配校验拒绝——5 个供应商
+    // 全部「消失」，但数据完整留在 .imported 里。
+
+    /// patch 文档里没有 llm-pi-ai entry（导入被拒后的真实样子）：别的 entry
+    /// 都在，其中一条带 `!!js` 表达式——移植时它们一个比特都不能动。
+    const PATCH_WITHOUT_PI_AI: &str = "\
+# Your patch layer for this dsh profile, applied after every bundle layer:
+- id: ui-theme
+  name: \"@deepseek-ai/dsh-client-ui-theme\"
+  config:
+    preference: dark
+- id: webserver
+  config:
+    port: !!js ctx.webStartup.port ?? 3080
+- id: agent-default-model
+  name: \"@deepseek-ai/dsh-agent-default-model\"
+  config:
+    provider: deepseek-official
+    model: deepseek-flash
+";
+
+    /// 残留文件：一个目录路由（只有 key）、一个自定义路由（含启动器不编辑的
+    /// `compat` 与块前注释），外加一行 providers 尾部的注释（不属于任何供应商，
+    /// 移植时不能带走）。
+    const IMPORTED_SAMPLE: &str = "\
+ui-onboarding:
+  welcomeNoticeVersion: 2026-08-13.1
+llm-pi-ai:
+  providers:
+    kimi-coding:
+      apiKeyEnv: KIMI_CODING_API_KEY
+    # 自建网关
+    vllm:
+      apiKeyEnv: VLLM_API_KEY
+      api: openai-completions
+      baseURL: https://example.test/v1
+      compat:
+        thinkingFormat: qwen
+      models:
+        - id: Qwen3.8-27B
+          reasoningEfforts:
+            max: max
+    # providers 尾部的注释
+agent-default-model:
+  provider: deepseek-official
+  model: deepseek-flash
+";
+
+    #[test]
+    fn restore_transplants_raw_blocks_into_patch_layout() {
+        let (updated, restored, skipped) = restore_imported_from_text(
+            PATCH_WITHOUT_PI_AI,
+            IMPORTED_SAMPLE,
+            DshSettingsLayout::ProfilePatch,
+        )
+        .expect("restore");
+
+        assert_eq!(restored, vec!["kimi-coding", "vllm"]);
+        assert!(skipped.is_empty());
+        // entry 整块补齐在文件尾（agent-default-model 之后），形状与 dsh 自己的
+        // configEditor 一致。
+        let entry_at = updated.find("- id: llm-pi-ai").expect("entry");
+        assert!(updated.find("- id: agent-default-model").expect("other") < entry_at);
+        assert!(updated[entry_at..].starts_with(
+            "- id: llm-pi-ai\n  name: '@deepseek-ai/dsh-llm-pi-ai'\n  config:\n    providers:\n"
+        ), "实际 entry 起：{}", &updated[entry_at..]);
+        // 供应商块平移到 key=6 / 字段=8：块前注释跟着走，字段逐字节保留（含
+        // 启动器不编辑的 compat）。
+        assert!(updated.contains("      kimi-coding:\n        apiKeyEnv: KIMI_CODING_API_KEY\n"), "实际：{updated}");
+        assert!(updated.contains("      # 自建网关\n      vllm:\n        apiKeyEnv: VLLM_API_KEY\n"), "实际：{updated}");
+        assert!(updated.contains("        compat:\n          thinkingFormat: qwen\n"), "实际：{updated}");
+        assert!(updated.contains("        models:\n          - id: Qwen3.8-27B\n            reasoningEfforts:\n              max: max\n"), "实际：{updated}");
+        // providers 尾部的注释不属于任何供应商，不能被带走。
+        assert!(!updated.contains("providers 尾部的注释"), "实际：{updated}");
+        // 其它 entry（含 !!js 表达式与文件头注释）一字节不动。
+        assert!(updated.starts_with("# Your patch layer"));
+        assert!(updated.contains("- id: webserver\n  config:\n    port: !!js ctx.webStartup.port ?? 3080\n"));
+        assert!(updated.contains("- id: agent-default-model\n  name: \"@deepseek-ai/dsh-agent-default-model\"\n  config:\n    provider: deepseek-official\n    model: deepseek-flash\n"));
+    }
+
+    #[test]
+    fn restore_into_legacy_layout_shifts_indent_down() {
+        let current = "llm-pi-ai:\n  providers:\n    existing:\n      apiKeyEnv: EXISTING\n";
+        let (updated, restored, skipped) = restore_imported_from_text(
+            current,
+            IMPORTED_SAMPLE,
+            DshSettingsLayout::LegacyYaml,
+        )
+        .expect("restore");
+
+        assert_eq!(restored, vec!["kimi-coding", "vllm"]);
+        assert!(skipped.is_empty());
+        // 旧布局 key=4 / 字段=6：往下平移两格。
+        assert!(updated.contains("    kimi-coding:\n      apiKeyEnv: KIMI_CODING_API_KEY\n"), "实际：{updated}");
+        assert!(updated.contains("    # 自建网关\n    vllm:\n      apiKeyEnv: VLLM_API_KEY\n      api: openai-completions\n"), "实际：{updated}");
+        // 已有的块原样，新块追加在它后面。
+        let existing_at = updated.find("    existing:\n      apiKeyEnv: EXISTING\n").expect("existing");
+        assert!(existing_at < updated.find("    kimi-coding:").expect("kimi"));
+    }
+
+    #[test]
+    fn restore_skips_providers_already_present() {
+        // kimi-coding 已在当前文档里：它不进 restored 也不进 skipped，且全文
+        // 仍然只有一份。
+        let current = "\
+- id: llm-pi-ai
+  name: \"@deepseek-ai/dsh-llm-pi-ai\"
+  config:
+    providers:
+      kimi-coding:
+        apiKeyEnv: KIMI_CODING_API_KEY
+";
+        let (updated, restored, skipped) = restore_imported_from_text(
+            current,
+            IMPORTED_SAMPLE,
+            DshSettingsLayout::ProfilePatch,
+        )
+        .expect("restore");
+
+        assert_eq!(restored, vec!["vllm"]);
+        assert!(skipped.is_empty());
+        assert_eq!(updated.matches("kimi-coding:").count(), 1, "实际：{updated}");
+    }
+
+    #[test]
+    fn restore_creates_the_entry_in_an_empty_document() {
+        let (updated, restored, _) =
+            restore_imported_from_text("", IMPORTED_SAMPLE, DshSettingsLayout::ProfilePatch)
+                .expect("restore");
+        assert_eq!(restored, vec!["kimi-coding", "vllm"]);
+        assert!(updated.contains("- id: llm-pi-ai\n  name: '@deepseek-ai/dsh-llm-pi-ai'\n  config:\n    providers:\n      kimi-coding:"), "实际：{updated}");
+    }
+
+    #[test]
+    fn restore_skips_custom_routes_missing_api() {
+        // 缺 api 的自定义路由正是当初被 dsh 拒掉的那种：恢复时必须在 skipped 里
+        // 说清原因，不能原样塞回去再丢一次。目录清单读不到时不做这条判定（那
+        // 是正常状态），整条用例跳过。
+        if installed_catalog_routes(DshSettingsLayout::ProfilePatch).is_none() {
+            return;
+        }
+        let imported = "\
+llm-pi-ai:
+  providers:
+    acme-broken:
+      baseURL: https://acme.test/v1
+      models:
+        - id: m1
+    acme-fine:
+      api: openai-completions
+      baseURL: https://acme2.test/v1
+      models:
+        - id: m2
+";
+        let (updated, restored, skipped) = restore_imported_from_text(
+            PATCH_WITHOUT_PI_AI,
+            imported,
+            DshSettingsLayout::ProfilePatch,
+        )
+        .expect("restore");
+
+        assert_eq!(restored, vec!["acme-fine"]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].provider.id, "acme-broken");
+        assert!(skipped[0].problems.iter().any(|problem| problem.contains("wire 协议")), "实际：{:?}", skipped[0].problems);
+        assert!(updated.contains("acme-fine:"), "实际：{updated}");
+        assert!(!updated.contains("acme-broken"), "实际：{updated}");
+    }
+
+    #[test]
+    fn scan_lists_only_missing_providers_with_their_problems() {
+        let existing: std::collections::HashSet<&str> = ["kimi-coding"].into_iter().collect();
+        let candidates =
+            scan_imported_text(&existing, IMPORTED_SAMPLE, DshSettingsLayout::ProfilePatch)
+                .expect("scan");
+        assert_eq!(
+            candidates.iter().map(|item| item.provider.id.as_str()).collect::<Vec<_>>(),
+            vec!["vllm"]
+        );
+        // vllm 字段齐全（api/baseURL/models 都在），任何目录状态下都没有问题。
+        assert!(candidates[0].problems.is_empty(), "实际：{:?}", candidates[0].problems);
+    }
+
+    #[test]
+    fn scan_reports_unparseable_imported_file() {
+        let existing: std::collections::HashSet<&str> = Default::default();
+        assert!(scan_imported_text(
+            &existing,
+            "llm-pi-ai:\n\tproviders:\n",
+            DshSettingsLayout::ProfilePatch
+        )
+        .is_err());
     }
 }

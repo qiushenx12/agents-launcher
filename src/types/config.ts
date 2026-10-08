@@ -416,6 +416,38 @@ export interface DshSettingsDocument {
   /** 本次读写按哪种布局进行（由检测到的 dsh 版本决定）。 */
   layout: DshSettingsLayout
   providers: DshProviderProfile[]
+  /**
+   * `settings.yaml.imported` 里还没回到当前文档的供应商。dsh 0.2.0 的一次性
+   * 导入把 `settings.yaml` 改名后逐节导入，被装配校验拒绝的节（典型：自定义
+   * 路由缺 `api`）只留在残留文件里——数据没丢，但界面上一片空白。非空时
+   * 配置页弹窗提供一键恢复；没有可恢复的（或文件不存在）时为 null。
+   */
+  legacyImport: DshLegacyImport | null
+}
+
+/** `$DSH_HOME/settings.yaml.imported` 的可恢复内容。 */
+export interface DshLegacyImport {
+  /** 残留文件的绝对路径。 */
+  path: string
+  /** 文件在但解析失败时的原因（此时 candidates 为空，恢复按钮不可用）。 */
+  parseError: string | null
+  /** 还没回到当前文档的供应商，顺序与残留文件一致。 */
+  candidates: DshImportedProvider[]
+}
+
+/** 一个可恢复的供应商：完整档案 + 恢复前必须先解决的问题（空 = 可直接恢复）。 */
+export interface DshImportedProvider extends DshProviderProfile {
+  problems: string[]
+}
+
+export interface DshRestoreImportedResult {
+  path: string
+  revision: string
+  backupPath: string
+  /** 已恢复的供应商路由键，按残留文件中的顺序。 */
+  restored: string[]
+  /** 没能恢复的供应商及其原因（需手工补齐字段后再恢复）。 */
+  skipped: DshImportedProvider[]
 }
 
 export interface DshSettingsWriteResult {

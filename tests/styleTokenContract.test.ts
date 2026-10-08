@@ -222,3 +222,39 @@ test('the version list is the only scroll region', () => {
   assert.equal(declarations(css, '.version-dialog__head').get('flex-shrink'), '0')
   assert.equal(declarations(css, '.version-dialog__foot').get('flex-shrink'), '0')
 })
+
+/**
+ * 导入残留恢复弹窗（DshLegacyImportDialog）与版本选择器同一类事故面：
+ * 面板必须不透明、限高必须落在视口单位、滚动区只有一个。
+ */
+const IMPORT_DIALOG = 'src/components/dsh/DshLegacyImportDialog.vue'
+
+test('the legacy-import dialog paints an opaque panel bounded by the viewport', () => {
+  const panel = declarations(scopedStyle(IMPORT_DIALOG), '.import-dialog__panel')
+  const background = panel.get('background')
+  assert.ok(background, 'the panel must declare a background or it renders see-through')
+  const token = /var\(\s*(--[a-zA-Z0-9-]+)/.exec(background)
+  if (token) {
+    assert.ok(
+      definedTokens().has(token[1]),
+      `${background} names a token that is defined nowhere, so the background is dropped`,
+    )
+  }
+  const maxHeight = panel.get('max-height')
+  assert.ok(maxHeight, 'the panel must bound its own height')
+  assert.match(
+    maxHeight,
+    /vh/,
+    `${maxHeight} has no viewport unit; a percentage here resolves against a `
+      + 'content-sized parent and the whole declaration is dropped',
+  )
+})
+
+test('the legacy-import dialog body is the only scroll region', () => {
+  const css = scopedStyle(IMPORT_DIALOG)
+  const body = declarations(css, '.import-dialog__body')
+  assert.equal(body.get('overflow-y'), 'auto', 'the body must own the scrolling')
+  assert.equal(body.get('min-height'), '0', 'without min-height: 0 the scroller defeats itself')
+  assert.equal(declarations(css, '.import-dialog__head').get('flex-shrink'), '0')
+  assert.equal(declarations(css, '.import-dialog__foot').get('flex-shrink'), '0')
+})
