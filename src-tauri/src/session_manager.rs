@@ -796,6 +796,18 @@ pub struct NativeRelocateReport {
     pub warnings: Vec<String>,
 }
 
+/// True when both paths resolve to the same filesystem object. Used to guard
+/// directory merges on case-insensitive filesystems: APFS (the macOS default)
+/// and NTFS treat `.../Demo` and `.../demo` as one directory even though the
+/// encoded transcript-dir names differ, and a merge would then delete the
+/// source copy of everything it reads. Unresolvable paths are never "same".
+fn same_existing_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Moves (or merges) the transcript directory from the old encoded path to the
 /// new one. Missing source directories are fine — the old path may simply have
 /// never run a session that survived the official cleanup.
@@ -823,13 +835,30 @@ fn relocate_transcripts_dir(
         if !dst_metadata.is_dir() {
             return Err(format!("目标转写目录 {} 不是目录", dst.display()));
         }
+        // APFS (macOS default) and NTFS are case-insensitive, so two different
+        // encoded names can resolve to one directory — e.g. re-pointing
+        // `/Users/paul/Demo` to `/Users/paul/demo`. Merging a directory into
+        // itself would read every entry, see it "already at the destination"
+        // and delete it, so bail out before touching anything.
+        if same_existing_path(&src, &dst) {
+            report.migrated.push(format!(
+                "转写目录 {}（新路径与旧路径在大小写不敏感的文件系统上是同一个目录）",
+                dst.display()
+            ));
+            return Ok(());
+        }
         // Merge: the destination keeps its own copies (same name = same
         // session id), the source copy is dropped after it is superseded.
         let mut conflicts = 0usize;
         for entry in std::fs::read_dir(&src).map_err(|e| format!("读取转写目录失败：{e}"))? {
             let Ok(entry) = entry else { continue };
             let target = dst.join(entry.file_name());
+            // Same guard one level down: never delete an entry that *is* its
+            // own destination (symlinked or case-variant duplicate).
             if target.exists() {
+                if same_existing_path(&entry.path(), &target) {
+                    continue;
+                }
                 conflicts += 1;
                 let removed = std::fs::remove_file(&entry.path())
                     .or_else(|_| std::fs::remove_dir_all(&entry.path()));
@@ -1610,5 +1639,40 @@ mod tests {
                 .expect("relocate with nothing to move");
         assert!(report.migrated.is_empty());
         assert_eq!(report.warnings.len(), 1);
+    }
+
+    /// APFS (macOS default) and NTFS are case-insensitive, so `encode(old)` and
+    /// `encode(new)` can resolve to the *same* directory even though the encoded
+    /// names differ. The merge branch must notice that instead of treating every
+    /// entry as a destination conflict — otherwise it deletes the source copy of
+    /// every transcript while "merging a directory into itself".
+    #[test]
+    fn relocate_to_case_only_variant_keeps_transcripts() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let claude = directory.path().join(".claude");
+        let encoded = encode_project_dir("/Users/paul/Demo");
+        std::fs::create_dir_all(claude.join("projects").join(&encoded)).expect("project dir");
+        std::fs::create_dir_all(claude.join("sessions")).expect("sessions dir");
+        std::fs::write(
+            claude.join("projects").join(&encoded).join("sid-aaa.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"sid-aaa\"}\n",
+        )
+        .expect("transcript");
+
+        let _ = relocate_project_native_at(
+            &claude,
+            &claude.join(".claude.json"),
+            "/Users/paul/Demo",
+            "/Users/paul/demo",
+        );
+
+        assert!(
+            claude
+                .join("projects")
+                .join(&encoded)
+                .join("sid-aaa.jsonl")
+                .exists(),
+            "大小写不同的重指向不能删掉转写文件"
+        );
     }
 }
