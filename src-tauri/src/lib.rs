@@ -353,6 +353,7 @@ pub fn run() {
             session_manager::invalidate_claude_history_cache,
             session_manager::delete_claude_project_native,
             session_manager::delete_claude_session_native,
+            session_manager::relocate_claude_project_native,
             // claude_launcher commands
             claude_launcher::launch_claude,
             claude_launcher::find_claude_executable,

@@ -71,7 +71,6 @@
         :class="{
           'project-block--dragging': projectDraggingIndex === index,
           'project-block--drag-over': projectDraggingIndex !== null && projectDraggingIndex !== index && projectOverIndex === index,
-          'project-block--menu-open': openMenuProjectId === project.id,
         }"
       >
         <!--
@@ -97,18 +96,17 @@
             </svg>
           </span>
           <span class="project-row__name">{{ project.name }}</span>
+          <span
+            v-if="projectPathMissing[project.id]"
+            class="project-row__issue"
+            title="项目路径不存在（文件夹可能被移动或改名），可在“⋯”菜单中重新指向新路径"
+          >⚠</span>
           <div class="project-row__actions" @click.stop>
-            <button class="project-row__action" title="项目更多菜单" @click="toggleProjectActions(project.id)">
+            <button class="project-row__action" title="项目更多菜单" @click="toggleProjectActions(project.id, $event)">
               ⋯
             </button>
             <button class="project-row__action project-row__action--new" title="新建项目会话" @click="store.createSession(project.id)" />
           </div>
-        </div>
-
-        <div v-if="openMenuProjectId === project.id" class="project-actions-menu">
-          <button @click="renameProject(project.id)">✎ 重命名项目</button>
-          <button @click="openProjectDirectory(project.id)">↗ 打开项目目录</button>
-          <button class="danger" @click="removeProject(project.id)">⌫ 删除项目</button>
         </div>
 
         <Transition name="session-list">
@@ -173,6 +171,24 @@
 
     <Teleport to="body">
       <div
+        v-if="openMenuProjectId"
+        ref="projectMenuRef"
+        class="project-actions-menu"
+        :style="{
+          top: `${projectMenuPosition.top}px`,
+          left: `${projectMenuPosition.left}px`,
+        }"
+        @click.stop
+      >
+        <button @click="renameProject(openMenuProjectId)"><span aria-hidden="true">✎</span>重命名项目</button>
+        <button @click="openProjectDirectory(openMenuProjectId)"><span aria-hidden="true">↗</span>打开项目目录</button>
+        <button @click="relocateProject(openMenuProjectId)"><span aria-hidden="true">⌖</span>重新指向路径…</button>
+        <button class="danger" @click="removeProject(openMenuProjectId)"><span aria-hidden="true">⌫</span>删除项目</button>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div
         v-if="openSessionMenuSession"
         ref="sessionMenuRef"
         class="session-actions-menu"
@@ -225,6 +241,12 @@
     <footer class="project-sidebar__footer">
       <button class="settings-entry" @click="emit('open-settings', $event)">⚙ <span>设置</span></button>
     </footer>
+
+    <RelocateProjectDialog
+      v-if="relocateProjectId"
+      :project-id="relocateProjectId"
+      @close="relocateProjectId = null"
+    />
   </aside>
 </template>
 
@@ -236,6 +258,7 @@ import type { Project, ProjectSession, ProjectSortMode } from '@/stores/project'
 import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import { useDragReorder } from '@/composables/useDragReorder'
 import { usePlatform } from '@/composables/usePlatform'
+import RelocateProjectDialog from './RelocateProjectDialog.vue'
 
 const store = useProjectStore()
 const { isWindows, isMacOS } = usePlatform()
@@ -248,6 +271,9 @@ const openSessionMenuId = ref<string | null>(null)
 const sessionMenuRef = ref<HTMLElement | null>(null)
 const sessionMenuAnchor = ref<{ top: number; bottom: number; right: number } | null>(null)
 const sessionMenuPosition = ref({ top: 0, left: 0 })
+const projectMenuRef = ref<HTMLElement | null>(null)
+const projectMenuAnchor = ref<{ top: number; bottom: number; right: number } | null>(null)
+const projectMenuPosition = ref({ top: 0, left: 0 })
 const openSessionMenuSession = computed(() => {
   if (!openSessionMenuId.value) return null
   return store.sessions.find((session) => session.id === openSessionMenuId.value) ?? null
@@ -256,6 +282,11 @@ const projectListExpanded = ref(true)
 const sidebarRef = ref<HTMLElement | null>(null)
 const currentTime = ref(Date.now())
 const sessionDisplayLimits = ref<Record<string, number>>({})
+const relocateProjectId = ref<string | null>(null)
+// 项目路径存在性探测结果（true = 目录不存在）。WSL 项目的路径在 Windows
+// 侧不可直接 stat（UNC 形态未加载时是 /home/… 形式），不参与探测以免误报。
+const projectPathMissing = ref<Record<string, boolean>>({})
+let pathProbeTimer: number | undefined
 let relativeTimeTimer: number | undefined
 const SESSION_DISPLAY_STEP = 5
 
@@ -331,19 +362,63 @@ onMounted(() => {
   }, 10_000)
   document.addEventListener('click', closeProjectActionsOnOutsideClick)
   document.addEventListener('scroll', updateSessionMenuPosition, true)
+  document.addEventListener('scroll', updateProjectMenuPosition, true)
   window.addEventListener('resize', updateSessionMenuPosition)
+  window.addEventListener('resize', updateProjectMenuPosition)
+  void probeProjectPaths()
 })
 
 onUnmounted(() => {
   if (relativeTimeTimer) window.clearInterval(relativeTimeTimer)
+  if (pathProbeTimer) window.clearTimeout(pathProbeTimer)
   document.removeEventListener('click', closeProjectActionsOnOutsideClick)
   document.removeEventListener('scroll', updateSessionMenuPosition, true)
+  document.removeEventListener('scroll', updateProjectMenuPosition, true)
   window.removeEventListener('resize', updateSessionMenuPosition)
+  window.removeEventListener('resize', updateProjectMenuPosition)
 })
 
 watch(() => store.sessions, () => {
   currentTime.value = Date.now()
 }, { deep: true })
+
+// 路径存在性探测：项目列表变化后防抖批量 stat。后端 path_kind 对打不开
+// 的路径返回 Err（目录不存在是最常见的形态），因此 catch 判定为缺失；
+// 权限错误之类罕见形态同样会显示 ⚠，菜单里仍可用重新指向功能处理。
+// WSL 项目的路径在 Windows 侧不可直接 stat，不参与探测。
+watch(
+  () => store.projects.map((project) => `${project.id}:${project.path}`).join('|'),
+  () => schedulePathProbe(),
+)
+
+function schedulePathProbe() {
+  if (pathProbeTimer) window.clearTimeout(pathProbeTimer)
+  pathProbeTimer = window.setTimeout(() => {
+    void probeProjectPaths()
+  }, 400)
+}
+
+async function probeProjectPaths() {
+  const targets = store.projects.filter((project) => !project.wsl)
+  const results = await Promise.all(targets.map(async (project) => {
+    try {
+      const kind = await invoke<'directory' | 'file' | 'missing'>('path_kind', { path: project.path })
+      return [project.id, kind === 'missing'] as const
+    } catch {
+      return [project.id, true] as const
+    }
+  }))
+  const next: Record<string, boolean> = {}
+  for (const [id, missing] of results) {
+    if (missing) next[id] = true
+  }
+  projectPathMissing.value = next
+}
+
+function relocateProject(projectId: string) {
+  openMenuProjectId.value = null
+  relocateProjectId.value = projectId
+}
 
 function isExpanded(projectId: string) {
   return store.expandedProjectIds.has(projectId)
@@ -492,9 +567,48 @@ async function setProjectSortMode(mode: ProjectSortMode) {
   projectOptionsOpen.value = false
 }
 
-function toggleProjectActions(projectId: string) {
-  openMenuProjectId.value = openMenuProjectId.value === projectId ? null : projectId
+function toggleProjectActions(projectId: string, event: MouseEvent) {
+  const next = openMenuProjectId.value === projectId ? null : projectId
+  openMenuProjectId.value = next
   openSessionMenuId.value = null
+  if (!next) {
+    projectMenuAnchor.value = null
+    return
+  }
+  const button = event.currentTarget as HTMLElement | null
+  const bounds = button?.getBoundingClientRect()
+  if (bounds) {
+    projectMenuAnchor.value = { top: bounds.top, bottom: bounds.bottom, right: bounds.right }
+    void nextTick(updateProjectMenuPosition)
+  }
+}
+
+// 项目菜单原来挂在 project-block 内部（absolute + 局部 z-index），列表底部
+// 打开时会被后面的兄弟节点或侧栏 overflow 裁掉。和会话菜单一样改为
+// Teleport + fixed 定位，并做视口边界翻转。
+function updateProjectMenuPosition() {
+  const anchor = projectMenuAnchor.value
+  if (!anchor) return
+
+  const menu = projectMenuRef.value
+  const menuWidth = menu?.offsetWidth || 180
+  const menuHeight = menu?.offsetHeight || 150
+  const viewportMargin = 8
+  const gap = 4
+  const preferredLeft = anchor.right - menuWidth - 6
+  const maxLeft = Math.max(viewportMargin, window.innerWidth - menuWidth - viewportMargin)
+  const left = Math.min(Math.max(viewportMargin, preferredLeft), maxLeft)
+  const belowTop = anchor.bottom + gap
+  const aboveTop = anchor.top - menuHeight - gap
+  const fitsBelow = belowTop + menuHeight <= window.innerHeight - viewportMargin
+  const fitsAbove = aboveTop >= viewportMargin
+  const top = fitsBelow
+    ? belowTop
+    : fitsAbove
+      ? aboveTop
+      : Math.max(viewportMargin, window.innerHeight - menuHeight - viewportMargin)
+
+  projectMenuPosition.value = { top, left }
 }
 
 function updateSessionMenuPosition() {
@@ -887,10 +1001,8 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
 }
 
 .project-actions-menu {
-  position: absolute;
-  z-index: 20;
-  right: 6px;
-  top: 30px;
+  position: fixed;
+  z-index: 3000;
   min-width: 170px;
   padding: 6px;
   border: 1px solid var(--separator);
@@ -909,8 +1021,15 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-primary);
+  font-family: var(--font-base);
   text-align: left;
   cursor: pointer;
+}
+
+.project-actions-menu button span {
+  width: 16px;
+  flex: 0 0 16px;
+  text-align: center;
 }
 
 .project-actions-menu button:hover {
@@ -929,10 +1048,6 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   position: relative;
   transition: transform 0.18s ease;
   will-change: transform;
-}
-
-.project-block--menu-open {
-  z-index: 10;
 }
 
 .project-block--dragging {
@@ -997,6 +1112,13 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
   flex: 0 0 auto;
   color: #b05f00;
   font-size: 11px;
+  cursor: help;
+}
+
+.project-row__issue {
+  flex: 0 0 auto;
+  color: var(--warning);
+  font-size: 12px;
   cursor: help;
 }
 

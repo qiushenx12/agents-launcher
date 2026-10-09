@@ -772,6 +772,241 @@ fn delete_session_native_at(
     Ok(report)
 }
 
+// ---------------------------------------------------------------------------
+// Relocating a Claude Code project to a new directory
+// ---------------------------------------------------------------------------
+//
+// Claude Code keys every piece of project data by the absolute path: the
+// transcript directory `projects/<encoded path>/`, the `project` field on each
+// history.jsonl line, and the `projects["<path>"]` entry in ~/.claude.json.
+// When the folder is moved or renamed, all three keep pointing at the stale
+// path, so `claude -r <id>`, the launcher's session sync, and PTY launches
+// against the new location all fail to find anything.
+//
+// `relocate_claude_project_native` rewrites all three to the new path (merging
+// with whatever already exists at the destination), guarded by the same
+// live-session check as deletion. Fail-safe order mirrors deletion: transcripts
+// first, history.jsonl second, .claude.json last. `file-history/<session id>`
+// is keyed by session id, so it needs no changes.
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeRelocateReport {
+    pub migrated: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Moves (or merges) the transcript directory from the old encoded path to the
+/// new one. Missing source directories are fine — the old path may simply have
+/// never run a session that survived the official cleanup.
+fn relocate_transcripts_dir(
+    claude_dir: &Path,
+    old_project: &str,
+    new_project: &str,
+    report: &mut NativeRelocateReport,
+) -> Result<(), String> {
+    let src = claude_dir
+        .join("projects")
+        .join(encode_project_dir(old_project));
+    let dst = claude_dir
+        .join("projects")
+        .join(encode_project_dir(new_project));
+    let Ok(src_metadata) = std::fs::metadata(&src) else {
+        return Ok(());
+    };
+    if !src_metadata.is_dir() {
+        return Err(format!("转写目录 {} 不是目录", src.display()));
+    }
+    if dst.exists() {
+        let dst_metadata =
+            std::fs::metadata(&dst).map_err(|e| format!("读取 {} 失败：{e}", dst.display()))?;
+        if !dst_metadata.is_dir() {
+            return Err(format!("目标转写目录 {} 不是目录", dst.display()));
+        }
+        // Merge: the destination keeps its own copies (same name = same
+        // session id), the source copy is dropped after it is superseded.
+        let mut conflicts = 0usize;
+        for entry in std::fs::read_dir(&src).map_err(|e| format!("读取转写目录失败：{e}"))? {
+            let Ok(entry) = entry else { continue };
+            let target = dst.join(entry.file_name());
+            if target.exists() {
+                conflicts += 1;
+                let removed = std::fs::remove_file(&entry.path())
+                    .or_else(|_| std::fs::remove_dir_all(&entry.path()));
+                if let Err(e) = removed {
+                    report.warnings.push(format!(
+                        "同名转写条目 {} 清理失败：{e}",
+                        entry.path().display()
+                    ));
+                }
+                continue;
+            }
+            std::fs::rename(entry.path(), &target)
+                .map_err(|e| format!("移动转写条目失败：{e}"))?;
+        }
+        let _ = std::fs::remove_dir(&src);
+        report.migrated.push(format!(
+            "转写目录并入 {}（{conflicts} 个同名条目保留目标位置的版本）",
+            dst.display()
+        ));
+        return Ok(());
+    }
+    std::fs::rename(&src, &dst).map_err(|e| format!("移动转写目录失败：{e}"))?;
+    report
+        .migrated
+        .push(format!("转写目录 {}", dst.display()));
+    Ok(())
+}
+
+/// Rewrites the `project` field of history.jsonl lines matching `old_project`
+/// to `new_project`. Unparseable lines are kept untouched, same rule as the
+/// history filter used by deletion. The file is left alone when nothing
+/// matched.
+fn rewrite_history_project(
+    path: &Path,
+    old_project: &str,
+    new_project: &str,
+) -> Result<usize, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("读取 history.jsonl 失败：{error}")),
+    };
+    let mut kept = String::with_capacity(content.len());
+    let mut rewritten = 0usize;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut rewritten_line = false;
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
+            if value.get("project").and_then(|p| p.as_str()) == Some(old_project) {
+                value["project"] = serde_json::Value::String(new_project.to_string());
+                kept.push_str(&value.to_string());
+                kept.push('\n');
+                rewritten += 1;
+                rewritten_line = true;
+            }
+        }
+        if !rewritten_line {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    if rewritten == 0 {
+        return Ok(0);
+    }
+    crate::file_transaction::write_private_text_atomic(
+        path,
+        kept.as_bytes(),
+        "Claude 历史 history.jsonl",
+    )?;
+    Ok(rewritten)
+}
+
+/// Moves the `projects["<old>"]` entry of ~/.claude.json to
+/// `projects["<new>"]`. When the destination entry already exists, fields are
+/// merged with the destination winning, and the stale old key is removed.
+fn relocate_claude_json_entry(
+    path: &Path,
+    old_project: &str,
+    new_project: &str,
+) -> Result<bool, String> {
+    edit_claude_json(path, |value| {
+        let Some(projects) = value
+            .get_mut("projects")
+            .and_then(|projects| projects.as_object_mut())
+        else {
+            return false;
+        };
+        let Some(entry) = projects.remove(old_project) else {
+            return false;
+        };
+        match projects.get_mut(new_project) {
+            Some(existing) => {
+                if let (Some(existing_obj), Some(entry_obj)) =
+                    (existing.as_object_mut(), entry.as_object())
+                {
+                    for (key, entry_value) in entry_obj {
+                        existing_obj
+                            .entry(key.clone())
+                            .or_insert(entry_value.clone());
+                    }
+                }
+                true
+            }
+            None => {
+                projects.insert(new_project.to_string(), entry);
+                true
+            }
+        }
+    })
+}
+
+fn relocate_project_native_at(
+    claude_dir: &Path,
+    claude_json: &Path,
+    old_project: &str,
+    new_project: &str,
+) -> Result<NativeRelocateReport, String> {
+    let session_ids = collect_project_session_ids(claude_dir, old_project);
+    guard_no_live_sessions(claude_dir, &session_ids)?;
+
+    let mut report = NativeRelocateReport::default();
+    relocate_transcripts_dir(claude_dir, old_project, new_project, &mut report)?;
+
+    let rewritten = rewrite_history_project(
+        &claude_dir.join("history.jsonl"),
+        old_project,
+        new_project,
+    )?;
+    if rewritten > 0 {
+        report
+            .migrated
+            .push(format!("history.jsonl 中的 {rewritten} 行 prompt 历史"));
+    }
+
+    if relocate_claude_json_entry(claude_json, old_project, new_project)? {
+        report
+            .migrated
+            .push(format!(".claude.json 项目条目 → projects[\"{new_project}\"]"));
+    }
+
+    if report.migrated.is_empty() {
+        report.warnings.push(
+            "Claude 原生数据里没有旧路径的条目（可能已被清理），仅更新了应用内的项目记录"
+                .to_string(),
+        );
+    }
+    Ok(report)
+}
+
+#[tauri::command]
+pub fn relocate_claude_project_native(
+    old_project_path: String,
+    new_project_path: String,
+) -> Result<NativeRelocateReport, String> {
+    let old_project = validate_native_project_path(&old_project_path)?;
+    let new_project = validate_native_project_path(&new_project_path)?;
+    if new_project == old_project {
+        return Ok(NativeRelocateReport::default());
+    }
+    let new_metadata = std::fs::metadata(&new_project)
+        .map_err(|_| format!("新路径不存在或无法访问：{new_project}"))?;
+    if !new_metadata.is_dir() {
+        return Err(format!("新路径不是目录：{new_project}"));
+    }
+
+    let report = relocate_project_native_at(
+        &claude_dir(),
+        &claude_json_path(),
+        &old_project,
+        &new_project,
+    )?;
+    invalidate_history_cache();
+    Ok(report)
+}
+
 #[tauri::command]
 pub fn delete_claude_project_native(project_path: String) -> Result<NativeDeleteReport, String> {
     let project_path = validate_native_project_path(&project_path)?;
@@ -1206,5 +1441,174 @@ mod tests {
             .join(encode_project_dir("D:\\work\\demo"))
             .join("sid-aaa.jsonl")
             .exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Native relocation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn relocate_project_moves_transcripts_history_and_claude_json_entry() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let claude = directory.path().join(".claude");
+        write_native_delete_fixture(&claude);
+        let claude_json = claude.join(".claude.json");
+
+        let report = relocate_project_native_at(
+            &claude,
+            &claude_json,
+            "D:\\work\\demo",
+            "D:\\work\\demo-renamed",
+        )
+        .expect("relocate project");
+
+        // Transcripts moved to the new encoded directory, sibling project untouched.
+        let new_dir = claude
+            .join("projects")
+            .join(encode_project_dir("D:\\work\\demo-renamed"));
+        assert!(new_dir.join("sid-aaa.jsonl").exists());
+        assert!(new_dir.join("sid-bbb.jsonl").exists());
+        assert!(!claude
+            .join("projects")
+            .join(encode_project_dir("D:\\work\\demo"))
+            .exists());
+        assert!(claude
+            .join("projects")
+            .join(encode_project_dir("D:\\work\\other"))
+            .join("sid-ccc.jsonl")
+            .exists());
+        // file-history is session-keyed and stays put.
+        assert!(claude.join("file-history").join("sid-aaa").exists());
+
+        // history.jsonl lines were rewritten, other projects kept.
+        let history = std::fs::read_to_string(claude.join("history.jsonl")).expect("history");
+        assert!(history.contains("D:\\\\work\\\\demo-renamed"));
+        assert!(!history.contains("\"project\":\"D:\\\\work\\\\demo\""));
+        assert!(history.contains("sid-ccc"));
+        assert!(history.contains("not-json"));
+
+        // .claude.json entry moved with its fields.
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_json).expect("claude.json"),
+        )
+        .expect("parse claude.json");
+        assert!(config
+            .get("projects")
+            .and_then(|p| p.get("D:\\work\\demo"))
+            .is_none());
+        let moved = config
+            .get("projects")
+            .and_then(|p| p.get("D:\\work\\demo-renamed"))
+            .expect("moved entry");
+        assert_eq!(moved.get("lastSessionId").and_then(|v| v.as_str()), Some("sid-aaa"));
+        assert!(moved.get("allowedTools").is_some());
+        assert!(!report.migrated.is_empty());
+    }
+
+    #[test]
+    fn relocate_project_merges_into_existing_destination() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let claude = directory.path().join(".claude");
+        write_native_delete_fixture(&claude);
+        let claude_json = claude.join(".claude.json");
+        // The destination already has its own transcript dir and .claude.json
+        // entry (e.g. a session was already run at the new path).
+        let dst_dir = claude
+            .join("projects")
+            .join(encode_project_dir("D:\\work\\demo-renamed"));
+        std::fs::create_dir_all(&dst_dir).expect("dst dir");
+        std::fs::write(
+            dst_dir.join("sid-bbb.jsonl"),
+            "{\"type\":\"ai-title\",\"aiTitle\":\"new copy\",\"sessionId\":\"sid-bbb\"}\n",
+        )
+        .expect("dst transcript");
+        std::fs::write(
+            dst_dir.join("sid-ddd.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"sid-ddd\"}\n",
+        )
+        .expect("dst-only transcript");
+        edit_claude_json(&claude_json, |value| {
+            value["projects"]["D:\\work\\demo-renamed"] =
+                serde_json::json!({"lastSessionId": "sid-ddd", "customNew": true});
+            true
+        })
+        .expect("seed dst entry");
+
+        relocate_project_native_at(
+            &claude,
+            &claude_json,
+            "D:\\work\\demo",
+            "D:\\work\\demo-renamed",
+        )
+        .expect("relocate onto existing destination");
+
+        // Destination keeps its own copy of the conflicting sid-bbb.
+        let content =
+            std::fs::read_to_string(dst_dir.join("sid-bbb.jsonl")).expect("dst sid-bbb");
+        assert!(content.contains("new copy"));
+        // Non-conflicting transcript arrives from the source.
+        assert!(dst_dir.join("sid-aaa.jsonl").exists());
+        // Destination-only transcript survives.
+        assert!(dst_dir.join("sid-ddd.jsonl").exists());
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_json).expect("claude.json"),
+        )
+        .expect("parse claude.json");
+        let merged = config
+            .get("projects")
+            .and_then(|p| p.get("D:\\work\\demo-renamed"))
+            .expect("merged entry");
+        // Destination wins on conflicting keys, source fills the gaps.
+        assert_eq!(merged.get("lastSessionId").and_then(|v| v.as_str()), Some("sid-ddd"));
+        assert_eq!(merged.get("customNew").and_then(|v| v.as_bool()), Some(true));
+        assert!(merged.get("allowedTools").is_some());
+        assert!(config
+            .get("projects")
+            .and_then(|p| p.get("D:\\work\\demo"))
+            .is_none());
+    }
+
+    #[test]
+    fn relocate_refused_while_session_process_is_alive() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let claude = directory.path().join(".claude");
+        write_native_delete_fixture(&claude);
+        std::fs::write(
+            claude.join("sessions").join("12345.json"),
+            format!(
+                "{{\"sessionId\":\"sid-aaa\",\"pid\":{}}}",
+                std::process::id()
+            ),
+        )
+        .expect("live session marker");
+
+        let error = relocate_project_native_at(
+            &claude,
+            &claude.join(".claude.json"),
+            "D:\\work\\demo",
+            "D:\\work\\demo-renamed",
+        )
+        .expect_err("live session must block relocation");
+        assert!(error.contains("仍在运行中"), "unexpected error: {error}");
+        assert!(claude
+            .join("projects")
+            .join(encode_project_dir("D:\\work\\demo"))
+            .join("sid-aaa.jsonl")
+            .exists());
+    }
+
+    #[test]
+    fn relocate_without_native_data_succeeds_with_warning() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let claude = directory.path().join(".claude");
+        std::fs::create_dir_all(&claude).expect("claude dir");
+        let claude_json = claude.join(".claude.json");
+
+        let report =
+            relocate_project_native_at(&claude, &claude_json, "D:\\gone", "D:\\fresh")
+                .expect("relocate with nothing to move");
+        assert!(report.migrated.is_empty());
+        assert_eq!(report.warnings.len(), 1);
     }
 }

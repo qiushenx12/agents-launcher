@@ -165,6 +165,13 @@ interface NativeDeleteReport {
   warnings: string[]
 }
 
+// 后端原生路径迁移命令的返回：已迁移条目 + 非致命提示（旧路径没有原生
+// 数据时 migrated 为空，只更新应用内记录）。
+interface NativeRelocateReport {
+  migrated: string[]
+  warnings: string[]
+}
+
 // A project path lives inside WSL when it is a distro-local absolute path or
 // already a \\wsl… UNC path picked from the distro share. Windows-only
 // heuristic: on macOS every absolute path starts with `/`, so a leading
@@ -1786,6 +1793,53 @@ export const useProjectStore = defineStore('project', () => {
     return project
   }
 
+  // 项目文件夹被移动/改名后的「重新指向新路径」：
+  // 1. Claude（非 WSL）项目先让后端把 Claude Code 原生数据整体迁到新路径——
+  //    ~/.claude/projects/<编码路径>/ 转写目录、history.jsonl 的 project 字段、
+  //    ~/.claude.json 的 projects["<路径>"] 条目。原生迁移失败时中止，本地
+  //    记录保持不动（与删除相同的失败语义），用户可以排查后重试。
+  // 2. 更新启动目录历史，让配置页下拉与 claudeStore.launchDir 指向新路径。
+  // 3. 最后走 replaceProjectPath 更新应用内记录并重新同步会话列表。
+  // WSL 项目的原生数据在发行版内部，暂不支持原生迁移，只更新应用内记录。
+  async function relocateProject(projectId: string, path: string): Promise<NativeRelocateReport | null> {
+    const project = projects.value.find((p) => p.id === projectId)
+    if (!project) throw new Error(`项目不存在: ${projectId}`)
+    const normalized = normalizeProjectPath(path)
+    if (!normalized) throw new Error('新路径为空')
+    const samePath = normalizeFsPath(normalized) === normalizeFsPath(project.path)
+
+    let report: NativeRelocateReport | null = null
+    if (project.cliKind === 'claude' && !project.wsl) {
+      report = await invoke<NativeRelocateReport>('relocate_claude_project_native', {
+        oldProjectPath: project.path,
+        newProjectPath: normalized,
+      })
+      if (report.warnings.length > 0) {
+        statusMessage.value = `Claude 原生数据：${report.warnings.join('；')}`
+      } else if (report.migrated.length > 0) {
+        statusMessage.value = `已迁移 Claude 原生数据（${report.migrated.length} 项）`
+      }
+      // 启动目录历史同步到新路径；旧路径从内存历史里剔除（后端
+      // history.jsonl 已被改写，刷新后也不会再回来）。
+      const claudeStore = useClaudeStore()
+      claudeStore.launchDirHistory = claudeStore.launchDirHistory.filter(
+        (dir) => normalizeFsPath(dir) !== normalizeFsPath(project.path),
+      )
+      updateClaudeLaunchHistory(claudeStore, normalized)
+      await claudeStore.saveLaunchDir().catch(() => {})
+    } else if (project.cliKind === 'claude' && project.wsl) {
+      statusMessage.value = 'WSL 项目仅更新了应用内路径，WSL 内的 Claude 原生数据未迁移'
+    }
+
+    await replaceProjectPath(projectId, normalized)
+    // 路径变了可能只是文件夹被重建（同路径），或原生会话历史在新路径下
+    // 立即可见；强制刷新一次 Claude 历史缓存保证侧边栏会话列表是新的。
+    if (project.cliKind === 'claude' && !samePath) {
+      await invoke('invalidate_claude_history_cache').catch(() => {})
+    }
+    return report
+  }
+
   async function toggleProjectExpanded(projectId: string) {
     if (expandedProjectIds.value.has(projectId)) {
       expandedProjectIds.value.delete(projectId)
@@ -2581,6 +2635,7 @@ export const useProjectStore = defineStore('project', () => {
     removeProject,
     renameProject,
     replaceProjectPath,
+    relocateProject,
     toggleProjectExpanded,
     toggleLeftSidebarCollapsed,
     setProjectSortMode,
