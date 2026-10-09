@@ -385,10 +385,12 @@ watch(() => store.sessions, () => {
   currentTime.value = Date.now()
 }, { deep: true })
 
-// 路径存在性探测：项目列表变化后防抖批量 stat。后端 path_kind 对打不开
-// 的路径返回 Err（目录不存在是最常见的形态），因此 catch 判定为缺失；
-// 权限错误之类罕见形态同样会显示 ⚠，菜单里仍可用重新指向功能处理。
-// WSL 项目的路径在 Windows 侧不可直接 stat，不参与探测。
+// 路径存在性探测：项目列表变化后防抖批量 stat。后端 path_kind 已把「打不开」
+// 细分为 missing（真被删/移走）、denied（目录在但无权读，如 macOS TCC 未授权）
+// 与 unreachable（盘符/网络位置暂时不可达），三者图标与提示文案各不相同——
+// 只有 missing 才该引导用户重新指向。catch 只剩无法归类的错误（例如路径
+// 字符串非法），按 missing 处理。WSL 项目的路径在 Windows 侧不可直接 stat，
+// 不参与探测。
 watch(
   () => store.projects.map((project) => `${project.id}:${project.path}`).join('|'),
   () => schedulePathProbe(),
@@ -408,7 +410,8 @@ async function probeProjectPaths() {
       const kind = await invoke<PathKind>('path_kind', { path: project.path })
       return [project.id, kind] as const
     } catch {
-      // 只有无法归类的错误（例如路径字符串非法）才走到这里，按缺失处理。
+      // 只有无法归类的错误（例如路径字符串非法）才走到这里，按缺失处理；
+      // missing / denied / unreachable 都是 Ok(...)，不会进这个分支。
       return [project.id, 'missing' as PathKind] as const
     }
   }))
