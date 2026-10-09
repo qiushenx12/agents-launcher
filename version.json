@@ -1,15 +1,15 @@
 {
   "schemaVersion": 3,
-  "currentVersion": "1.0.2",
+  "currentVersion": "1.0.3",
   "platforms": {
     "windows": {
       "status": "passed",
       "architecture": "x64",
-      "testedAt": "2026-10-08T17:20:29+08:00",
+      "testedAt": "2026-10-10T00:32:12+08:00",
       "artifacts": [
         {
-          "path": "src-tauri/release-bundle/nsis/Agents Launcher_1.0.2_x64-setup.exe",
-          "size": 7496248
+          "path": "src-tauri/release-bundle/nsis/Agents Launcher_1.0.3_x64-setup.exe",
+          "size": 7552707
         }
       ]
     },
@@ -45,11 +45,28 @@
         "windows": {
           "status": "passed",
           "architecture": "x64",
-          "testedAt": "2026-10-08T17:20:29+08:00",
+          "testedAt": "2026-10-10T00:21:02+08:00",
           "artifacts": [
             {
               "path": "src-tauri/release-bundle/nsis/Agents Launcher_1.0.2_x64-setup.exe",
-              "size": 7496248
+              "size": 7553141
+            }
+          ]
+        }
+      }
+    },
+    {
+      "version": "1.0.3",
+      "recordedAt": "2026-10-10T00:32:12+08:00",
+      "platforms": {
+        "windows": {
+          "status": "passed",
+          "architecture": "x64",
+          "testedAt": "2026-10-10T00:32:12+08:00",
+          "artifacts": [
+            {
+              "path": "src-tauri/release-bundle/nsis/Agents Launcher_1.0.3_x64-setup.exe",
+              "size": 7552707
             }
           ]
         }
