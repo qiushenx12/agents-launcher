@@ -464,6 +464,40 @@ export interface DshCredentialSaveResult {
 }
 
 /**
+ * 后端 `path_kind` 的返回值。
+ *
+ * 三种「打不开」的原因必须分开报，否则用户会被引导去做错误的操作：
+ * - `missing`：目录真的被删除或移动了 → 该重新指向新路径。
+ * - `denied`：目录还在但读不到。macOS TCC 在用户授权前拒绝访问 `~/Desktop`、
+ *   `~/Documents`、`~/Downloads`、iCloud Drive（EACCES 而非 ENOENT）；Windows
+ *   上则是 ACL 拒绝（例如别人的用户目录）。此时重新指向没有用，该去授权。
+ * - `unreachable`：Windows 上盘符/网络位置暂时不可达——U 盘拔出、读卡器空、
+ *   映射网络驱动器断开、UNC 共享离线。等介质回来就好，不该改路径。
+ */
+export type PathKind = 'directory' | 'file' | 'missing' | 'denied' | 'unreachable'
+
+/** 只有这三种状态需要在项目行上给出提示。 */
+export type PathIssue = Extract<PathKind, 'missing' | 'denied' | 'unreachable'>
+
+export function pathIssueGlyph(issue: PathIssue): string {
+  if (issue === 'denied') return '🔒'
+  if (issue === 'unreachable') return '🔌'
+  return '⚠'
+}
+
+export function pathIssueTitle(issue: PathIssue, isMacOS: boolean): string {
+  if (issue === 'denied') {
+    return isMacOS
+      ? '没有访问权限：路径存在，但 macOS 未授予访问权。请在「系统设置 → 隐私与安全性 → 文件与文件夹」（或完全磁盘访问权限）中允许本应用访问该目录。'
+      : '没有访问权限：路径存在，但当前无权读取该目录（Windows 上通常是 ACL 限制，例如其他用户的配置文件目录）。'
+  }
+  if (issue === 'unreachable') {
+    return '盘符或网络位置当前不可达（U 盘已拔出、读卡器为空、映射网络驱动器已断开或服务器离线）。路径可能仍然存在，接回后会自动恢复，不需要重新指向。'
+  }
+  return '项目路径不存在（文件夹可能被移动或改名），可在“⋯”菜单中重新指向新路径'
+}
+
+/**
  * dsh 自己的凭据引用名派生规则（`dsh-client-ui-settings-models/lib/client.js` 的
  * `deriveKeyRef`）：路由键大写、**连续的**非字母数字折叠成一个 `_`、后缀
  * `_API_KEY`。启动器保存令牌时用它生成引用名；名字不是合法的 POSIX 变量名时

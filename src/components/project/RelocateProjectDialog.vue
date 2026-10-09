@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
+import type { PathKind } from '@/types/config'
 import { useProjectStore } from '@/stores/project'
 
 /*
@@ -24,7 +25,7 @@ const project = computed(
 )
 
 const newPath = ref('')
-const newPathKind = ref<'checking' | 'directory' | 'file' | 'missing' | 'error'>('checking')
+const newPathKind = ref<PathKind | 'checking' | 'error'>('checking')
 const submitting = ref(false)
 const errorMessage = ref('')
 
@@ -46,7 +47,7 @@ watch(newPath, (path) => {
   newPathKind.value = 'checking'
   inspectTimer = setTimeout(async () => {
     try {
-      newPathKind.value = await invoke<'directory' | 'file' | 'missing'>('path_kind', { path: value })
+      newPathKind.value = await invoke<PathKind>('path_kind', { path: value })
     } catch {
       newPathKind.value = 'error'
     }
@@ -72,6 +73,11 @@ const statusText = computed(() => {
     case 'directory': return sameAsOld.value ? '新路径与当前路径相同' : '目录存在，可以使用'
     case 'file': return '这是一个文件，不是目录'
     case 'missing': return '路径不存在（请先创建或移动好文件夹）'
+    // macOS TCC 未授权 ~/Desktop、~/Documents 等时目录是在的，只是读不到，
+    // 必须和「不存在」区分开，否则用户会以为自己填错了路径。
+    case 'denied': return '没有访问权限（路径存在，但系统拒绝本应用读取该目录）'
+    // Windows：U 盘拔出 / 网络驱动器断开。目录没被删，重连即可，不该迁移。
+    case 'unreachable': return '盘符或网络位置当前不可达（请接回后重试，不要迁移）'
     case 'error': return '无法识别该路径'
     default: return ''
   }
@@ -138,7 +144,7 @@ async function submit() {
             class="relocate__status"
             :class="{
               'relocate__status--ok': newPathKind === 'directory' && !sameAsOld,
-              'relocate__status--bad': newPathKind === 'file' || newPathKind === 'missing' || newPathKind === 'error',
+              'relocate__status--bad': newPathKind !== 'checking' && newPathKind !== 'directory',
             }"
           >
             {{ statusText }}

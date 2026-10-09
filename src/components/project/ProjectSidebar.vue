@@ -97,10 +97,10 @@
           </span>
           <span class="project-row__name">{{ project.name }}</span>
           <span
-            v-if="projectPathMissing[project.id]"
+            v-if="projectPathIssue[project.id]"
             class="project-row__issue"
-            title="项目路径不存在（文件夹可能被移动或改名），可在“⋯”菜单中重新指向新路径"
-          >⚠</span>
+            :title="pathIssueTitle(projectPathIssue[project.id], isMacOS)"
+          >{{ pathIssueGlyph(projectPathIssue[project.id]) }}</span>
           <div class="project-row__actions" @click.stop>
             <button class="project-row__action" title="项目更多菜单" @click="toggleProjectActions(project.id, $event)">
               ⋯
@@ -255,6 +255,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useProjectStore } from '@/stores/project'
 import type { Project, ProjectSession, ProjectSortMode } from '@/stores/project'
+import type { PathIssue, PathKind } from '@/types/config'
+import { pathIssueGlyph, pathIssueTitle } from '@/types/config'
 import { useTauriDrop, isInside } from '@/composables/useTauriDrop'
 import { useDragReorder } from '@/composables/useDragReorder'
 import { usePlatform } from '@/composables/usePlatform'
@@ -283,9 +285,10 @@ const sidebarRef = ref<HTMLElement | null>(null)
 const currentTime = ref(Date.now())
 const sessionDisplayLimits = ref<Record<string, number>>({})
 const relocateProjectId = ref<string | null>(null)
-// 项目路径存在性探测结果（true = 目录不存在）。WSL 项目的路径在 Windows
-// 侧不可直接 stat（UNC 形态未加载时是 /home/… 形式），不参与探测以免误报。
-const projectPathMissing = ref<Record<string, boolean>>({})
+// 项目路径探测结果：missing = 目录真的没了；denied = 目录在但无权访问
+// （macOS TCC 未授权 ~/Desktop、~/Documents 等，或 Unix 权限不足）。两者
+// 都要提示，但提示文案和图标不同——denied 不该引导用户去「重新指向新路径」。
+const projectPathIssue = ref<Record<string, PathIssue>>({})
 let pathProbeTimer: number | undefined
 let relativeTimeTimer: number | undefined
 const SESSION_DISPLAY_STEP = 5
@@ -402,17 +405,18 @@ async function probeProjectPaths() {
   const targets = store.projects.filter((project) => !project.wsl)
   const results = await Promise.all(targets.map(async (project) => {
     try {
-      const kind = await invoke<'directory' | 'file' | 'missing'>('path_kind', { path: project.path })
-      return [project.id, kind === 'missing'] as const
+      const kind = await invoke<PathKind>('path_kind', { path: project.path })
+      return [project.id, kind] as const
     } catch {
-      return [project.id, true] as const
+      // 只有无法归类的错误（例如路径字符串非法）才走到这里，按缺失处理。
+      return [project.id, 'missing' as PathKind] as const
     }
   }))
-  const next: Record<string, boolean> = {}
-  for (const [id, missing] of results) {
-    if (missing) next[id] = true
+  const next: Record<string, PathIssue> = {}
+  for (const [id, kind] of results) {
+    if (kind === 'missing' || kind === 'denied' || kind === 'unreachable') next[id] = kind
   }
-  projectPathMissing.value = next
+  projectPathIssue.value = next
 }
 
 function relocateProject(projectId: string) {
@@ -842,7 +846,7 @@ async function openProjectDirectory(projectId: string) {
 
 async function inspectPath(path: string) {
   try {
-    return await invoke<'directory' | 'file' | 'missing'>('path_kind', { path })
+    return await invoke<PathKind>('path_kind', { path })
   } catch (e) {
     store.statusMessage = `无法识别拖拽路径：${e}`
     return null
@@ -874,6 +878,16 @@ async function handleDroppedPath(path: string, targetProjectId?: string) {
 
   if (kind === 'file') {
     await store.openFile(path)
+    return
+  }
+
+  if (kind === 'denied') {
+    store.statusMessage = `没有访问权限，无法打开该路径：${path}`
+    return
+  }
+
+  if (kind === 'unreachable') {
+    store.statusMessage = `盘符或网络位置当前不可达：${path}`
     return
   }
 

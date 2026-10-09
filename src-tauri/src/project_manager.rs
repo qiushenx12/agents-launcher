@@ -505,16 +505,81 @@ fn transactional_write(path: &Path, content: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Windows-only: the drive or network location is unreachable right now, but
+/// nothing was deleted — an ejected USB drive, an empty card reader, an offline
+/// mapped network drive or UNC share, a drive letter that no longer exists.
+///
+/// `metadata()` fails for all of these, and Rust collapses several of them
+/// (notably `ERROR_BAD_NETPATH`) into `ErrorKind::NotFound`, so they can only be
+/// told apart by the raw Win32 code. Reporting them as "missing" tells the user
+/// a folder was moved when it is simply not plugged in / not connected, which
+/// sends them into the relocate flow for a project that will come back on its
+/// own. This is the Windows counterpart of the macOS TCC `denied` bucket.
+#[cfg(windows)]
+fn is_unreachable_location(error: &std::io::Error) -> bool {
+    const ERROR_INVALID_DRIVE: i32 = 15; // 盘符不存在
+    const ERROR_NOT_READY: i32 = 21; // 可移动介质未就绪（U 盘拔出、读卡器空）
+    const ERROR_BAD_NETPATH: i32 = 53; // 网络路径不可达
+    const ERROR_NETNAME_DELETED: i32 = 64; // 网络连接已断开
+    const ERROR_NETWORK_UNREACHABLE: i32 = 1231; // 网络不可达
+    const ERROR_NOT_CONNECTED: i32 = 2250; // 映射驱动器已断开
+    matches!(
+        error.raw_os_error(),
+        Some(
+            ERROR_INVALID_DRIVE
+                | ERROR_NOT_READY
+                | ERROR_BAD_NETPATH
+                | ERROR_NETNAME_DELETED
+                | ERROR_NETWORK_UNREACHABLE
+                | ERROR_NOT_CONNECTED
+        )
+    )
+}
+
+#[cfg(not(windows))]
+fn is_unreachable_location(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Maps a `metadata()` failure onto the bucket callers can act on.
+///
+/// `NotFound` and `PermissionDenied` must stay distinct: on macOS, TCC denies
+/// access to `~/Desktop`, `~/Documents`, `~/Downloads` and iCloud Drive until
+/// the user grants it in System Settings, and that denial arrives as EACCES —
+/// the path very much still exists. Reporting it as "missing" sends the user
+/// off to re-point a project that is sitting right where they left it (and the
+/// replacement path usually gets denied too). Plain Unix permissions land in
+/// the same bucket, as does a Windows ACL refusal on someone else's profile.
+fn classify_stat_error(error: &std::io::Error) -> Option<&'static str> {
+    if is_unreachable_location(error) {
+        return Some("unreachable");
+    }
+    match error.kind() {
+        std::io::ErrorKind::NotFound => Some("missing"),
+        std::io::ErrorKind::PermissionDenied => Some("denied"),
+        _ => None,
+    }
+}
+
 #[tauri::command]
 pub fn path_kind(path: String) -> Result<String, String> {
     let path_buf = PathBuf::from(&path);
-    let metadata = fs::metadata(&path_buf).map_err(|e| format!("Failed to inspect path: {e}"))?;
-    if metadata.is_dir() {
-        Ok("directory".to_string())
-    } else if metadata.is_file() {
-        Ok("file".to_string())
-    } else {
-        Ok("missing".to_string())
+    match fs::metadata(&path_buf) {
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                Ok("directory".to_string())
+            } else if metadata.is_file() {
+                Ok("file".to_string())
+            } else {
+                Ok("missing".to_string())
+            }
+        }
+        // Only genuinely unknown failures stay an Err; a denied path returns
+        // Ok("denied") so callers never mistake it for a deleted folder.
+        Err(error) => match classify_stat_error(&error) {
+            Some(kind) => Ok(kind.to_string()),
+            None => Err(format!("Failed to inspect path: {error}")),
+        },
     }
 }
 
@@ -819,5 +884,78 @@ mod tests {
         assert!(repaired.active_session_id.is_none());
         assert_ne!(first_persisted, legacy);
         assert_eq!(second_persisted, first_persisted);
+    }
+
+    #[test]
+    fn path_kind_separates_missing_from_permission_denied() {
+        use std::io::{Error, ErrorKind};
+
+        // macOS TCC (and plain Unix permissions) answer EACCES for paths that
+        // exist; only NotFound may be reported as "missing".
+        assert_eq!(
+            classify_stat_error(&Error::from(ErrorKind::NotFound)),
+            Some("missing")
+        );
+        assert_eq!(
+            classify_stat_error(&Error::from(ErrorKind::PermissionDenied)),
+            Some("denied")
+        );
+        assert_eq!(classify_stat_error(&Error::from(ErrorKind::Other)), None);
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        assert_eq!(path_kind(directory.path().display().to_string()).expect("dir"), "directory");
+
+        let file = directory.path().join("a.txt");
+        fs::write(&file, "x").expect("write file");
+        assert_eq!(path_kind(file.display().to_string()).expect("file"), "file");
+
+        // A deleted path is the only thing allowed to read as "missing".
+        assert_eq!(
+            path_kind(directory.path().join("gone").display().to_string()).expect("gone"),
+            "missing"
+        );
+    }
+
+    /// Windows-only: the raw Win32 code decides "unreachable". Rust folds
+    /// several of these (ERROR_BAD_NETPATH above all) into `ErrorKind::NotFound`,
+    /// so without the raw-code check a project on an offline network drive would
+    /// be reported as a folder the user deleted.
+    #[cfg(windows)]
+    #[test]
+    fn unreachable_locations_never_read_as_missing() {
+        use std::io::Error;
+
+        for code in [15i32, 21, 53, 64, 1231, 2250] {
+            assert_eq!(
+                classify_stat_error(&Error::from_raw_os_error(code)),
+                Some("unreachable"),
+                "Win32 错误码 {code} 应判为 unreachable"
+            );
+        }
+        // Ordinary Win32 codes keep their own bucket.
+        assert_eq!(
+            classify_stat_error(&Error::from_raw_os_error(2)),
+            Some("missing")
+        );
+        assert_eq!(
+            classify_stat_error(&Error::from_raw_os_error(5)),
+            Some("denied")
+        );
+    }
+
+    /// Off Windows there is no unreachable bucket to hand out: the same raw
+    /// numbers are unrelated Unix errnos and must fall through to `kind()`.
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_has_no_unreachable_bucket() {
+        use std::io::Error;
+
+        for code in [15i32, 21, 53, 64, 1231, 2250] {
+            assert_ne!(
+                classify_stat_error(&Error::from_raw_os_error(code)),
+                Some("unreachable"),
+                "Unix 上不应出现 unreachable（错误码 {code}）"
+            );
+        }
     }
 }
